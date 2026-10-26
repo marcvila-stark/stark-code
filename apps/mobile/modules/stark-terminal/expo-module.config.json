@@ -1,0 +1,10 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["StarkTerminalModule"],
+    "podspecPath": "StarkTerminalNative.podspec"
+  },
+  "android": {
+    "modules": ["expo.modules.starkterminal.StarkTerminalModule"]
+  }
+}

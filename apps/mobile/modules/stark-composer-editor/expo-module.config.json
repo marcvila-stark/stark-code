@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["StarkComposerEditorModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.starkcomposereditor.StarkComposerEditorModule"]
+  }
+}

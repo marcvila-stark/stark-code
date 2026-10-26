@@ -1,0 +1,7 @@
+{
+  "uuid": "snap-shot@unconfigured.invalid",
+  "name": "Stark Code SnapShots",
+  "description": "Allows Stark Code to capture the focused window, identify it for optional accessibility text, and animate it into Stark Code. Disable this extension to revoke access.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 2
+}

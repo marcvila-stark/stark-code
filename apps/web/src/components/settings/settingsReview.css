@@ -1,0 +1,410 @@
+.stark-settings-layout {
+  background: var(--sr-bg);
+  color: var(--sr-text);
+}
+
+.stark-settings-layout header {
+  border-bottom: 1px solid var(--sr-border);
+}
+
+.stark-settings-layout .stark-settings-page {
+  position: relative;
+  max-width: 920px;
+  padding: 38px 40px 56px;
+  gap: 24px;
+}
+
+.stark-settings-intro h1 {
+  margin: 0;
+  color: var(--sr-text);
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.3;
+}
+
+.stark-settings-intro p {
+  margin-top: 10px;
+  color: var(--sr-muted);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.stark-settings-scope {
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--sr-border);
+  color: var(--sr-muted);
+}
+
+.stark-settings-scope > p {
+  padding: 0;
+  font-size: 13px;
+}
+
+.stark-settings-scope:empty {
+  display: none;
+}
+
+.stark-settings-back-header {
+  display: flex;
+  align-items: center;
+  height: var(--workspace-topbar-height, 56px);
+  flex-shrink: 0;
+  padding: 0 18px;
+  background: var(--sr-panel);
+}
+
+.stark-settings-back-header.drag-region {
+  padding-left: calc(var(--workspace-controls-left, 90px) + 34px);
+}
+
+.stark-settings-navigation {
+  background: var(--sr-panel);
+  color: var(--sr-text);
+}
+
+.stark-settings-navigation [data-slot="sidebar-group"] {
+  padding: 10px 12px 20px;
+}
+
+.stark-settings-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 7px 10px;
+  border: 1px solid var(--sr-border);
+  border-radius: 6px;
+  background: var(--sr-bg);
+  color: var(--sr-muted);
+}
+
+.stark-settings-search:focus-within {
+  outline: 1px solid var(--sr-gold);
+  outline-offset: 1px;
+}
+
+.stark-settings-search-input {
+  width: 0;
+  min-width: 0;
+  flex: 1;
+  outline: none;
+  background: transparent;
+  color: var(--sr-text);
+  font-size: 12px;
+}
+
+.stark-settings-search-input::placeholder {
+  color: var(--sr-muted);
+}
+
+.stark-settings-nav-groups {
+  display: grid;
+  gap: 22px;
+  padding-top: 20px;
+}
+
+.stark-settings-nav-label {
+  padding: 0 12px 7px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--sr-muted);
+}
+
+.stark-settings-nav-link {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 7px;
+  color: var(--sr-muted);
+  font-size: 13px;
+  line-height: 18px;
+  text-align: left;
+}
+
+.stark-settings-nav-link:hover,
+.stark-settings-nav-link[aria-current="page"] {
+  background: var(--sr-card);
+  color: var(--sr-text);
+}
+
+.stark-settings-more summary {
+  padding: 8px 12px;
+  color: var(--sr-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.stark-settings-nav-link:focus-visible,
+.stark-settings-back-header button:focus-visible,
+.stark-settings-more summary:focus-visible {
+  outline: 2px solid var(--sr-gold);
+  outline-offset: -2px;
+}
+
+.stark-agent-section > [data-settings-scroll-target] {
+  position: absolute;
+  top: 38px;
+  right: 40px;
+  padding: 0;
+}
+
+.stark-agent-section > :last-child {
+  margin-block: 0;
+}
+
+.stark-agent-section > [data-settings-scroll-target] h2 {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.stark-agent-cards {
+  display: grid;
+  gap: 20px;
+}
+
+.stark-agent-card > div {
+  border: 1px solid var(--sr-border);
+  background: var(--sr-card);
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+.stark-agent-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 18px;
+  padding: 24px 24px 20px;
+}
+
+.stark-agent-name {
+  color: var(--sr-text);
+  font-size: 18px;
+  font-weight: 550;
+  line-height: 1.4;
+}
+
+.stark-agent-identity {
+  color: var(--sr-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.stark-agent-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--sr-muted);
+  font-size: 12px;
+}
+
+.stark-agent-state[data-state="ready"] {
+  color: var(--success);
+}
+
+.stark-agent-state[data-state="error"],
+.stark-agent-state[data-state="warning"] {
+  color: var(--warning);
+}
+
+.stark-agent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 0 24px 23px;
+}
+
+.stark-agent-account-fields {
+  border-top: 1px solid var(--sr-border);
+  padding: 12px;
+}
+
+.stark-runtime-fold {
+  border-top: 1px solid var(--sr-border);
+}
+
+.stark-runtime-fold-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 10px 24px;
+}
+
+.stark-runtime-fold-heading h2 {
+  flex-shrink: 0;
+}
+
+.stark-runtime-summary {
+  margin-left: auto;
+  color: var(--sr-muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+.stark-mcp-panel {
+  display: grid;
+  gap: 24px;
+  font-size: 14px;
+}
+
+.stark-mcp-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.stark-mcp-heading h1 span {
+  margin-left: 10px;
+  color: var(--sr-muted);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.stark-mcp-scope {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.stark-mcp-scope select {
+  max-width: min(260px, 65vw);
+  background: var(--sr-bg);
+  color: var(--sr-text);
+  padding: 5px 8px 5px 0;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.stark-mcp-status-hero {
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 280px;
+  padding: 38px 28px;
+  border: 1px solid var(--sr-border);
+  border-radius: 12px;
+  background: var(--sr-card);
+  text-align: center;
+}
+
+.stark-mcp-status-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin-bottom: 21px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--sr-gold) 12%, transparent);
+  color: var(--sr-gold);
+}
+
+.stark-mcp-status-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
+.stark-mcp-status-hero > p:first-of-type {
+  color: var(--sr-text);
+  font-size: 18px;
+  font-weight: 550;
+}
+
+.stark-mcp-status-hero > p + p {
+  max-width: 440px;
+  margin: 14px 0 24px;
+  color: var(--sr-muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.stark-mcp-server-card {
+  padding: 22px 24px;
+  border: 1px solid var(--sr-border);
+  border-radius: 12px;
+  background: var(--sr-card);
+}
+
+.stark-mcp-server-card h4 {
+  font-size: 17px;
+}
+
+.stark-mcp-server-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 16px;
+  color: var(--sr-muted);
+  font-size: 13px;
+}
+
+.stark-mcp-health-note {
+  padding: 17px 20px;
+  border-left: 2px solid var(--sr-gold);
+  border-radius: 0 8px 8px 0;
+  background: color-mix(in srgb, var(--sr-gold) 5%, transparent);
+  color: var(--sr-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.stark-mcp-health-note strong {
+  color: var(--sr-text);
+  font-weight: 550;
+}
+
+@container providers (max-width: 520px) {
+  .stark-agent-section > [data-settings-scroll-target] {
+    position: static;
+    padding-bottom: 12px;
+  }
+}
+
+@media (max-width: 700px) {
+  .stark-settings-layout .stark-settings-page {
+    padding: 26px 20px 40px;
+  }
+
+  .stark-settings-intro h1 {
+    font-size: 25px;
+  }
+
+  .stark-agent-section > [data-settings-scroll-target] {
+    position: static;
+    padding-bottom: 12px;
+  }
+
+  .stark-agent-card-heading {
+    padding: 20px 18px;
+  }
+
+  .stark-agent-actions {
+    padding: 0 18px 20px;
+  }
+
+  .stark-runtime-fold-heading {
+    padding: 12px 18px;
+    flex-wrap: wrap;
+  }
+
+  .stark-runtime-summary {
+    margin-left: 24px;
+    text-align: left;
+  }
+}

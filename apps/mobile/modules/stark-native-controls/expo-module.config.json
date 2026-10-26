@@ -1,0 +1,17 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["StarkNativeControlsModule", "StarkKeyboardCommandsModule"],
+    "appDelegateSubscribers": [
+      "StarkWorkspaceOrientationSubscriber",
+      "StarkMenuDismissTouchGateSubscriber"
+    ]
+  },
+  "android": {
+    "modules": [
+      "expo.modules.starknativecontrols.StarkNativeControlsModule",
+      "expo.modules.starknativecontrols.StarkWorkspaceNavigationModule",
+      "expo.modules.starknativecontrols.StarkKeyboardCommandsModule"
+    ]
+  }
+}

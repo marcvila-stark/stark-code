@@ -1,0 +1,49 @@
+.title {
+  font-size: 28px;
+  letter-spacing: -0.5px;
+}
+
+.intro {
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.eyebrow {
+  letter-spacing: 0.1em;
+}
+
+.browserName {
+  font-size: 15px;
+}
+
+.browserChoice {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+}
+
+.detail {
+  line-height: 1.65;
+}
+
+@media (width < 480px) {
+  .browserChoice {
+    grid-template-columns: 24px minmax(0, 1fr);
+    row-gap: 6px;
+  }
+
+  .browserAction {
+    grid-column: 2;
+  }
+}
+
+@media (width < 640px) {
+  .title {
+    font-size: 24px;
+  }
+
+  .intro {
+    font-size: 14px;
+  }
+}

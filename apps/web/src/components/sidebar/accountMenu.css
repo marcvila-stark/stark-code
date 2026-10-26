@@ -1,0 +1,290 @@
+.stark-sidebar-account-trigger {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.stark-sidebar-account-trigger:hover {
+  background: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+.stark-sidebar-account-trigger:focus-visible,
+.stark-account-menu button:focus-visible {
+  outline: 1px solid #9a8a5c;
+  outline-offset: 2px;
+}
+
+.stark-sidebar-account-avatar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid #a6a69c;
+  border-radius: 7px;
+  color: #53534c;
+  background: #ecece6;
+}
+
+.stark-sidebar-account-avatar > svg {
+  width: 16px;
+  height: 16px;
+}
+
+.stark-sidebar-account-avatar-claude {
+  border-color: #cbb4a7;
+  color: #b46d4d;
+  background: #f2e9e3;
+}
+
+.stark-sidebar-account-identity {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.stark-sidebar-account-identity > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+.stark-sidebar-account-identity > span:first-child {
+  font-size: 12px;
+  font-weight: 500;
+  color: #42423d;
+}
+
+.stark-sidebar-account-identity > span:last-child {
+  font-size: 11px;
+  color: #707068;
+}
+
+.stark-sidebar-account-chevron {
+  width: 12px;
+  height: 12px;
+  margin-left: auto;
+  color: #888883;
+}
+
+.dark .stark-sidebar-account-avatar {
+  border-color: #44443e;
+  color: #ccccbf;
+  background: #20201d;
+}
+
+.dark .stark-sidebar-account-avatar-claude {
+  border-color: #4a3930;
+  color: #c47d5c;
+  background: #211a16;
+}
+
+.dark .stark-sidebar-account-identity > span:first-child {
+  color: #d9d9d4;
+}
+
+.dark .stark-sidebar-account-identity > span:last-child {
+  color: #9c9c96;
+}
+
+/* These neutral colors are the approved account menu, independent of page surfaces. */
+.stark-account-menu {
+  --popover: #f7f7f3;
+  --popover-foreground: #42423d;
+  --border: #d7d7cf;
+  --muted-foreground: #74746a;
+  --sr-text: #42423d;
+  --sr-muted: #74746a;
+  --sr-gold: #8a7441;
+  --sr-border: #d7d7cf;
+  --account-hover: #eaeae4;
+  --account-selected: #e5e5dd;
+  --account-heading: #42423d;
+  --account-group: #79796f;
+}
+
+.dark .stark-account-menu {
+  --popover: #1a1a1a;
+  --popover-foreground: #d4d4cc;
+  --border: #3b3b39;
+  --muted-foreground: #97978a;
+  --sr-text: #bdbdb1;
+  --sr-muted: #97978a;
+  --sr-gold: #c4aa74;
+  --sr-border: #343431;
+  --account-hover: #242424;
+  --account-selected: #262626;
+  --account-heading: #d4d4cb;
+  --account-group: #79796f;
+}
+
+.stark-account-menu-content {
+  padding: 8px;
+}
+
+.stark-account-menu-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 9px 8px;
+}
+
+.stark-account-menu-heading h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--account-heading);
+}
+
+.stark-account-menu-heading h3 > svg {
+  width: 16px;
+  height: 16px;
+}
+
+.stark-account-menu-heading > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 0;
+  border-radius: 5px;
+  font-size: 10px;
+  color: var(--sr-muted);
+  cursor: pointer;
+}
+
+.stark-account-menu-heading > button > svg {
+  width: 12px;
+  height: 12px;
+}
+
+.stark-account-menu button:disabled {
+  cursor: default;
+}
+
+.stark-account-menu-heading > button:disabled {
+  opacity: 0.5;
+}
+
+.stark-account-menu-group {
+  padding: 4px 10px 12px;
+  color: var(--account-group);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.stark-account-option {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+  min-height: 78px;
+  gap: 9px;
+  padding: 10px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--popover-foreground);
+  text-align: left;
+  cursor: pointer;
+}
+
+.stark-account-option-provider {
+  display: block;
+}
+
+.stark-account-option:hover {
+  background: var(--account-hover);
+}
+
+.stark-account-option[aria-pressed="true"] {
+  background: var(--account-selected);
+}
+
+.stark-account-option-name {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.stark-account-usage-summary {
+  display: grid;
+  gap: 4px;
+  margin-top: 4px;
+  color: var(--sr-muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.stark-account-menu-footer {
+  margin-top: 8px;
+  padding-top: 5px;
+  border-top: 1px solid var(--sr-border);
+}
+
+.stark-account-menu-footer > button,
+.stark-account-menu-manage > button:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--sr-muted);
+  text-align: left;
+  cursor: pointer;
+}
+
+.stark-account-menu-footer button:hover {
+  background: var(--account-hover);
+}
+
+.stark-account-menu-manage {
+  display: flex;
+  align-items: center;
+}
+
+.stark-account-menu-manage > button:first-child {
+  flex: 1;
+  width: auto;
+}
+
+.stark-account-menu-help {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  margin-right: 4px;
+  border-radius: 6px;
+  color: var(--account-group);
+  cursor: pointer;
+}
+
+.stark-account-menu-help > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.stark-account-menu-footer p {
+  margin: 8px 10px 10px;
+  color: var(--sr-muted);
+  font-size: 10px;
+  line-height: 1.6;
+}

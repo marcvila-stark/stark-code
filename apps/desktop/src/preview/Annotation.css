@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--stark-font-sans);
+  --font-mono: var(--stark-font-mono);
+  --color-background: var(--stark-background);
+  --color-foreground: var(--stark-foreground);
+  --color-popover: var(--stark-popover);
+  --color-popover-foreground: var(--stark-popover-foreground);
+  --color-primary: var(--stark-primary);
+  --color-primary-foreground: var(--stark-primary-foreground);
+  --color-muted: var(--stark-muted);
+  --color-muted-foreground: var(--stark-muted-foreground);
+  --color-accent: var(--stark-accent);
+  --color-accent-foreground: var(--stark-accent-foreground);
+  --color-border: var(--stark-border);
+  --color-input: var(--stark-input);
+  --color-ring: var(--stark-ring);
+  --radius-sm: calc(var(--stark-radius) - 4px);
+  --radius-md: calc(var(--stark-radius) - 2px);
+  --radius-lg: var(--stark-radius);
+  --radius-xl: calc(var(--stark-radius) + 4px);
+  --radius-2xl: calc(var(--stark-radius) + 8px);
+}
+
+:host {
+  --stark-font-sans:
+    "DM Sans Variable", "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  --stark-font-mono:
+    "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  --stark-radius: 0.625rem;
+  --stark-background: white;
+  --stark-foreground: oklch(0.269 0 0);
+  --stark-popover: white;
+  --stark-popover-foreground: oklch(0.269 0 0);
+  --stark-primary: oklch(0.488 0.217 264);
+  --stark-primary-foreground: white;
+  --stark-muted: rgb(0 0 0 / 4%);
+  --stark-muted-foreground: oklch(0.556 0 0);
+  --stark-accent: rgb(0 0 0 / 4%);
+  --stark-accent-foreground: oklch(0.269 0 0);
+  --stark-border: rgb(0 0 0 / 8%);
+  --stark-input: rgb(0 0 0 / 10%);
+  --stark-ring: oklch(0.488 0.217 264);
+  color: var(--stark-foreground);
+  font-family: var(--stark-font-sans);
+}
+
+* {
+  box-sizing: border-box;
+  border-color: var(--stark-border);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--stark-ring) 72%, transparent);
+  outline-offset: -2px;
+}

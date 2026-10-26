@@ -1,0 +1,9 @@
+src/
+pkg/
+*.AppImage
+*.pkg.tar.zst
+.SRCINFO
+starkcode-bin-*.png
+starkcode-bin-*-LICENSE
+starkcode-nightly-bin-*.png
+starkcode-nightly-bin-*-LICENSE

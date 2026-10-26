@@ -1,0 +1,12 @@
+{
+  "productName": "Stark Code",
+  "companyName": "Stark Future",
+  "bundleId": "com.starkfuture.starkcode",
+  "dataDirectory": ".stark-code",
+  "profileName": "stark-code",
+  "iconPath": "assets/stark/icon-macos.png",
+  "telemetryEnabled": false,
+  "cloudServicesEnabled": false,
+  "requireApprovalsByDefault": true,
+  "backgroundNetworkChecksEnabled": false
+}

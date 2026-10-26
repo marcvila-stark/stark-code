@@ -1,0 +1,276 @@
+/* The navigation shell follows the approved neutral sidebar independently
+   of the conversation's theme. Keep these tokens local to the chat sidebar. */
+html [data-app-sidebar="threads"][data-app-sidebar][aria-label] {
+  background: var(--sidebar);
+  color: var(--sidebar-foreground);
+  --sidebar-content-inset: 10px;
+  --sidebar-row-content-inset: 10px;
+  --surface-grain: none;
+  --background: #f6f6f4;
+  --foreground: #282825;
+  --card: #f6f6f4;
+  --card-foreground: #282825;
+  --muted-foreground: #64645e;
+  --secondary-label: #64645e;
+  --sidebar: #f6f6f4;
+  --sidebar-foreground: #282825;
+  --sidebar-muted-foreground: #64645e;
+  --sidebar-icon-color: #777770;
+  --sidebar-row-hover: #eaeae6;
+  --sidebar-row-active: #e2e2dd;
+  --sidebar-row-selected: #e2e2dd;
+  --sidebar-border: #deded8;
+  --sidebar-stage-fade: var(--sidebar);
+  --stark-sidebar-brand: #8f7b40;
+
+  @variant dark {
+    --background: #111111;
+    --foreground: #dfdfdb;
+    --card: #111111;
+    --card-foreground: #dfdfdb;
+    --muted-foreground: #a3a3a0;
+    --secondary-label: #a3a3a0;
+    --sidebar: #111111;
+    --sidebar-foreground: #dfdfdb;
+    --sidebar-muted-foreground: #a3a3a0;
+    --sidebar-icon-color: #91918d;
+    --sidebar-row-hover: #202020;
+    --sidebar-row-active: #242424;
+    --sidebar-row-selected: #242424;
+    --sidebar-border: #242424;
+    --stark-sidebar-brand: #bbaa77;
+  }
+}
+
+/* The Stark palette owns the whole navigation surface, including the olive
+   selection. Other themes retain the existing neutral navigation shell. */
+html[data-theme-id="stark-chat"] [data-app-sidebar="threads"][data-app-sidebar][aria-label] {
+  --sidebar: inherit;
+  --sidebar-foreground: inherit;
+  --sidebar-muted-foreground: inherit;
+  --sidebar-row-hover: inherit;
+  --sidebar-row-active: inherit;
+  --sidebar-row-selected: inherit;
+  --sidebar-border: inherit;
+  --sidebar-icon-color: var(--sidebar-muted-foreground);
+  --background: var(--sidebar);
+  --foreground: var(--sidebar-foreground);
+  --card: var(--sidebar);
+  --card-foreground: var(--sidebar-foreground);
+  --muted-foreground: var(--sidebar-muted-foreground);
+  --secondary-label: var(--sidebar-muted-foreground);
+  --stark-sidebar-brand: var(--stark-gold-foreground);
+}
+
+.stark-sidebar-brandrow {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  height: var(--stark-sidebar-brand-height, 56px);
+  padding: var(--stark-native-titlebar-inset, 0px) 15px 0 var(--stark-sidebar-brand-start, 20px);
+}
+
+.stark-sidebar-brand {
+  position: relative;
+  z-index: 10;
+  display: var(--stark-sidebar-brand-display, inline-flex);
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 9px;
+  color: var(--sidebar-foreground);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  border-radius: 6px;
+  -webkit-app-region: no-drag;
+}
+
+.stark-sidebar-brandrow[data-has-pill] {
+  height: calc(var(--stark-sidebar-brand-height, 56px) + 25px);
+  padding-bottom: 25px;
+}
+
+.stark-sidebar-environment {
+  position: absolute;
+  bottom: 2px;
+  left: 20px;
+  max-width: calc(100% - 40px);
+  overflow: hidden;
+}
+
+.stark-sidebar-brandmark {
+  width: 19px;
+  height: 19px;
+  flex: none;
+  border: 2px solid var(--stark-sidebar-brand, #bbaa77);
+  border-radius: 50%;
+}
+
+.stark-sidebar-brand-probe {
+  display: flex;
+  width: max-content;
+  gap: 8px;
+  padding: 0 15px 0 var(--stark-sidebar-brand-start, 20px);
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.stark-sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.stark-sidebar-workspace {
+  margin: 0 0 9px;
+}
+
+.stark-sidebar-navigation-button {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 37px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--sidebar-muted-foreground);
+  text-align: left;
+  font-size: 13px;
+  line-height: 19px;
+  cursor: pointer;
+}
+
+.stark-sidebar-navigation-button[data-workspace] {
+  height: 43px;
+  font-size: 14px;
+  color: var(--sidebar-foreground);
+}
+
+.stark-sidebar-navigation-button:hover,
+.stark-sidebar-search:hover {
+  background: var(--sidebar-row-hover);
+}
+
+.stark-sidebar-navigation-button:focus-visible,
+.stark-sidebar-brand:focus-visible {
+  outline: 1px solid var(--stark-sidebar-brand);
+  outline-offset: 2px;
+}
+
+.stark-sidebar-navigation-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.stark-sidebar-navigation-button > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--sidebar-icon-color);
+}
+
+.stark-sidebar-search {
+  display: flex;
+  min-width: 0;
+  height: 37px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  border-radius: 6px;
+}
+
+.stark-sidebar-search > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--sidebar-icon-color);
+}
+
+.stark-sidebar-search-input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--sidebar-foreground);
+  font-size: 13px;
+  line-height: 19px;
+}
+
+.stark-sidebar-search-input::placeholder {
+  color: var(--sidebar-muted-foreground);
+  opacity: 1;
+}
+
+.stark-sidebar-search:focus-within {
+  outline: 1px solid var(--stark-sidebar-brand);
+  outline-offset: -1px;
+}
+
+.stark-sidebar-list-heading {
+  display: flex;
+  height: 23px;
+  margin: 24px 0 0;
+  padding: 0 8px;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--sidebar-icon-color);
+  font-size: 11px;
+}
+
+.stark-sidebar-footer {
+  padding-top: 14px;
+  padding-bottom: 8px;
+}
+
+.stark-sidebar-utility-button {
+  height: 29px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.stark-sidebar-utility-button[data-icon] {
+  width: 25px;
+  height: 25px;
+  justify-content: center;
+  padding: 5px;
+}
+
+.stark-sidebar-chat-title {
+  font-size: 13px;
+}
+
+/* Desktop density comes from the surrounding chrome, not smaller chat text.
+   Keep the larger navigation targets on touch devices. */
+@media (pointer: fine) {
+  .stark-sidebar-workspace {
+    margin-bottom: 4px;
+  }
+
+  .stark-sidebar-nav .stark-sidebar-navigation-button:not([data-workspace]),
+  .stark-sidebar-search {
+    height: 32px;
+  }
+
+  .stark-sidebar-navigation-button[data-workspace] {
+    height: 36px;
+  }
+
+  .stark-sidebar-list-heading {
+    margin-top: 10px;
+  }
+
+  .stark-sidebar-footer {
+    padding-top: 8px;
+    padding-bottom: 4px;
+  }
+}

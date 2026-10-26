@@ -1,0 +1,10 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["StarkReviewDiffModule"],
+    "podspecPath": "StarkReviewDiffNative.podspec"
+  },
+  "android": {
+    "modules": ["expo.modules.starkreviewdiff.StarkReviewDiffModule"]
+  }
+}

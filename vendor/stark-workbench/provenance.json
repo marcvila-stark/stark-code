@@ -1,0 +1,12 @@
+{
+  "repository": "stark-workbench",
+  "commit": "9c9c7aafe8ad39286bcbaec2e698d539ed4e0b68",
+  "packageLockSha256": "8c37090276f9b412c1d4cf9c9ef346394465155e35ccf44711bb2557ea27658f",
+  "archiveSha256": "7931a16d3d70df82d87da2aeefb4d4153f897a92d70344f5eb77f04d9fac6256",
+  "files": 408,
+  "adaptations": [
+    "Hooks and command/skill examples use STARK_WORKBENCH_NODE with ELECTRON_RUN_AS_NODE=1.",
+    "STARK_WORKBENCH_MANAGED_MIRROR=1 delegates mirror lifecycle to the desktop app.",
+    "Production dependencies included, workspace symlinks materialized; tests, fixtures, source maps, caches excluded."
+  ]
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stark App Testing"
+  short_description: "Test web and desktop in Stark's Browser panel"
+  default_prompt: "Use $test-stark-app to verify the affected web or desktop flow through Stark's Browser panel."

@@ -1,0 +1,190 @@
+@layer base {
+  /* Approved document, account and setup surfaces. Kept local to these screens so
+   the conversation and composer retain their existing appearance. */
+  .stark-review-surface {
+    --sr-bg: #f7f7f3;
+    --sr-panel: #f0f1ec;
+    --sr-card: #fff;
+    --sr-border: #d6d9ce;
+    --sr-text: #272a23;
+    --sr-muted: #636b5d;
+    --sr-gold: #c4b483;
+    --sr-on-gold: #20241a;
+    --sr-accent: #e5e8df;
+    --background: var(--sr-bg);
+    --foreground: var(--sr-text);
+    --card: var(--sr-card);
+    --card-foreground: var(--sr-text);
+    --popover: var(--sr-panel);
+    --popover-foreground: var(--sr-text);
+    --muted: var(--sr-panel);
+    --muted-foreground: var(--sr-muted);
+    --placeholder: var(--sr-muted);
+    --secondary-label: var(--sr-muted);
+    --icon-muted: var(--sr-muted);
+    --accent: var(--sr-accent);
+    --accent-foreground: var(--sr-text);
+    --primary: var(--sr-gold);
+    --primary-foreground: var(--sr-on-gold);
+    --border: var(--sr-border);
+    --input: var(--sr-border);
+    --ring: var(--sr-gold);
+    --sidebar: var(--sr-panel);
+    --sidebar-foreground: var(--sr-text);
+    --sidebar-muted-foreground: var(--sr-muted);
+    --sidebar-accent: var(--sr-accent);
+    --sidebar-accent-foreground: var(--sr-text);
+    --sidebar-border: var(--sr-border);
+    --contrast-foreground: var(--sr-text);
+    --contrast-card-foreground: var(--sr-text);
+    --contrast-popover-foreground: var(--sr-text);
+    --contrast-muted-foreground: var(--sr-muted);
+    --contrast-placeholder: var(--sr-muted);
+    --contrast-secondary-label: var(--sr-muted);
+    --contrast-icon-muted: var(--sr-muted);
+    --contrast-accent-foreground: var(--sr-text);
+    --contrast-primary-foreground: var(--sr-on-gold);
+    --contrast-border: var(--sr-border);
+    --contrast-input: var(--sr-border);
+    --contrast-sidebar-foreground: var(--sr-text);
+    --contrast-sidebar-muted-foreground: var(--sr-muted);
+    --contrast-sidebar-accent-foreground: var(--sr-text);
+    --contrast-sidebar-border: var(--sr-border);
+  }
+
+  .dark .stark-review-surface,
+  .dark.stark-review-surface {
+    --sr-bg: #101112;
+    --sr-panel: #181a1b;
+    --sr-card: #1a1c1d;
+    --sr-border: #363a37;
+    --sr-text: #dddcd7;
+    --sr-muted: #9ba196;
+    --sr-accent: #2b3028;
+  }
+}
+/* Attached skills are controls, separate from the editable message. */
+.composer-attached-skills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+.composer-attached-skill {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  gap: 0;
+  padding: 2px;
+  border: 1px solid color-mix(in srgb, var(--foreground) 13%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  color: var(--foreground);
+  font-size: 14px;
+  line-height: 20px;
+}
+.composer-attached-skill-label,
+.composer-attached-skill-remove {
+  cursor: pointer;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  border-radius: 5px;
+}
+.composer-attached-skill-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  max-width: 280px;
+}
+.composer-attached-skill-label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-attached-skill-label svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+.composer-attached-skill-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 30px;
+  color: var(--muted-foreground);
+}
+.composer-attached-skill-remove svg {
+  width: 16px;
+  height: 16px;
+}
+.composer-attached-skill-label:hover,
+.composer-attached-skill-remove:hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+}
+.composer-attached-skill button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.composer-attached-skill button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* A quiet, full-height home tab keeps chat distinct from opened documents. */
+[data-stark-sidebar-layout] {
+  --stark-native-titlebar-inset: 0px;
+}
+[data-stark-sidebar-layout][data-native-window-controls="macos"] {
+  --workspace-topbar-height: 76px;
+  --stark-native-titlebar-inset: 24px;
+}
+[data-stark-sidebar-layout][data-native-window-controls="macos"][data-sidebar-state="collapsed"] {
+  --workspace-topbar-height: 52px;
+  --stark-native-titlebar-inset: 0px;
+}
+[data-chat-header],
+[data-conversation-titlebar-controls],
+[data-right-panel-tabbar][data-conversation-titlebar="true"] {
+  padding-top: var(--stark-native-titlebar-inset, 0px);
+}
+.stark-conversation-tablist {
+  height: calc(var(--workspace-topbar-height) - var(--stark-native-titlebar-inset, 0px) - 1px);
+}
+.stark-conversation-chat-tab {
+  position: relative;
+  height: 100%;
+  gap: 7px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--stark-gold-foreground);
+}
+.stark-conversation-chat-tab > svg {
+  width: 16px;
+  height: 16px;
+}
+.stark-conversation-chat-tab::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0;
+  height: 2px;
+  background: transparent;
+}
+.stark-conversation-chat-tab[aria-selected="true"]::after {
+  background: var(--stark-gold-foreground);
+}
+.stark-conversation-chat-tab:hover {
+  background: color-mix(in srgb, var(--stark-gold) 5%, transparent);
+}
+html[data-theme-id="stark-chat"] {
+  --stark-gold: #c5af75;
+  --stark-gold-foreground: light-dark(#8b7440, #c5af75);
+}
