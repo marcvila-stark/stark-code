@@ -2,7 +2,7 @@
 
 The private source repository and download location are [starkfuture/stark-code](https://github.com/starkfuture/stark-code). Desktop installers are attached to prereleases in [GitHub Releases](https://github.com/starkfuture/stark-code/releases). Repository access is required to download them. Do not expose a token in a download URL.
 
-The initial distribution targets Apple silicon and macOS 13.3+. It is ad hoc signed, not Developer ID signed or notarized. It does not use the App Store. Automatic updates remain disabled; testers install each update manually. Do not describe the initial installer as production ready or as verified on Intel Macs.
+The initial distribution targets Apple silicon and macOS 13.3+. It preserves the tested development signature; it is not Developer ID signed or notarized. It does not use the App Store. Automatic updates remain disabled; testers install each update manually. Do not describe the initial installer as production ready or as verified on Intel Macs.
 
 ## Build
 
