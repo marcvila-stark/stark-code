@@ -12,6 +12,7 @@ import {
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurnTokenUsage,
+  type OrchestrationV2ThreadProjection,
   ProjectId,
   ProviderInstanceId,
   ProviderSessionId,
@@ -26,6 +27,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -377,18 +379,25 @@ const waitForIdle = Effect.fn("ProviderSwitchTest.waitForIdle")(function* (
   targetThreadId: ThreadId,
 ) {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
-  for (let attempt = 0; attempt < 1_000; attempt += 1) {
-    const projection = yield* orchestrator.getThreadProjection(targetThreadId);
-    if (
-      projection.runs.every(
-        (run) => !["queued", "starting", "running", "waiting"].includes(run.status),
-      )
-    ) {
-      return projection;
-    }
-    yield* Effect.sleep("5 millis");
-  }
-  return yield* Effect.die(new Error("Provider switch test timed out waiting for idle"));
+  const eventSink = yield* EventSink.EventSinkV2;
+  const isIdle = (projection: OrchestrationV2ThreadProjection) =>
+    projection.runs.every(
+      (run) => !["queued", "starting", "running", "waiting"].includes(run.status),
+    );
+  // Read the replay cursor first so a commit between the state read and
+  // subscription is observed, even when real Git work takes several seconds.
+  const afterSequence = yield* eventSink.latestSequence({ threadId: targetThreadId });
+  const current = yield* orchestrator.getThreadProjection(targetThreadId);
+  if (isIdle(current)) return current;
+  const idle = yield* orchestrator
+    .streamStoredEventsFrom({ threadId: targetThreadId, afterSequence })
+    .pipe(
+      Stream.mapEffect(() => orchestrator.getThreadProjection(targetThreadId)),
+      Stream.filter(isIdle),
+      Stream.runHead,
+    );
+  if (Option.isSome(idle)) return idle.value;
+  return yield* Effect.die(new Error("Provider switch event stream ended before idle"));
 });
 
 describe("orchestration v2 provider switching", () => {
