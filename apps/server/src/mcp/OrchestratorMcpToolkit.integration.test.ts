@@ -48,6 +48,8 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { McpSchema, McpServer } from "effect/ai";
 
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
@@ -530,17 +532,24 @@ const layerUnusedScheduledTaskStub = Layer.succeed(
 );
 
 describe("orchestrator MCP toolkit", () => {
-  // Keep the real-Git scenarios, and also exercise their accumulated state in one runtime.
-  it.live.each(["MCP tools", "late completions", "wide fan-out", "combined"] as const)(
+  // Test accumulated workflow state separately from the real filesystem checkpoint boundary.
+  const workflowScenarios = [
+    "MCP tools",
+    "late completions",
+    "wide fan-out",
+    "combined",
+    "Git checkpoints",
+  ] as const;
+  it.live.each(workflowScenarios)(
     "%s preserves delegated-task lifecycle and delivery",
     (scenario) =>
       Effect.scoped(
         Effect.gen(function* () {
-          // The combined oracle is orchestration/delivery, not repeated Git subprocesses.
-          // A non-Git workspace and store preserve the real checkpoint service's missing-file
-          // path; the individual scenarios still exercise the filesystem-backed store.
+          // Workflow oracles use known non-Git directories, avoiding hundreds of unrelated
+          // Git processes inside tool wait budgets. The Git journey below separately
+          // awaits durable completion and verifies the actual checkpoint's file bytes.
           const workspace = (name: string) =>
-            scenario === "combined"
+            scenario !== "Git checkpoints"
               ? FileSystem.FileSystem.pipe(
                   Effect.flatMap((fs) =>
                     fs.makeTempDirectoryScoped({ prefix: `stark-mcp-${name}-` }),
@@ -637,7 +646,7 @@ describe("orchestrator MCP toolkit", () => {
               },
             },
             layerRegistry,
-            scenario === "combined"
+            scenario !== "Git checkpoints"
               ? {
                   checkpointStoreLayer: Layer.mock(CheckpointStore.CheckpointStore)({
                     isGitRepository: () => Effect.succeed(false),
@@ -764,6 +773,119 @@ describe("orchestrator MCP toolkit", () => {
               }
               return taskEvent.event.payload;
             };
+            if (scenario === "Git checkpoints") {
+              yield* orchestrator.dispatch({
+                type: "thread.create",
+                createdBy: "user",
+                creationSource: "web",
+                commandId: CommandId.make("command:mcp-git:create"),
+                threadId: parentThreadId,
+                projectId,
+                title: "Git checkpoint parent",
+                modelSelection: codexSelection,
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: cwd,
+              });
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                createdBy: "user",
+                creationSource: "web",
+                commandId: CommandId.make("command:mcp-git:start"),
+                threadId: parentThreadId,
+                messageId: MessageId.make("message:mcp-git:start"),
+                text: parentPrompt,
+                attachments: [],
+                modelSelection: codexSelection,
+                dispatchMode: { type: "start_immediately" },
+              });
+              yield* waitForProjection(orchestrator, parentThreadId, (projection) =>
+                projection.providerTurns.some((turn) => turn.status === "running"),
+              );
+              const invocation: McpInvocationContext.McpInvocationScope = {
+                environmentId: EnvironmentId.make("environment:mcp-git"),
+                requestNamespace: "mcp-git-parent",
+                thread: {
+                  threadId: parentThreadId,
+                  providerSessionId: "mcp-git-parent",
+                  providerInstanceId: codexInstanceId,
+                },
+                client: undefined,
+                capabilities: new Set(["orchestration"]),
+                issuedAt: 1,
+              };
+              const invoke = (name: string, args: Record<string, unknown>) =>
+                server
+                  .callTool({ name, arguments: args })
+                  .pipe(
+                    Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+                    Effect.provideService(McpSchema.McpServerClient, client),
+                  );
+              const delegatedCall = yield* invoke("delegate_task", {
+                task: cancellationPrompt,
+                target: { providerInstanceId: claudeInstanceId, model: claudeModel },
+                runtimeMode: "approval-required",
+                mode: "async",
+                clientRequestId: "git-child",
+              });
+              expect(delegatedCall.isError).toBe(false);
+              const delegated = yield* decodeDelegateTaskResult(delegatedCall.structuredContent);
+              const activeChild = yield* waitForProjection(
+                orchestrator,
+                delegated.childThreadId,
+                (projection) => projection.providerTurns.some((turn) => turn.status === "running"),
+              );
+              const childRun = activeChild.runs.find((run) => run.status === "running");
+              if (childRun === undefined) return yield* Effect.die("Git child run missing.");
+              const fs = yield* FileSystem.FileSystem;
+              const contents = "Changes made during the delegated turn.\n";
+              yield* fs.writeFileString(`${cwd}/capture-smoke.txt`, contents);
+              const interrupted = yield* invoke("stark_thread_interrupt", {
+                threadId: delegated.childThreadId,
+                clientRequestId: "git-child-stop",
+              });
+              expect(interrupted.isError).toBe(false);
+              // A real checkpoint can exceed a caller's wait budget. Await its persisted
+              // milestone instead of assuming that a ten-second wait must finish the run.
+              const completedChild = yield* waitForProjection(
+                orchestrator,
+                delegated.childThreadId,
+                (projection) => {
+                  const run = projection.runs.find((candidate) => candidate.id === childRun.id);
+                  return (
+                    run?.status === "interrupted" &&
+                    projection.checkpoints.some(
+                      (checkpoint) =>
+                        checkpoint.id === run.checkpointId && checkpoint.status === "ready",
+                    )
+                  );
+                },
+              );
+              const checkpoint = completedChild.checkpoints.find(
+                (candidate) => candidate.runId === childRun.id && candidate.status === "ready",
+              );
+              if (checkpoint === undefined)
+                return yield* Effect.die("Git child checkpoint missing.");
+              expect(checkpoint.files.some((file) => file.path === "capture-smoke.txt")).toBe(true);
+              const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+              const captured = yield* spawner.string(
+                ChildProcess.make("git", ["show", `${checkpoint.ref}:capture-smoke.txt`], { cwd }),
+              );
+              expect(captured).toBe(contents);
+              const waitedCall = yield* invoke("stark_thread_wait", {
+                threadId: delegated.childThreadId,
+                runId: childRun.id,
+                timeoutMs: 1,
+              });
+              expect(waitedCall.isError).toBe(false);
+              const waited = yield* decodeThreadWaitResult(waitedCall.structuredContent);
+              expect(waited).toMatchObject({
+                runId: childRun.id,
+                status: "interrupted",
+                timedOut: false,
+              });
+            }
             if (scenario === "MCP tools" || scenario === "combined") {
               yield* orchestrator.dispatch({
                 type: "thread.create",
@@ -3902,7 +4024,7 @@ describe("orchestrator MCP toolkit", () => {
                 ]),
               );
             }
-          }).pipe(Effect.provide(layerTest));
+          }).pipe(Effect.provide(Layer.merge(layerTest, NodeServices.layer)));
         }),
       ),
   );
