@@ -162,7 +162,9 @@ node scripts/sign-local-macos.ts --app "/path/to/Stark Code (Alpha).app" --ident
 This local command preserves the unsigned build's runtime policy, uses Electron's
 per-file entitlements, and does not notarize or change Keychain permissions. It is
 separate from distribution signing; macOS may require an initial approval for the
-signing key and the newly signed app. Make no bundle changes after signing.
+signing key and the newly signed app. Make no bundle changes after signing. To rehearse with
+hardened runtime instead, build with `--signed` and `STARK_CODE_MACOS_SIGNING_MODE=development`
+([Signed macOS builds](./release.md#signed-macos-builds)).
 
 ### Linux AppImage prerequisites
 
@@ -218,5 +220,7 @@ passed as `--wsl-runtime`; see the
 ### Signing and passkeys
 
 Add `--signed` after configuring the platform credentials in the
-[release runbook](./release.md). macOS passkeys need a signed, provisioned app; follow the
+[release runbook](./release.md); a signed macOS build stops early when they are incomplete.
+macOS passkeys need a signed, provisioned app and are opted into with
+`STARK_CODE_MACOS_PROVISIONING_PROFILE`; follow the
 [Connect setup](./connect-setup.md#desktop-passkeys) for local signing and renderer HMR.

@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { act, create, type ReactTestRenderer } from "react-test-renderer";
+import { act, create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import type { RuntimeMode, ProviderInteractionMode } from "@starkfuture/contracts";
 
@@ -21,8 +21,18 @@ vi.mock("../ui/menu", () => ({
       {children}
     </select>
   ),
-  MenuRadioItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
+  MenuRadioItem: ({
+    value,
+    disabled,
+    children,
+  }: {
+    value: string;
+    disabled?: boolean;
+    children: ReactNode;
+  }) => (
+    <option value={value} disabled={disabled}>
+      {children}
+    </option>
   ),
 }));
 vi.mock("./composerEventScope", () => ({ useComposerMenuProps: () => ({}) }));
@@ -31,6 +41,8 @@ import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { runtimeModeOptionsForProvider } from "./runtimeModeConfig";
 
 let renderer: ReactTestRenderer | undefined;
+const text = (node: ReactTestInstance | string): string =>
+  typeof node === "string" ? node : node.children.map(text).join(" ");
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
 afterEach(async () => {
   await act(async () => renderer?.unmount());
@@ -53,6 +65,7 @@ it("selects native Claude modes and leaves Plan when Manual or Auto is selected"
           runtimeMode={runtimeMode}
           interactionMode={interactionMode}
           runtimeModeOptions={runtimeModeOptionsForProvider("claudeAgent")}
+          canWriteSettings
           onRuntimeModeChange={(mode) => {
             setRuntimeMode(mode);
             return true;
@@ -68,7 +81,7 @@ it("selects native Claude modes and leaves Plan when Manual or Auto is selected"
     renderer = create(<Composer />);
   });
   expect(renderer!.root.findAllByType("select")).toHaveLength(1);
-  expect(renderer!.root.findAllByType("option").map((option) => option.children.join(""))).toEqual([
+  expect(renderer!.root.findAllByType("option").map((option) => text(option))).toEqual([
     "Manual",
     "Accept edits",
     "Auto",
@@ -113,6 +126,7 @@ it.each([false, true])(
             runtimeMode={runtimeMode}
             interactionMode={interactionMode}
             runtimeModeOptions={runtimeModeOptionsForProvider("claudeAgent")}
+            canWriteSettings
             onRuntimeModeChange={async (mode) => {
               const confirmed = await pending;
               if (confirmed) setRuntimeMode(mode);
@@ -140,3 +154,36 @@ it.each([false, true])(
     );
   },
 );
+
+it("disables the wider modes without the settings permission and never sends them", async () => {
+  const onRuntimeModeChange = vi.fn(() => true);
+  await act(async () => {
+    renderer = create(
+      <CompactComposerControlsMenu
+        combinePlanMode
+        showInteractionModeToggle
+        runtimeMode="approval-required"
+        interactionMode="default"
+        runtimeModeOptions={runtimeModeOptionsForProvider("claudeAgent")}
+        canWriteSettings={false}
+        onRuntimeModeChange={onRuntimeModeChange}
+        onToggleInteractionMode={() => {}}
+      />,
+    );
+  });
+  expect(
+    renderer!.root
+      .findAllByType("option")
+      .map((option) => [text(option), option.props.disabled === true]),
+  ).toEqual([
+    ["Manual", false],
+    ["Accept edits Needs settings permission", true],
+    ["Auto Needs settings permission", true],
+    ["Plan", false],
+    ["Bypass permissions Needs settings permission", true],
+  ]);
+  await act(async () =>
+    renderer!.root.findByType("select").props.onChange({ target: { value: "auto" } }),
+  );
+  expect(onRuntimeModeChange).not.toHaveBeenCalled();
+});

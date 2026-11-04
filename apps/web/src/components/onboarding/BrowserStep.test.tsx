@@ -105,20 +105,19 @@ function profileButton(name: string) {
   if (!(match instanceof HTMLButtonElement)) throw new Error(`Missing profile: ${name}`);
   return match;
 }
-function checkbox(label: string) {
-  const match = [...document.querySelectorAll<HTMLElement>('[role="checkbox"]')].find(
-    (candidate) => candidate.getAttribute("aria-label") === label,
-  );
-  if (!match) throw new Error(`Missing checkbox: ${label}`);
+function siteCheckbox(site: string) {
+  const match = [...document.querySelectorAll("label")]
+    .find((candidate) => candidate.textContent === site)
+    ?.querySelector<HTMLElement>('[role="checkbox"]');
+  if (!match) throw new Error(`Missing site checkbox: ${site}`);
   return match;
 }
-async function chooseSiteAndConsent(site: string) {
-  expect(button("Select sites to import").disabled).toBe(true);
-  expect(checkbox(site).getAttribute("aria-checked")).toBe("false");
-  await act(async () => checkbox(site).click());
-  expect(button("Import 1 site").disabled).toBe(true);
-  await act(async () => checkbox("Allow copying sign-ins for selected sites").click());
-  expect(button("Import 1 site").disabled).toBe(false);
+/** Ticks one site; the copy button, which is the confirmation, then names it. */
+async function chooseSite(site: string) {
+  expect(button("Copy sign-ins").disabled).toBe(true);
+  expect(siteCheckbox(site).getAttribute("aria-checked")).toBe("false");
+  await act(async () => siteCheckbox(site).click());
+  expect(button("Copy sign-ins for 1 site").disabled).toBe(false);
 }
 const mount = () =>
   act(async () =>
@@ -230,12 +229,14 @@ describe("browser import onboarding", () => {
   it("reviews the selected browser profile and imports only after the exact choice is confirmed", async () => {
     await mount();
     await click("Review before importing");
-    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Import from Chrome");
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+      "Use your Chrome sign-ins in Stark Code",
+    );
     await act(async () => profileButton("Work").click());
     expect(importCookies).not.toHaveBeenCalled();
-    await chooseSiteAndConsent("work.example");
+    await chooseSite("work.example");
     expect(importCookies).not.toHaveBeenCalled();
-    await click("Import 1 site");
+    await click("Copy sign-ins for 1 site");
     expect(importCookies).toHaveBeenCalledExactlyOnceWith({
       environmentId: "local-environment",
       sourceId: "chrome",
@@ -266,8 +267,8 @@ describe("browser import onboarding", () => {
     await click("Review before importing");
     mocks.getSettings.mockReturnValue({ ...initialSettings, browserDefaultProfileId: "personal" });
     await mount();
-    await chooseSiteAndConsent("personal.example");
-    await click("Import 1 site");
+    await chooseSite("personal.example");
+    await click("Copy sign-ins for 1 site");
     expect(importCookies).toHaveBeenCalledExactlyOnceWith({
       environmentId: "local-environment",
       sourceId: "chrome",
@@ -286,8 +287,8 @@ describe("browser import onboarding", () => {
     });
     await mount();
     await click("Review before importing");
-    await chooseSiteAndConsent("personal.example");
-    await click("Import 1 site");
+    await chooseSite("personal.example");
+    await click("Copy sign-ins for 1 site");
     expect(importCookies).toHaveBeenCalledExactlyOnceWith({
       environmentId: "local-environment",
       sourceId: "chrome",
@@ -308,7 +309,9 @@ describe("browser import onboarding", () => {
     expect(importCookies).not.toHaveBeenCalled();
     await click("I’ve quit it");
     expect(listSources).toHaveBeenCalledTimes(2);
-    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Import from Chrome");
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+      "Use your Chrome sign-ins in Stark Code",
+    );
     expect(importCookies).not.toHaveBeenCalled();
     await click("Cancel");
     expect(importCookies).not.toHaveBeenCalled();
@@ -318,8 +321,8 @@ describe("browser import onboarding", () => {
     importCookies.mockResolvedValue({ imported: 0, skipped: 0, skippedDomains: [] });
     await mount();
     await click("Review before importing");
-    await chooseSiteAndConsent("personal.example");
-    await click("Import 1 site");
+    await chooseSite("personal.example");
+    await click("Copy sign-ins for 1 site");
     expect(document.querySelector('[role="dialog"]')?.textContent).toContain("No cookies found");
     await click("Done");
     expect(container.textContent).not.toContain("Browser sign-ins imported");
@@ -331,8 +334,8 @@ describe("browser import onboarding", () => {
     importCookies.mockRejectedValue(new Error("Authorization: private-cookie-value"));
     await mount();
     await click("Review before importing");
-    await chooseSiteAndConsent("personal.example");
-    await click("Import 1 site");
+    await chooseSite("personal.example");
+    await click("Copy sign-ins for 1 site");
     expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
       "Couldn’t import from Chrome",
     );
@@ -372,10 +375,10 @@ describe("browser import onboarding", () => {
 it("refuses local cookie import after the destination computer changes", async () => {
   await mount();
   await click("Review before importing");
-  await chooseSiteAndConsent("personal.example");
+  await chooseSite("personal.example");
   mocks.environment = { environmentId: "another-environment" };
   await mount();
-  await click("Import 1 site");
+  await click("Copy sign-ins for 1 site");
   expect(importCookies).not.toHaveBeenCalled();
   expect(document.body.textContent).toContain("Couldn’t import from Chrome");
 });

@@ -2,13 +2,17 @@ import type { EnvironmentId, McpServersListInput } from "@starkfuture/contracts"
 import { useEffect, useEffectEvent } from "react";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
+import { mcpStatusMemory, mcpStatusTargetKey } from "./mcpStatusMemory";
 
 type Subscriber = { refresh: () => void; interval: number };
 type Poller = { subscribers: Set<Subscriber>; timer: ReturnType<typeof setInterval> | undefined };
 const pollers = new Map<string, Poller>();
 const isVisible = () => typeof document === "undefined" || document.visibilityState !== "hidden";
 
-/** The chip, warning and open panel share one poller and one query for their target. */
+/**
+ * The chip, warning and open panel share one poller and one query for their
+ * target. Every result is also remembered so a later open can show it first.
+ */
 export function useMcpServersQuery(
   environmentId: EnvironmentId,
   target: McpServersListInput,
@@ -20,12 +24,11 @@ export function useMcpServersQuery(
   const refresh = useEffectEvent(() => {
     if (isVisible() && !query.isPending) query.refresh();
   });
-  const key = JSON.stringify([
-    environmentId,
-    target.threadId,
-    target.providerInstanceId,
-    target.projectId,
-  ]);
+  const key = mcpStatusTargetKey(environmentId, target);
+  useEffect(() => {
+    if (query.data && query.dataUpdatedAt > 0)
+      mcpStatusMemory.remember(key, { result: query.data, receivedAt: query.dataUpdatedAt });
+  }, [key, query.data, query.dataUpdatedAt]);
   useEffect(() => {
     const subscriber = { refresh: () => refresh(), interval };
     const existing = pollers.get(key);

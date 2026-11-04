@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
+import { ScheduledTaskId, ScheduledTaskRunId, type ScheduledTaskRun } from "@starkfuture/contracts";
 import {
   formatNextScheduledTaskRun,
   formatScheduledTaskInterval,
+  formatScheduledTaskLastRun,
 } from "./scheduledTaskPresentation";
 
 const MINUTE = 60_000;
@@ -73,5 +75,37 @@ describe("formatNextScheduledTaskRun", () => {
 
   it("does not show an invalid date", () => {
     expect(formatNextScheduledTaskRun("invalid", now)).toBe("Next run unavailable");
+  });
+});
+
+describe("formatScheduledTaskLastRun", () => {
+  const run = (overrides: Partial<ScheduledTaskRun>): ScheduledTaskRun => ({
+    id: ScheduledTaskRunId.make("scheduled-run:1"),
+    taskId: ScheduledTaskId.make("scheduled-task:1"),
+    trigger: "scheduled",
+    state: "succeeded",
+    error: null,
+    threadId: null,
+    webhookDeliveryId: null,
+    createdAt: new Date(now - 3 * 60 * MINUTE).toISOString(),
+    startedAt: new Date(now - 5 * MINUTE).toISOString(),
+    endedAt: null,
+    ...overrides,
+  });
+
+  it("names the newest run's state and when it started", () => {
+    expect(formatScheduledTaskLastRun(run({}), now)).toBe("Last run: Succeeded · 5m ago");
+    expect(
+      formatScheduledTaskLastRun(
+        run({ state: "running", startedAt: new Date(now).toISOString() }),
+        now,
+      ),
+    ).toBe("Last run: Running · just now");
+  });
+
+  it("dates a run that never started by when it was due", () => {
+    expect(formatScheduledTaskLastRun(run({ state: "skipped", startedAt: null }), now)).toBe(
+      "Last run: Skipped · 3h ago",
+    );
   });
 });

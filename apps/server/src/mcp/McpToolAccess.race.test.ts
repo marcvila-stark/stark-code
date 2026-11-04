@@ -16,6 +16,7 @@ import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { DispatchModeLimit } from "../orchestration-v2/DispatchModeLimit.ts";
+import { DispatchSettingsWrite } from "../orchestration-v2/DispatchSettingsWrite.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -116,7 +117,11 @@ const renameRacingTheUser = (threadId: ThreadId, userRaises: boolean) =>
                   threadId: input.threadId,
                   runtimeMode: "full-access",
                 })
-                .pipe(Effect.provideService(DispatchModeLimit, undefined), Effect.orDie);
+                .pipe(
+                  Effect.provideService(DispatchModeLimit, undefined),
+                  Effect.provideService(DispatchSettingsWrite, undefined),
+                  Effect.orDie,
+                );
               yield* Ref.set(raised, true);
             }
             yield* threads

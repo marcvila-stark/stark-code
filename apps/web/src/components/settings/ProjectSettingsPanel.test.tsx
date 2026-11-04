@@ -17,6 +17,11 @@ import {
   type ServerProvider,
 } from "@starkfuture/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@starkfuture/contracts/settings";
+
+const GROUPED_CLIENT_SETTINGS = {
+  ...DEFAULT_CLIENT_SETTINGS,
+  sidebarProjectGroupingMode: "repository" as const,
+};
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@starkfuture/shared/keybindings";
 import * as Cause from "effect/Cause";
 import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
@@ -97,7 +102,7 @@ vi.mock("~/state/use-atom-command", () => ({
   ) => state[command],
 }));
 vi.mock("~/hooks/useSettings", () => ({
-  useClientSettings: () => DEFAULT_CLIENT_SETTINGS,
+  useClientSettings: () => GROUPED_CLIENT_SETTINGS,
   useUpdateClientSettings: () => state.updateClientSettings,
   usePrimarySettings: () => DEFAULT_SERVER_SETTINGS,
   useEnvironmentSettings: () => DEFAULT_SERVER_SETTINGS,
@@ -304,7 +309,7 @@ afterEach(async () => {
 function group() {
   return buildSidebarProjectSnapshots({
     projects: state.projects,
-    settings: DEFAULT_CLIENT_SETTINGS,
+    settings: GROUPED_CLIENT_SETTINGS,
     primaryEnvironmentId: primaryId,
     resolveEnvironmentLabel: (id) => id,
   })[0]!;

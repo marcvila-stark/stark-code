@@ -398,7 +398,7 @@ export function getMobileThemeVariables(
         : colors.sidebarRowActive
       : themeId === "stark-chat"
         ? appearance === "light"
-          ? colors.toolbarControl
+          ? colors.toolbarControlHover
           : colors.surface
         : colors.muted;
   const mobileColors =

@@ -13,6 +13,7 @@ import {
   TurnItemId,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ThreadProjection,
+  type ServerProviderSkill,
 } from "@starkfuture/contracts";
 import type { EnvironmentThreadShell } from "@starkfuture/client-runtime/state/models";
 import { scopeThreadRef, scopedThreadKey } from "@starkfuture/client-runtime/environment";
@@ -28,8 +29,20 @@ const state = vi.hoisted(() => ({
   update: vi.fn(),
   child: null as EnvironmentThreadShell | null,
   projection: null as OrchestrationV2ThreadProjection | null,
+  skills: [] as ServerProviderSkill[],
 }));
-vi.mock("../../state/session", () => ({ useEnvironmentScope: () => state.allowed }));
+vi.mock("../../state/session", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../state/session")>()),
+  useEnvironmentScope: () => state.allowed,
+}));
+vi.mock("../../state/environments", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../state/environments")>()),
+  useEnvironment: () => ({ connection: { phase: "connected" } }),
+}));
+vi.mock("../../runtimeRequestResponse", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../runtimeRequestResponse")>()),
+  useRuntimeResponseAttempts: () => new Map(),
+}));
 vi.mock("../../state/threads", () => ({
   threadEnvironment: {
     startTurn: "start",
@@ -48,10 +61,14 @@ vi.mock("../../state/entities", () => ({
     new Map([
       [
         parent.environmentId,
-        { environment: { capabilities: { threadSideChats: state.supportsSideChats } } },
+        {
+          environment: { capabilities: { threadSideChats: state.supportsSideChats } },
+          providers: [{ instanceId: parent.modelSelection.instanceId, skills: state.skills }],
+        },
       ],
     ]),
   useThreadShells: () => (state.child ? [state.child] : []),
+  useThreadStatus: () => (state.projection ? "live" : "empty"),
   useThreadShell: (ref: { threadId: string } | null) =>
     ref?.threadId === state.child?.id ? state.child : null,
   useThreadProjection: (ref: { threadId: string } | null) =>
@@ -139,6 +156,7 @@ beforeEach(async () => {
   state.supportsSideChats = true;
   state.child = null;
   state.projection = null;
+  state.skills = [];
   state.start.mockReset().mockResolvedValue({ _tag: "Success" });
   state.interrupt.mockReset().mockResolvedValue({ _tag: "Success" });
   state.approve.mockReset().mockResolvedValue({ _tag: "Success" });
@@ -325,12 +343,12 @@ it("keeps approval controls scoped to the side chat and disables them for read-o
   };
   state.allowed = false;
   await render();
-  expect(button("Approve").disabled).toBe(true);
-  await click("Approve");
+  expect(button("Allow once").disabled).toBe(true);
+  await click("Allow once");
   expect(state.approve).not.toHaveBeenCalled();
   state.allowed = true;
   await render();
-  await click("Approve");
+  await click("Allow once");
   expect(state.approve).toHaveBeenCalledExactlyOnceWith({
     environmentId: parent.environmentId,
     input: { threadId, requestId, decision: "accept" },
@@ -343,7 +361,7 @@ it("keeps approval controls scoped to the side chat and disables them for read-o
     })),
   };
   await render();
-  expect(button("Approve").disabled).toBe(true);
+  expect(button("Allow once").disabled).toBe(true);
 });
 
 it("restores a durable child and its unfinished draft after remount without legacy storage", async () => {
@@ -369,6 +387,24 @@ it("restores a durable child and its unfinished draft after remount without lega
   expect(container.textContent).toContain("Saved answer");
   expect(container.querySelector("textarea")?.value).toBe("Unfinished follow-up");
   expect(state.start).not.toHaveBeenCalled();
+});
+
+it("omits known skill commands from side-chat titles without changing saved records", async () => {
+  state.skills = [{ name: "plain-english", path: "/skills/plain/SKILL.md", enabled: true }];
+  state.child = makeThreadFixture({
+    id: ThreadId.make("skill-child"),
+    title: "$plain-english Explain retries",
+    lineage: {
+      parentThreadId: parent.id,
+      rootThreadId: parent.id,
+      relationshipToParent: "side_chat",
+    },
+  });
+  await render();
+  expect(container.textContent).toContain("Explain retries");
+  expect(container.textContent).not.toContain("$plain-english");
+  expect(state.child.title).toBe("$plain-english Explain retries");
+  expect(state.update).not.toHaveBeenCalled();
 });
 
 it("brings a completed response into an editable main draft without starting either agent", async () => {

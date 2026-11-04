@@ -36,7 +36,11 @@ const snapshot = (tabId: string): PreviewSessionSnapshot => ({
 beforeEach(() => {
   __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
   resetPreviewStateForTests();
-  useRightPanelStore.setState({ byThreadKey: {}, threadPanelVisibilityByThreadKey: {} });
+  useRightPanelStore.setState({
+    byThreadKey: {},
+    threadPanelInlineOpen: true,
+    threadPanelPopoverOpenByThreadKey: {},
+  });
 });
 
 describe("addBrowserSurface", () => {

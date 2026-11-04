@@ -53,6 +53,8 @@ export function ProviderAccountSwitcher({
   connected,
   onManage,
   onUsage,
+  trigger,
+  popupSide = "top",
 }: {
   context: SidebarAccountContext;
   selected: ProviderInstanceEntry;
@@ -60,6 +62,8 @@ export function ProviderAccountSwitcher({
   connected: boolean;
   onManage: () => void;
   onUsage?: () => void;
+  trigger?: React.ReactElement<React.ComponentProps<"button">> | undefined;
+  popupSide?: "top" | "right" | undefined;
 }) {
   const [open, setOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -108,29 +112,37 @@ export function ProviderAccountSwitcher({
     >
       <PopoverTrigger
         render={
-          <button
-            type="button"
-            className="stark-sidebar-account-trigger"
-            aria-label={`${label} accounts`}
-          />
+          trigger ?? (
+            <button
+              type="button"
+              className="stark-sidebar-account-trigger"
+              aria-label={`${label} accounts`}
+            />
+          )
         }
       >
-        <span className="stark-sidebar-account-avatar">
-          <ProviderInstanceIcon
-            driverKind={selected.driverKind}
-            apiBackend={selected.snapshot.apiBackend}
-            displayName={selected.displayName}
-          />
-        </span>
-        <span className="stark-sidebar-account-identity">
-          <span>{selected.displayName}</span>
-          <span>{selected.snapshot.auth.email ?? label}</span>
-        </span>
-        <ChevronDownIcon className="stark-sidebar-account-chevron" />
+        {trigger ? (
+          trigger.props.children
+        ) : (
+          <>
+            <span className="stark-sidebar-account-avatar">
+              <ProviderInstanceIcon
+                driverKind={selected.driverKind}
+                apiBackend={selected.snapshot.apiBackend}
+                displayName={selected.displayName}
+              />
+            </span>
+            <span className="stark-sidebar-account-identity">
+              <span>{selected.displayName}</span>
+              <span>{selected.snapshot.auth.email ?? label}</span>
+            </span>
+            <ChevronDownIcon className="stark-sidebar-account-chevron" />
+          </>
+        )}
       </PopoverTrigger>
       <PopoverPopup
-        side="top"
-        align="start"
+        side={popupSide}
+        align={popupSide === "right" ? "end" : "start"}
         width="account"
         variant="account"
         padding="none"

@@ -14,7 +14,7 @@ import {
   assertVisibleTurnItemsMirrorLocalTurnItems,
   projectionFor,
 } from "../shared.ts";
-import { TOOL_CALL_DENIED_WRITE_PROMPT } from "./input.ts";
+import { TOOL_CALL_DENIED_WRITE_PROMPT, TOOL_CALL_DENIED_WRITE_TARGET } from "./input.ts";
 
 export function assertToolCallDeniedWriteClaudeOutput(
   result: OrchestratorV2ScenarioResult,
@@ -41,4 +41,23 @@ export function assertToolCallDeniedWriteClaudeOutput(
   const writes = projection.turnItems.filter((item) => item.type === "file_change");
   assert.lengthOf(writes, 1);
   assert.equal(writes[0]?.status, "failed");
+
+  // The declined card showed the file the Write would create and its content;
+  // the answered approval keeps the file but not the diff.
+  const pending = result.domainEvents.flatMap((event) =>
+    event.type === "turn-item.updated" &&
+    event.payload.type === "approval_request" &&
+    event.payload.status === "waiting"
+      ? [event.payload]
+      : [],
+  );
+  assert.lengthOf(pending, 1);
+  const [proposed] = pending[0]?.proposedChanges ?? [];
+  assert.isTrue(proposed?.path.endsWith(`/${TOOL_CALL_DENIED_WRITE_TARGET}`));
+  assert.equal(proposed?.operation, "add");
+  assert.include(proposed?.patch, "+approval fixture\n");
+  const resolved = projection.turnItems.find((item) => item.type === "approval_request");
+  assert.deepEqual(resolved?.type === "approval_request" ? resolved.proposedChanges : [], [
+    { path: proposed?.path ?? "", operation: "add" },
+  ]);
 }

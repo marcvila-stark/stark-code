@@ -434,7 +434,15 @@ describe("resolveWorktreeCleanup", () => {
           projectSettingsOverrides: {
             [projectId]: {
               worktreeCleanup:
-                mode === "off" ? { mode } : { mode, rules: { worktreeKeepWhen: saved } },
+                mode === "off"
+                  ? { mode }
+                  : {
+                      mode,
+                      rules: {
+                        ...resolveWorktreeCleanup(machine, null),
+                        worktreeKeepWhen: saved,
+                      },
+                    },
             },
           },
         });

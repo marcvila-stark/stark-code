@@ -5,7 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import * as NodeVM from "node:vm";
-import { ASSISTANT_CITATION_MAX_TEXT_LENGTH } from "../packages/contracts/src/assistantCitations";
+import { ASSISTANT_CITATION_MAX_TEXT_LENGTH } from "@starkfuture/contracts";
 import { expect, it, vi } from "vite-plus/test";
 import { prepareStarkWorkbench } from "./prepare-stark-workbench.mjs";
 

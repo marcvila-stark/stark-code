@@ -3,36 +3,170 @@
 Connect a phone, browser, or another desktop app to Stark Code running on a different
 machine. That machine must stay running and reachable while you work.
 
-## Stark Connect
+## Use Stark Code from your phone or another computer
 
-Stark Connect makes an environment available to your other devices without setting
-up router forwarding. In the desktop app on the host, open **Settings →
-Connections**, sign in, and enable **Stark Connect** for that environment.
+The supported way to reach a machine from elsewhere is **Tailscale HTTPS direct
+pairing**. Tailscale gives the host a private HTTPS address on your tailnet, such as
+`https://machine.tailnet.ts.net/`, and forwards it to Stark Code on the host's
+loopback address. The host needs no open ports or LAN access, nothing runs on
+Stark-hosted servers, and the address works from any network your devices reach the
+tailnet from.
 
-For a command-line host, run:
+### What you need
+
+- Tailscale installed and signed in on the host and on every device you connect
+  from, all in the same tailnet.
+- MagicDNS and HTTPS certificates turned on for the tailnet in the Tailscale admin
+  console.
+- The host stays on and keeps Stark Code running. On a server without a desktop,
+  use the [background service](./background-service.md).
+
+### Set up the host
+
+In the desktop app on the host, open **Settings → Connections**, find **Tailscale
+HTTPS**, and choose **Setup** (or turn on its switch). Keep the HTTPS port unless
+something else on the tailnet already uses it, then confirm. Stark Code restarts
+its local server with Tailscale Serve and shows the HTTPS address. Turn it off in
+the same place, or choose **Disable**, to remove that address.
+
+Then create a pairing link in **Settings → Connections** and choose the Tailscale
+HTTPS address for it. The link looks like `https://machine.tailnet.ts.net/pair#…`.
+
+On a command-line host, start the server with Tailscale HTTPS:
 
 ```bash
-stark-code connect
+stark-code serve --tailscale-serve
 ```
 
-Follow the sign-in instructions. Setup offers a
-[background service](./background-service.md); if you decline it, start the
-server with `stark-code serve`. Saving your sign-in alone does not make the machine
-reachable.
+For a server that is already running, publish it and print a fresh pairing link
+and QR code:
 
-On your other device, sign in to the same Stark Connect account and choose the
-environment. Over SSH, the CLI prints a browser link and a short code. Open the
-link on any device, confirm the code matches, and approve. The CLI continues on
-its own, so you do not need to forward an OAuth callback port.
+```bash
+stark-code pair --tailscale
+```
 
-Stark Connect renews access credentials when needed without disconnecting a healthy
-connection. Pull request diffs and provider settings keep working after the
-previous credential expires. A failed renewal affects that request; it does not
-disconnect an otherwise healthy conversation.
+The mapping created by `pair --tailscale` persists across restarts. Remove its
+default-port mapping with:
+
+```bash
+tailscale serve --https=443 off
+```
+
+If that port is already in use, choose another with `--tailscale-serve-port`. See
+`stark-code pair --help` for other pairing options.
+
+### Open it on the other device
+
+- **Phone or tablet browser.** With Tailscale connected on the phone, open the
+  pairing link in Safari or Chrome. The host serves the full Stark Code web app,
+  so nothing else needs installing. Add it to your Home Screen to open it like an
+  app.
+- **Desktop app on another computer.** Open **Settings → Connections → Add
+  environment** and paste the pairing link.
+- **Stark Code mobile app**, where it is installed. Open **Settings →
+  Environments**, tap **+** (Add environment), and scan the QR code or paste the
+  link.
+
+Use a fresh one-time link for each device. Pairing authorizes that device for
+future connections; it reconnects without the link.
+
+### Check the host before you rely on it
+
+Run through this once for each host, and again after installing a new build:
+
+1. On the phone, with Tailscale connected, open `https://<machine>.<tailnet>.ts.net/`.
+   Stark Code loads and asks this browser to pair. If you see "No static directory configured
+   and no dev URL set." instead, the host's server has no web app bundled with it,
+   which happens with a development server or a desktop build packaged without
+   its web client. Pair from the desktop app instead, or install a build whose
+   server includes the web client.
+2. Open the pairing link on the phone. It signs in and lists the host's projects.
+3. Start a task that asks for approval, answer it from the phone, and check that
+   the host continues.
+
+### What pairing grants
+
+A standard pairing link, the default in **Create pairing link** and for
+`stark-code pair`, lets the device do almost everything you can do on the host,
+not only answer approvals:
+
+| Permission                                      | What it allows                                                              |
+| ----------------------------------------------- | --------------------------------------------------------------------------- |
+| View environment (`orchestration:read`)         | Read threads, status, checkpoints, and configuration.                       |
+| Operate tasks (`orchestration:operate`)         | Start, steer, and stop tasks, and answer approvals and questions.           |
+| Change environment settings (`settings:write`)  | Edit preferences and keybindings, and save **Always allow** approval rules. |
+| Manage providers (`providers:manage`)           | Configure, install, sign in to, and update providers and usage sources.     |
+| Maintain environment (`environment:maintain`)   | Update the server and control its processes.                                |
+| Control previews (`preview:operate`)            | Open browser previews and drive the host's browser.                         |
+| View diagnostics and usage (`diagnostics:read`) | Read process diagnostics, resource history, and usage totals.               |
+| View terminals (`terminal:read`)                | Read terminal output and status.                                            |
+| Use terminals (`terminal:operate`)              | Create terminals and type into shells on the host, as your user.            |
+| Change source control (`source-control:write`)  | Commit, push, manage branches and repositories, and change pull requests.   |
+| Read files (`filesystem:read`)                  | Browse host files, search workspaces, and inspect local changes.            |
+| Write files (`filesystem:write`)                | Edit workspace files and save plans to disk.                                |
+| View relay (`relay:read`)                       | Inspect managed relay connectivity.                                         |
+
+It does not include **View access** and **Manage access** (`access:read`,
+`access:write`), which create pairing links and revoke other devices, or **Manage
+relay** (`relay:write`).
+
+For a device that should only follow and answer tasks, untick the rest under
+**Permissions** when you create the link, or pass the scopes it needs:
+
+```bash
+stark-code pair --tailscale --scope orchestration:read --scope orchestration:operate
+```
+
+Without **Change environment settings**, the device can still approve once or for
+the session, but not save an **Always allow** rule. See
+[Manage or revoke access](#manage-or-revoke-access) to change or remove a device's
+access later.
+
+### Answer approvals from another device
+
+Approval and question cards on web, desktop, and mobile take an answer only while
+the device is connected and the chat is in sync with the host. Otherwise the
+buttons are disabled and the card says why: **Reconnecting**, **Offline**, **Not
+connected**, or **Syncing…**. They come back on their own once the connection is
+live again. An answer is never queued while you are offline.
+
+If the connection drops after you answer:
+
+- The card keeps its spinner and says **Sending when reconnected**. When the device
+  reconnects, Stark Code sends the same answer again. If the host had already
+  received it, the host recognizes it and does not apply it twice.
+- If the device does not reconnect within five minutes, the card says **Couldn't
+  confirm your answer** and offers **Retry**, which sends that same answer again.
+  Once reconnected, the chat shows whether it went through. Closing the tab or the
+  app forgets an answer that was never confirmed; reopen the chat to see what the
+  host has.
+- The connection banner says when answers are waiting to be sent.
+
+If someone answered on another device first, or the request expired or was
+cancelled, the notice says so instead of showing an error. When the host reports
+that it, or the agent, stopped before the agent received an answer, the notice
+says the answer may not have reached the agent.
+
+Thread history catches up after a drop. Web keeps a message you have not sent as a
+draft, and the mobile app queues messages and sends them when it reconnects. A
+host restart ends approvals that were waiting; questions the agent asked as a
+message stay answerable.
+
+## Stark Connect
+
+Stark Connect, the hosted sign-in and relay, is not available in this build. Its
+settings do not appear, `stark-code connect` reports that hosted cloud services are
+not included, and features that depend on it, such as
+[mobile push notifications](./mobile-notifications.md), are off. Use
+[Tailscale HTTPS](#use-stark-code-from-your-phone-or-another-computer) to reach a
+machine from elsewhere.
 
 ## Pair over a LAN or private network
 
-Use direct pairing when the other device can reach the host's network address.
+Use direct pairing when the other device can reach the host's network address
+directly, for example on the same Wi-Fi network. Plain HTTP addresses do not give
+browsers a secure context, so prefer
+[Tailscale HTTPS](#use-stark-code-from-your-phone-or-another-computer) for phones.
 
 On a desktop host, open **Settings → Connections**, enable **Network access**,
 then create a pairing link using an address the other device can reach. Changing
@@ -65,17 +199,16 @@ another link to share.
 ### Reach one machine several ways
 
 A machine can have more than one route: LAN, Tailscale, another VPN, a public
-URL, SSH, or Stark Connect. Tailscale shares its `100.64.0.0/10` address range with
+URL, or SSH. Tailscale shares its `100.64.0.0/10` address range with
 other VPNs such as Cloudflare WARP, so an address in that range shows as VPN
 unless the machine confirms it is on Tailscale. To add a route, choose **Add
-route** in the machine's route list, or next to it in the Stark Connect list.
-Pairing the same machine again over another address also adds a route instead
-of a second machine. A new route is placed by speed, in that order, and you can
+route** in the machine's route list. Pairing the same machine again over another
+address also adds a route instead of a second machine. A new route is placed by speed, in that order, and you can
 reorder routes at any time.
 
-While connected through Stark Connect or a paired address, Stark Code also learns the
-machine's current LAN and Tailscale addresses and adds them as routes, so
-pairing once through Stark Connect is enough to use the LAN at home. When the
+While connected through a paired address, Stark Code also learns the machine's
+current LAN and Tailscale addresses and adds them as routes, so pairing once over
+Tailscale is enough to use the LAN at home. When the
 machine's LAN address changes, for example after it joins another Wi-Fi network,
 the learned route follows it. The machine must allow network access for its LAN
 address to be learned. You can reorder a learned route, but not remove it; it
@@ -91,15 +224,13 @@ return to the app, and every minute, and moves back as soon as one works.
 On web and desktop, select the route count under the machine's name in
 **Settings → Connections** to see its routes. Drag a route to change the order,
 or remove it. On mobile, open the machine under **Settings → Environments** and
-choose **Edit**. Signing out of Stark Connect removes only that route; a machine
-you can still reach another way stays saved.
+choose **Edit**.
 
 Open **Permissions** next to **Routes** in web or desktop, or **Your permissions**
 in the mobile route details, to see what your current connection can do on that
 environment. For a remote environment, this is in its route details. Permissions
 shown there apply only to the route marked **In use**; other routes are not
-checked. Direct pairing and Stark Connect have separate sessions and may grant
-different permissions.
+checked.
 
 ### Balance new threads across machines
 
@@ -118,34 +249,6 @@ a specific machine to override it. Choosing a branch or worktree also keeps the 
 on that machine. Existing threads stay where they started. If resource checks are
 unavailable or all eligible machines are full, choose a machine manually to continue.
 Mobile keeps its manual environment selection.
-
-### Tailscale HTTPS
-
-Join both devices to the same tailnet. In the desktop app, enable **Tailscale
-HTTPS** in **Settings → Connections**. Turn it off there to remove that route.
-
-To start a command-line server with Tailscale HTTPS:
-
-```bash
-stark-code serve --tailscale-serve
-```
-
-For an already-running server:
-
-```bash
-stark-code pair --tailscale
-```
-
-The pairing link uses an address such as `https://machine.tailnet.ts.net/`.
-The mapping created by `pair --tailscale` persists across restarts. Remove its
-default-port mapping with:
-
-```bash
-tailscale serve --https=443 off
-```
-
-If that port is already in use, choose another with
-`--tailscale-serve-port`. See `stark-code pair --help` for other pairing options.
 
 ### Hosted web app
 
@@ -190,10 +293,11 @@ directly. Every other device, and the desktop app for other environments,
 streams them from the host. Agents keep using them while no device is
 connected, and `localhost` addresses reach servers on the host.
 
-The first tab downloads a headless Chrome, about 120 MB, into the Stark home. It
-is the same browser [HTML renders](html-renders.md) use, so a host downloads it
-only once. Some Linux hosts need [setup](#browser-host-setup) before it can
-start.
+The first tab downloads a headless Chrome, about 120 MB, into the Stark home,
+unless you already installed it from **Settings → Agents & accounts → Setup
+doctor**. It is the same browser [HTML renders](html-renders.md) use, so a host
+downloads it only once. Some Linux hosts need [setup](#browser-host-setup)
+before it can start.
 
 Agent tabs have separate storage and share a Chromium process. Take control before
 typing into an agent's tab, then release control when you want the agent to
@@ -287,52 +391,24 @@ a client's permissions.
 local changes. Add `filesystem:write` to allow editing files or saving plans to
 the workspace. These scopes control direct file access from the client.
 
-To remove an environment from Stark Connect, open your account menu's **Stark Connect**
-page, or **Settings → Stark Connect** on mobile, and choose **Deregister**. This
-revokes its cloud access and frees its host space even when the environment is
-offline or has been wiped. Removing an environment from a device's connection
-settings only forgets it on that device; it stays registered to your account.
-
-When idle tunnel cleanup is enabled, Stark Connect removes a linked environment's
-tunnel after it stays offline for several minutes. The environment stays linked
-and keeps the same address. When the host starts again or wakes, Stark Connect
-creates a replacement tunnel on its own. You do not need to pair again. Cleanup
-usually runs five to ten minutes after the tunnel goes down.
-
-Stark Connect also removes the tunnel of an environment running an older version of
-Stark Code once it has been offline for seven days. That environment shows a message
-asking you to update. Start Stark Code on that computer and update it to the latest
-version; it reconnects at the same address without pairing again.
-
-On a command-line host, `stark-code connect unlink` disables exposure while retaining
-your login; `stark-code connect logout` also clears that login. Background-service
-[removal](./background-service.md#manage-the-service) is separate.
-
 Treat pairing URLs and authorization codes as passwords. Do not include them in
 screenshots, logs, or bug reports.
 
-## Stark Connect troubleshooting
+## Troubleshooting
 
-Run `stark-code connect status` on the host to inspect saved authorization and link
-configuration. It is not a live reachability check. If the environment appears
-offline, run `stark-code service status` and read the displayed log. If it disappears
-when SSH closes, see [background-service troubleshooting](./background-service.md#troubleshooting).
+| Problem                                                 | What to do                                                                                                                   |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| The link does not open on the phone                     | Check that Tailscale is connected on the phone and on the host, in the same tailnet. Run `tailscale status` on the host.     |
+| "No static directory configured and no dev URL set."    | The host's server has no web app bundled. See [Check the host before you rely on it](#check-the-host-before-you-rely-on-it). |
+| "This machine has no MagicDNS name."                    | Run `tailscale up` on the host and turn on MagicDNS for the tailnet.                                                         |
+| Setup says the HTTPS port already serves something else | Choose another HTTPS port in **Setup**, or pass `--tailscale-serve-port`.                                                    |
+| Approval buttons stay disabled                          | The card says why. Wait for **Reconnecting** or **Syncing…** to clear, or choose **Reconnect** in the connection banner.     |
 
-| Error                                                     | Recovery                                                                                                                                                            |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `environment_link_limit_exceeded` or managed tunnel limit | Deregister an unused environment, then restart Stark Code on the host.                                                                                              |
-| `auth_invalid` or `invalid_bearer`                        | Run `stark-code connect login`. If credentials were revoked, run `stark-code connect logout`, then `stark-code connect` again. Restart the server after signing in. |
-| Expired or invalid link proof                             | Check the host's date and time, update Stark Code, then restart it.                                                                                                 |
-| HTTP 403 without a recognized error                       | Check relay access, proxies, and firewall rules. Keep any Cloudflare Ray ID for a bug report.                                                                       |
-| HTTP 408, 429, or 5xx                                     | Check network and relay availability. Startup retries temporary failures for up to ten minutes.                                                                     |
-
-After fixing a permanent rejection, restart the host's server. On Linux, use
-`systemctl --user restart starkcode.service` for the background service. For a
-foreground server, stop it and run `stark-code serve` again with your usual options.
-Include the diagnostic message and trace ID when reporting a persistent failure.
-
-For a connection that still fails after linking, check the date and time on both
-devices. For server version warnings, follow [Updating Stark Code](./updating.md).
+If the environment disappears when SSH closes, see
+[background-service troubleshooting](./background-service.md#troubleshooting).
+For a connection that still fails, check the date and time on both devices. For
+server version warnings, follow [Updating Stark Code](./updating.md). Include the
+diagnostic message and trace ID when reporting a persistent failure.
 
 ## Using the Desktop App as a Remote Only
 
@@ -340,7 +416,7 @@ If a computer should only drive work running elsewhere, turn off its local envir
 desktop app, open **Settings → Connections** and switch off **Local
 environment**. Stark Code restarts without a local server: no local agents or terminals run, WSL
 backends stay off, and other devices can no longer connect to this computer. Your projects,
-history, and saved connections are kept, and you keep working through pairing, Stark Connect, or SSH.
+history, and saved connections are kept, and you keep working through pairing or SSH.
 
 Switch **Local environment** back on in the same place to restart with your previous local
 settings.

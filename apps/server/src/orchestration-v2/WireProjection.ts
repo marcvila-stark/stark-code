@@ -54,6 +54,30 @@ export function boundFileChangeForStorage(item: OrchestrationV2TurnItem): Orches
     : bounded;
 }
 
+/**
+ * Keeps a resolved approval's file list but drops its proposed diffs: only the
+ * pending card shows them, and the checkpoint diff covers what was written.
+ * Storage, the wire and detail reads all apply this one rule.
+ */
+export function dropResolvedApprovalPreview(
+  item: OrchestrationV2TurnItem,
+): OrchestrationV2TurnItem {
+  if (
+    item.type !== "approval_request" ||
+    item.status === "waiting" ||
+    item.proposedChanges?.some((change) => change.patch !== undefined) !== true
+  ) {
+    return item;
+  }
+  return {
+    ...item,
+    proposedChanges: item.proposedChanges.map(
+      ({ patch: _patch, patchTruncated: _truncated, approximate: _approximate, ...change }) =>
+        change,
+    ),
+  };
+}
+
 function summarizeDynamicValue(value: unknown): unknown {
   let serialized: string;
   try {
@@ -127,6 +151,8 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
         ? { ...projected, diffStr: truncateDetail(diffStr) }
         : projected;
     }
+    case "approval_request":
+      return dropResolvedApprovalPreview(item);
     case "subagent":
       return {
         ...item,
@@ -218,6 +244,7 @@ export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): Orchest
       };
     case "handoff":
     case "file_change":
+    case "approval_request":
       return projectTurnItemForWire(item);
     default:
       return item;

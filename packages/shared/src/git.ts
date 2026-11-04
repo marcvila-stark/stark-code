@@ -136,13 +136,12 @@ export function buildTemporaryWorktreeBranchName(
 
 /**
  * Git stores refs as paths, so a plain `stark-code` branch makes every `stark-code/<hex>`
- * ref impossible. This moves a temporary name to the flat `stark-<hex>` sibling.
+ * ref impossible. This moves a temporary name to the flat `stark-code-<hex>` sibling.
  */
 export function flattenTemporaryWorktreeBranchName(refName: string): string {
   // Keep only the canonical 8-hex token so legacy `starkcode/` and UUID names map cleanly.
   const normalized = refName.trim().toLowerCase();
-  const tokenStart = normalized.search(/[-/]/) + 1;
-  const token = normalized.slice(tokenStart, tokenStart + 8);
+  const token = normalized.replace(/^(?:stark-code|starkcode)[-/]/u, "").slice(0, 8);
   return `${WORKTREE_BRANCH_PREFIX}-${token}`;
 }
 

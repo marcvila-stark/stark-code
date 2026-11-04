@@ -17,6 +17,7 @@ import type {
   EnvironmentThreadShell,
 } from "@starkfuture/client-runtime/state/shell";
 import type { EnvironmentThreadSearchMatch } from "@starkfuture/client-runtime/state/thread-search";
+import { threadRunEndedUnfinished } from "@starkfuture/client-runtime/state/models";
 import { AuthOrchestrationOperateScope, type EnvironmentMachineKind } from "@starkfuture/contracts";
 import { canSnooze, resolveSnoozePresets } from "@starkfuture/client-runtime/state/thread-settled";
 import type { MenuAction } from "@react-native-menu/menu";
@@ -84,6 +85,12 @@ const STATUS_LABEL_BY_STATUS: Partial<Record<ThreadListV2Status, StatusLabel>> =
     className: "text-adaptive-indigo-600-300",
     iconTintClassName: "accent-adaptive-indigo-600-300",
   },
+  lost: {
+    label: "Decision lost",
+    icon: "exclamationmark.shield",
+    className: "text-warning-foreground",
+    iconTintClassName: "accent-warning-foreground",
+  },
   working: {
     label: "Working",
     icon: "circle.dashed",
@@ -108,6 +115,13 @@ const STATUS_LABEL_BY_STATUS: Partial<Record<ThreadListV2Status, StatusLabel>> =
     className: "text-warning-foreground",
     iconTintClassName: "accent-warning-foreground",
   },
+};
+// A restart or stop cut the turn short; its partial reply is not an answer.
+const INTERRUPTED_STATUS_LABEL: StatusLabel = {
+  label: "Interrupted",
+  icon: "exclamationmark.circle",
+  className: "text-warning-foreground",
+  iconTintClassName: "accent-warning-foreground",
 };
 const DONE_STATUS_LABEL: StatusLabel = {
   label: "Done",
@@ -636,7 +650,12 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     // A native /goal keeps the agent going across turns until it is met.
     (status === "working" && workingLabel !== undefined && thread.goal?.status === "active"
       ? { ...workingLabel, label: "Goal" }
-      : workingLabel) ?? (isUnread ? DONE_STATUS_LABEL : undefined);
+      : workingLabel) ??
+    (isUnread
+      ? threadRunEndedUnfinished(thread.latestRun)
+        ? INTERRUPTED_STATUS_LABEL
+        : DONE_STATUS_LABEL
+      : undefined);
   const recede = shouldRecedeThreadRow({ status, selected });
   // The timestamp is precomputed on the list item (same stamps the settled
   // tail sorts by) so a minute tick only re-renders rows that draw it.

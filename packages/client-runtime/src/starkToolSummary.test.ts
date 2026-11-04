@@ -60,6 +60,21 @@ describe("summarizeStarkToolCalls", () => {
     ).toEqual({ label, failedCount: 0 });
   });
 
+  it("does not claim a preview happened when Stark's preview browser was missing", () => {
+    const missing = completed(
+      { html: "<p>Flow</p>" },
+      { previewBrowser: { state: "not-installed", totalBytes: 99_221_129 }, message: "..." },
+    );
+    const shot = completed({ html: "<p>Chart</p>" }, { width: 720, contentHeight: 300 });
+    expect(summarizeStarkToolCalls("html-preview", [missing])).toEqual({
+      label: "Not previewed: preview browser not installed",
+      failedCount: 0,
+    });
+    expect(summarizeStarkToolCalls("html-preview", [shot, missing]).label).toBe(
+      "Previewed 1 HTML page, 1 not previewed",
+    );
+  });
+
   it("counts answered requests rather than pretending every request contains one question", () => {
     expect(
       summarizeStarkToolCalls("question-respond", [

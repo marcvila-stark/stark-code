@@ -39,7 +39,8 @@ const makeFixture = Effect.fn("test.makePackagedWorkbench")(function* (
     platform === "mac"
       ? path.join(stageDistDir, "mac-arm64", "Stark Code.app", "Contents", "Resources")
       : path.join(stageDistDir, `${platform}-unpacked`, "resources");
-  const resource = DESKTOP_EXTRA_RESOURCES[0];
+  const resource = DESKTOP_EXTRA_RESOURCES.find((entry) => "filter" in entry);
+  if (!resource) throw new Error("Packaged Workbench resource is missing.");
   const source = path.join(root, resource.from);
   const files = {
     "stark-workbench/.claude-plugin/plugin.json": '{"name":"stark-workbench"}',

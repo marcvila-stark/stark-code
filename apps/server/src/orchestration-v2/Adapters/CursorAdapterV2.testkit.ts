@@ -81,7 +81,7 @@ export class CursorReplayFrameMismatchError extends Schema.TaggedError<CursorRep
   },
 ) {
   override get message(): string {
-    return `Cursor Agent SDK replay frame mismatch at cursor ${this.cursor} in scenario ${this.scenario}.`;
+    return `Cursor Agent SDK replay frame mismatch at cursor ${this.cursor} in scenario ${this.scenario}. Expected ${JSON.stringify(this.expected)}; received ${JSON.stringify(this.actual)}.`;
   }
 }
 
@@ -219,7 +219,7 @@ export function makeCursorAgentSdkReplayRunner(
   let cursorAdvanced = makeSignal();
 
   const recordFailure = <Error extends CursorAgentSdkReplayError>(error: Error): Error => {
-    failure = error;
+    failure ??= error;
     cursorAdvanced.resolve();
     return error;
   };
@@ -565,6 +565,41 @@ export const CursorOrchestratorReplayHarness: OrchestratorV2ProviderReplayHarnes
   driver: CursorAgentSdk.CURSOR_PROVIDER,
   decodeTranscript: (transcript) =>
     decodeCursorAgentSdkReplayTranscript(transcript).pipe(
+      // Version 1 lifecycle recordings launched with the old Full-access
+      // default. Cursor now uses Supervised; compare that exact sandbox and
+      // review policy, retaining explicit sandboxed/read-only recordings.
+      Effect.map((decoded) =>
+        decoded.version === "1"
+          ? {
+              ...decoded,
+              entries: decoded.entries.map((entry) => {
+                if (
+                  entry.type !== "expect_outbound" ||
+                  typeof entry.frame !== "object" ||
+                  entry.frame === null ||
+                  !("type" in entry.frame) ||
+                  entry.frame.type !== "agent.open"
+                )
+                  return entry;
+                const frame = entry.frame as Extract<
+                  CursorOutgoingFrame,
+                  { readonly type: "agent.open" }
+                >;
+                if (frame.options.local === undefined) return entry;
+                return {
+                  ...entry,
+                  frame: {
+                    ...frame,
+                    options: {
+                      ...frame.options,
+                      local: { ...frame.options.local, sandboxEnabled: true, autoReview: true },
+                    },
+                  },
+                };
+              }),
+            }
+          : decoded,
+      ),
       Effect.mapError(
         (cause) =>
           new CursorReplayTranscriptDecodeError({

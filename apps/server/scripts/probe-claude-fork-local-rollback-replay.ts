@@ -118,7 +118,7 @@ function stableOptions(options: ClaudeAgentSdkQueryOptions): ClaudeAgentSdkQuery
   const stable = {
     model: options.model,
     tools: options.tools,
-    permissionMode: options.permissionMode,
+    ...(options.permissionMode === undefined ? {} : { permissionMode: options.permissionMode }),
     ...(options.allowedTools === undefined ? {} : { allowedTools: options.allowedTools }),
     ...(options.disallowedTools === undefined ? {} : { disallowedTools: options.disallowedTools }),
     ...(options.settings === undefined ? {} : { settings: options.settings }),

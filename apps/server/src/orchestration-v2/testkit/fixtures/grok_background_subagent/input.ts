@@ -13,8 +13,10 @@ const GROK_SUBAGENT_WAKE_LABEL =
 // replays as a continuation run, like Claude and Codex background wakes.
 export function grokBackgroundSubagentInput(): OrchestratorFixtureInput {
   return {
+    runtimeMode: "approval-required",
     steps: [
       { type: "message", text: GROK_BACKGROUND_SUBAGENT_PROMPT },
+      { type: "approve_next_runtime_request" },
       { type: "finish_held_run", targetRunIndex: 1, status: "completed" },
       { type: "release_replay_gate", label: GROK_SUBAGENT_WAKE_LABEL },
       { type: "finish_held_run", targetRunIndex: 2, status: "completed" },

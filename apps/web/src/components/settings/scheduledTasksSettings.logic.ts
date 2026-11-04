@@ -9,13 +9,16 @@ import {
   type ProviderInteractionMode,
   type ServerSettings,
 } from "@starkfuture/contracts";
+import { runtimeModeDisabledReason } from "@starkfuture/client-runtime/approvals/permission-presentation";
 import { parseMaxDeliveryAge } from "@starkfuture/client-runtime/scheduled-task-webhook";
+import { orderByAutomaticProviderPreference } from "@starkfuture/shared/model";
 
 import {
   resolveProjectSettings,
   type LegacyProjectSettingsFields,
 } from "@starkfuture/shared/projectSettings";
 import type { ProviderInstanceEntry } from "../../providerInstances";
+import { runtimeModeConfig } from "../chat/runtimeModeConfig";
 
 import type { ResolvedSettingsScope } from "./settingsScope";
 
@@ -64,8 +67,9 @@ export interface DraftState {
   readonly startFromOrigin: boolean;
   readonly existingWorktreePath: string;
   readonly modelKey: string;
-  /** Not editable in the dialog, but preserved so editing an agent-created task keeps its modes. */
-  readonly runtimeMode: RuntimeMode;
+  /** Null sends no mode, so the server runs the project's default; a saved task keeps its own. */
+  readonly runtimeMode: RuntimeMode | null;
+  /** Not editable in the dialog, but preserved so editing an agent-created task keeps it. */
   readonly interactionMode: ProviderInteractionMode;
   /**
    * The task's original model selection. The picker only edits
@@ -170,7 +174,58 @@ export function taskToDraft(task: ScheduledTask): DraftState {
   };
 }
 
-/** Use configured defaults before the catalog's advertised default model. */
+/** The mode a task saved without one runs: the project's default, as the server resolves it. */
+export function scheduledTaskProjectRuntimeMode(
+  settings: ServerSettings,
+  project: (LegacyProjectSettingsFields & { readonly id: ProjectId }) | null,
+): RuntimeMode {
+  return resolveProjectSettings(settings, project?.id ?? null, project).settings.defaultRuntimeMode;
+}
+
+export const PROJECT_DEFAULT_MODE = "project-default";
+
+export interface ScheduledTaskModeChoice {
+  /** `PROJECT_DEFAULT_MODE` sends no mode, so the server runs the project's default. */
+  readonly value: RuntimeMode | typeof PROJECT_DEFAULT_MODE;
+  readonly label: string;
+  /** Shown but not selectable, with the reason. */
+  readonly disabledReason?: string;
+}
+
+/**
+ * The editor's permission choices: the project's default first (the server picks it, so saving
+ * needs no settings grant), then the provider's modes. Without the settings-write grant, modes
+ * above the narrowest are disabled, since the server refuses to save them. A saved mode the
+ * provider no longer offers stays listed so the editor shows what the task has.
+ */
+export function scheduledTaskModeChoices(input: {
+  readonly options: ReadonlyArray<{ readonly mode: RuntimeMode; readonly label: string }>;
+  readonly projectDefault: RuntimeMode;
+  readonly selected: RuntimeMode | null;
+  readonly canWriteSettings: boolean;
+}): ReadonlyArray<ScheduledTaskModeChoice> {
+  const labelOf = (mode: RuntimeMode) =>
+    input.options.find((option) => option.mode === mode)?.label ?? runtimeModeConfig[mode].label;
+  const modes = input.options.map((option) => option.mode);
+  if (input.selected !== null && !modes.includes(input.selected)) modes.push(input.selected);
+  return [
+    { value: PROJECT_DEFAULT_MODE, label: `Project default · ${labelOf(input.projectDefault)}` },
+    ...modes.map((mode) => {
+      const disabledReason = runtimeModeDisabledReason(mode, input.canWriteSettings);
+      return {
+        value: mode,
+        label: labelOf(mode),
+        ...(disabledReason === undefined ? {} : { disabledReason }),
+      };
+    }),
+  ];
+}
+
+/**
+ * Use configured defaults before the catalog's advertised default model. With
+ * nothing configured, the task starts on a ready provider, Claude first, like
+ * a new thread does.
+ */
 export function scheduledTaskDefaultModel(
   settings: ServerSettings,
   project: (LegacyProjectSettingsFields & { readonly id: ProjectId }) | null,
@@ -196,11 +251,14 @@ export function scheduledTaskDefaultModel(
     )
       return selection;
   }
-  const models = available.flatMap((entry) =>
-    entry.models
-      .filter((model) => !model.isLegacy)
-      .map((model) => ({ instanceId: entry.instanceId, model })),
-  );
-  const fallback = models.find(({ model }) => model.isDefault) ?? models[0];
-  return fallback ? { instanceId: fallback.instanceId, model: fallback.model.slug } : null;
+  const ranked = orderByAutomaticProviderPreference(available, (entry) => entry.driverKind);
+  for (const entry of [
+    ...ranked.filter((candidate) => candidate.status === "ready"),
+    ...ranked.filter((candidate) => candidate.status !== "ready"),
+  ]) {
+    const models = entry.models.filter((model) => !model.isLegacy);
+    const fallback = models.find((model) => model.isDefault) ?? models[0];
+    if (fallback) return { instanceId: entry.instanceId, model: fallback.slug };
+  }
+  return null;
 }

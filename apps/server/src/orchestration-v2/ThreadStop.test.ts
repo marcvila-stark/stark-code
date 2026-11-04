@@ -136,7 +136,7 @@ const delegate = (parentThreadId: ThreadId, task: string) =>
       parentNodeId: parentRun.rootNodeId!,
       task,
       modelSelection,
-      runtimeMode: "full-access",
+      runtimeMode: "auto",
       interactionMode: "default",
       completionWake: "always",
       createdBy: "agent",

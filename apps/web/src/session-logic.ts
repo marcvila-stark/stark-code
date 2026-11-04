@@ -9,6 +9,7 @@ import {
   type OrchestrationV2TurnItem,
   type PlanId,
   type RunId,
+  type RuntimeRequestId,
   type ToolActivitySurface,
   type ToolActivityIcon,
   type ToolActivitySource,
@@ -30,6 +31,7 @@ import {
   contextCompactionLabel,
   workEntryIndicatesToolFailure,
 } from "@starkfuture/client-runtime/work-log/presentation";
+import type { ApprovalRecord } from "@starkfuture/client-runtime/approvals/permission-presentation";
 import type { ThreadCheckpointSummary } from "@starkfuture/client-runtime/state/thread-checkpoints";
 import type {
   ThreadPendingApproval,
@@ -95,6 +97,8 @@ export interface WorkLogEntry {
   readonly structuredPayload?: OrchestrationV2TurnItem;
   readonly sourceItemType?: OrchestrationV2TurnItem["type"];
   readonly projectedItem?: OrchestrationV2ProjectedTurnItem;
+  /** What became of an approval: the recorded choice, then whether it reached the agent. */
+  readonly approvalRecord?: ApprovalRecord;
 }
 
 export type PendingApproval = ThreadPendingApproval;
@@ -194,6 +198,8 @@ export function workEntrySignalsSevereFailure(entry: WorkLogEntry): boolean {
 }
 
 export function workEntryIndicatesToolSuccess(entry: WorkLogEntry): boolean {
+  // Only an allow the agent confirmed receiving is a success, whatever the item's status says.
+  if (entry.approvalRecord !== undefined) return entry.approvalRecord.success;
   if (
     !workLogEntryIsToolLike(entry) ||
     workEntryIndicatesToolFailure(entry) ||
@@ -430,7 +436,11 @@ export function providerErrorPresentation(
   };
 }
 
-function projectedWorkEntry(row: OrchestrationV2ProjectedTurnItem): WorkLogEntry {
+function projectedWorkEntry(
+  row: OrchestrationV2ProjectedTurnItem,
+  approvalRecords?: ReadonlyMap<RuntimeRequestId, ApprovalRecord>,
+  declinedItemIds?: ReadonlySet<string>,
+): WorkLogEntry {
   const { item } = row;
   const title = item.title?.trim() || null;
   const common = {
@@ -439,7 +449,12 @@ function projectedWorkEntry(row: OrchestrationV2ProjectedTurnItem): WorkLogEntry
     runId: item.runId,
     tone: projectedWorkEntryTone(item),
     itemType: item.type,
-    toolLifecycleStatus: projectedWorkEntryStatus(item),
+    // A command or tool call its approval never allowed did not run, whatever its item says.
+    toolLifecycleStatus:
+      (item.type === "command_execution" || item.type === "dynamic_tool") &&
+      declinedItemIds?.has(item.id)
+        ? "declined"
+        : projectedWorkEntryStatus(item),
     structuredPayload: item,
     projectedItem: row,
     ...extractToolActivityPresentation(item),
@@ -554,13 +569,16 @@ function projectedWorkEntry(row: OrchestrationV2ProjectedTurnItem): WorkLogEntry
         toolData: { input: item.input, output: item.output },
       };
     }
-    case "approval_request":
+    case "approval_request": {
+      const approvalRecord = approvalRecords?.get(item.requestId);
       return {
         ...common,
         label: title ?? "Approval requested",
         detail: item.prompt ?? item.requestKind,
         toolData: item,
+        ...(approvalRecord === undefined ? {} : { approvalRecord }),
       };
+    }
     case "user_input_request":
       return {
         ...common,
@@ -592,6 +610,10 @@ export interface TimelineEntriesInput {
   readonly attempts?: ReadonlyArray<OrchestrationV2RunAttempt>;
   readonly nodes?: ReadonlyArray<OrchestrationV2ExecutionNode>;
   readonly plans?: ReadonlyArray<OrchestrationV2PlanArtifact>;
+  /** Each approval's outcome by request id, from `deriveApprovalRecords`. */
+  readonly approvalRecords?: ReadonlyMap<RuntimeRequestId, ApprovalRecord>;
+  /** Commands and tool calls whose approval never allowed them (`deriveDeclinedApprovalItemIds`). */
+  readonly declinedItemIds?: ReadonlySet<string>;
 }
 
 export interface TimelineEntriesProjection {
@@ -776,7 +798,7 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
       id: item.id,
       kind: "work",
       createdAt,
-      entry: projectedWorkEntry(row),
+      entry: projectedWorkEntry(row, input.approvalRecords, input.declinedItemIds),
       ...attemptMetadata,
     });
   }
@@ -940,6 +962,16 @@ export function isStreamingTurnItemTextUpdate(
   return Equal.equals(previousMetadata, nextMetadata);
 }
 
+function sameIds(
+  left: ReadonlySet<string> | undefined,
+  right: ReadonlySet<string> | undefined,
+): boolean {
+  if (left === right) return true;
+  if ((left?.size ?? 0) !== (right?.size ?? 0)) return false;
+  for (const id of left ?? []) if (!right?.has(id)) return false;
+  return true;
+}
+
 function reuseTimelineEntries(
   input: TimelineEntriesInput,
   previous: TimelineEntriesProjection,
@@ -952,7 +984,11 @@ function reuseTimelineEntries(
     !shallow(input.attachmentUrlById, before.attachmentUrlById) ||
     !shallow(input.attempts, before.attempts) ||
     !shallow(input.nodes, before.nodes) ||
-    !shallow(input.plans, before.plans)
+    !shallow(input.plans, before.plans) ||
+    // An answer or its delivery changes an approval row that is already shown.
+    input.approvalRecords !== before.approvalRecords ||
+    // A declined approval changes the row of the command it gated.
+    !sameIds(input.declinedItemIds, before.declinedItemIds)
   ) {
     return null;
   }

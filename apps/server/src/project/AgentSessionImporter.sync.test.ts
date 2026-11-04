@@ -18,6 +18,7 @@ import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as AgentSessionImporter from "./AgentSessionImporter.ts";
 import * as Scanner from "./AgentSessionScanner.ts";
 import * as ProjectService from "./ProjectService.ts";
@@ -159,6 +160,8 @@ function fixture() {
         }),
         IdAllocator.layer,
         ThreadCommandExecutor.layer,
+        // The project-scoped import reads Stark's own sessions from SQL; a sync never does.
+        SqlitePersistence.layerMemory,
       ),
     ),
   );

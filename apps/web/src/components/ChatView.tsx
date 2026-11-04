@@ -1,3 +1,4 @@
+import { BrowserCaptureCards } from "./chat/BrowserCaptureCards";
 import { LocalHistoryNotice } from "./chat/LocalHistoryNotice";
 import {
   NATIVE_AGENT_SHELL_TOGGLE_EVENT,
@@ -16,7 +17,10 @@ import { selectStarkPageTabs, useStarkPageTabs, type StarkPageTarget } from "../
 import type { StarkPageQuote } from "../starkPageQuote";
 import { useStarkPagesPublishCapability } from "../hooks/useStarkPagesPublishCapability";
 import { FinishEvidenceCard } from "./chat/FinishEvidenceCard";
-import { deriveFinishEvidence } from "./chat/finishEvidence";
+import { deriveFinishEvidence, type FinishCheckEvidence } from "./chat/finishEvidence";
+import { checkFixPrompt, shellOutputAttachment } from "./chat/turnChecks";
+import { checksForRun } from "@starkfuture/client-runtime/state/review-chain";
+import { latestCheckSubjectRun } from "@starkfuture/shared/userShellChecks";
 import { SideWorkPanel } from "./chat/SideWorkPanel";
 import { ConversationToolsPanel } from "./chat/ConversationToolsPanel";
 import { WorkspaceToolsMenu } from "./chat/WorkspaceToolsMenu";
@@ -32,6 +36,7 @@ import { orchestrationEnvironment } from "../state/orchestration";
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
+import { lostRequestBannerItem } from "./chat/LostRequestBanner";
 import {
   resolveBackgroundDraftWorkspaceOptions,
   resolveDraftHeroState,
@@ -116,7 +121,11 @@ import {
   RuntimeMode,
   TerminalOpenInput,
   type WorktreeSetupSnapshot,
+  newChatPermissionSourceFor,
+  type PermissionSource,
+  permissionSourceOf,
 } from "@starkfuture/contracts";
+import type { ApprovalResponseInput } from "@starkfuture/client-runtime/approvals/permission-presentation";
 import { type EnvironmentConnectionPresentation } from "@starkfuture/client-runtime/connection";
 import { deriveThreadTitleSeed } from "@starkfuture/client-runtime/operations";
 import {
@@ -149,7 +158,18 @@ import {
   type CodexFeedbackSubmission,
 } from "@starkfuture/client-runtime/state/threads";
 import { resolveThreadLastVisitedAt } from "./Sidebar.logic";
-import { derivePendingThreadRequests } from "@starkfuture/client-runtime/state/thread-requests";
+import {
+  deriveApprovalRecords,
+  deriveDeclinedApprovalItemIds,
+  derivePendingThreadRequests,
+} from "@starkfuture/client-runtime/state/thread-requests";
+import {
+  liveProviderSession,
+  permissionChangeLanded,
+  permissionProviderName,
+  threadPermissionDisplay,
+  type PermissionChangeInFlight,
+} from "./chat/permissionsPresentation.logic";
 import {
   parseScopedThreadKey,
   scopedThreadKey,
@@ -183,6 +203,7 @@ import { Debouncer } from "@tanstack/react-pacer";
 import { useAtomValue } from "@effect/atom-react";
 import { Atom } from "effect/reactivity";
 import {
+  type CSSProperties,
   Fragment,
   lazy,
   memo,
@@ -283,10 +304,8 @@ import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
 import { FileMetadataThreadProvider } from "../hooks/FileMetadataThreadProvider";
 import { usePreviewPanelInlineSize } from "../hooks/usePreviewPanelInlineSize";
-import {
-  RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
-  type ThreadPanelPresentation,
-} from "../rightPanelLayout";
+import { useRightPanelSheet } from "../hooks/useRightPanelSheet";
+import type { ThreadPanelPresentation } from "../rightPanelLayout";
 import { PopoverCreateHandle } from "./ui/popover";
 import {
   pullRequestSurface,
@@ -354,6 +373,12 @@ import {
 import { cn, randomUUID } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
+import {
+  runtimeRequestCardState,
+  toastRuntimeResponseFailure,
+  useRuntimeResponseAttempts,
+} from "~/runtimeRequestResponse";
+import { countRuntimeResponsesAwaitingReconnect } from "@starkfuture/client-runtime/state/runtime-request-response";
 import {
   decodeProjectScriptKeybindingRule,
   keybindingValueForCommand,
@@ -477,6 +502,7 @@ import {
   useThreadRefs,
   useThreadVisibleTurnItems,
   waitForThreadShell,
+  useThreadLostRequests,
 } from "../state/entities";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
@@ -556,6 +582,7 @@ import {
   branchMismatchKey,
   buildExpiredTerminalContextToastCopy,
   buildLocalDraftThread,
+  resolveDraftSubmissionTitle,
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
   deriveCommittedServerUserMessageIds,
@@ -563,6 +590,7 @@ import {
   dismissBranchMismatchForSession,
   hasEnvironmentReconnectWarningGraceElapsed,
   scheduleEnvironmentReconnectWarning,
+  environmentUnavailableBanner,
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
   shouldShowBranchMismatchBanner,
@@ -592,6 +620,8 @@ import {
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
+  runtimeModeChangeRequest,
+  stopAndApplyPermissionRequest,
   revokeUserMessagePreviewUrls,
   startNewThreadForProject,
   codexArtifactTemplatePromptToAppend,
@@ -1682,6 +1712,9 @@ export default function ChatView(props: ChatViewProps) {
   const setThreadInteractionMode = useOrchestrationCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
+  const setThreadPermission = useOrchestrationCommand(threadEnvironment.setPermission, {
+    reportFailure: false,
+  });
   const startThreadTurn = useOrchestrationCommand(threadEnvironment.startTurn, {
     reportFailure: false,
   });
@@ -1713,6 +1746,12 @@ export default function ChatView(props: ChatViewProps) {
     reportFailure: false,
   });
   const dismissThreadUserInput = useAtomCommand(threadEnvironment.dismissUserInput, {
+    reportFailure: false,
+  });
+  const askAgainLostRequests = useOrchestrationCommand(threadEnvironment.askAgainLostRequests, {
+    reportFailure: false,
+  });
+  const dismissLostRequests = useOrchestrationCommand(threadEnvironment.dismissLostRequests, {
     reportFailure: false,
   });
   const revertThreadCheckpoint = useOrchestrationCommand(threadEnvironment.revertCheckpoint, {
@@ -1775,6 +1814,7 @@ export default function ChatView(props: ChatViewProps) {
   });
   const serverThreadProjection = useThreadProjection(routeThreadDetailRef);
   const serverProjection = serverThreadProjection?.projection ?? null;
+  const lostRequests = useThreadLostRequests(routeThreadDetailRef);
   const reportedModelSelection = serverProjection
     ? deriveReportedModelSelection(serverProjection)
     : null;
@@ -1861,6 +1901,12 @@ export default function ChatView(props: ChatViewProps) {
   );
   const composerInteractionMode = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.interactionMode ?? null,
+  );
+  const composerPermissionSource = useComposerDraftStore(
+    (store) => store.getComposerDraft(composerDraftTarget)?.permissionSource,
+  );
+  const setComposerDraftPermissionSource = useComposerDraftStore(
+    (store) => store.setPermissionSource,
   );
   const composerActiveProvider = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
@@ -1989,9 +2035,9 @@ export default function ChatView(props: ChatViewProps) {
   >({});
   const [pendingUserInputQuestionIndexByRequestId, setPendingUserInputQuestionIndexByRequestId] =
     useState<Record<string, number>>({});
-  const shouldUsePlanSidebarSheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
   const isMobileViewport = useMediaQuery("max-sm");
   const [workspaceLayoutElement, setWorkspaceLayoutElement] = useState<HTMLDivElement | null>(null);
+  const shouldUsePlanSidebarSheet = useRightPanelSheet(workspaceLayoutElement);
   const threadPanelPopoverAnchorRef = useRef<HTMLElement | null>(null);
   // Tracks whether the user explicitly dismissed the sidebar for the active turn.
   // When set, the thread-change reset effect will open the sidebar instead of closing it.
@@ -2031,6 +2077,10 @@ export default function ChatView(props: ChatViewProps) {
   // False while a status bar stands in for the composer (a native subagent).
   const composerMountedRef = useRef(true);
   const [scrollToEndClearance, setScrollToEndClearance] = useState(0);
+  // The overlay's current height. The transcript stops where it begins, so no
+  // text reads through the composer or the strip under it while scrolling.
+  const [composerCoverHeight, setComposerCoverHeight] = useState(0);
+  const composerCoverHeightRef = useRef(0);
   const isAtEndRef = useRef(true);
   const isTimelineAtLogicalEnd = useCallback(
     () => resolveTimelineIsAtEnd(legendListRef.current?.getState()) ?? isAtEndRef.current,
@@ -2252,12 +2302,64 @@ export default function ChatView(props: ChatViewProps) {
   const [, setThreadErrorBannerDismissTick] = useState(0);
   const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
     .settings.defaultRuntimeMode;
+  // A permission change this client sent whose event hasn't reached the chat yet.
+  const [permissionChangeInFlight, setPermissionChangeInFlight] =
+    useState<PermissionChangeInFlight | null>(null);
+  // A saved chat's source and preset come from one record, so the chip and the picker never show
+  // two different events. The shell carries no permission source, so the loaded detail is read
+  // for both while it is this chat's; until it loads, the shell's mode stands with the
+  // stored-override default.
+  const permissionDetailThread =
+    isServerThread && serverProjection?.thread.id === activeThread?.id
+      ? serverProjection?.thread
+      : undefined;
+  const permissionRecordThreadId = isServerThread ? activeThread?.id : undefined;
+  const permissionRecordSource = isServerThread
+    ? permissionSourceOf(permissionDetailThread ?? {})
+    : undefined;
+  const permissionRecordMode = isServerThread
+    ? (permissionDetailThread ?? activeThread)?.runtimeMode
+    : undefined;
+  const permissionRecordIdentity = permissionDetailThread ?? activeThread ?? undefined;
+  const threadPermissionRecord = useMemo(
+    () =>
+      permissionRecordThreadId === undefined ||
+      permissionRecordSource === undefined ||
+      permissionRecordMode === undefined
+        ? null
+        : {
+            threadId: permissionRecordThreadId,
+            permissionSource: permissionRecordSource,
+            runtimeMode: permissionRecordMode,
+            ...(permissionRecordIdentity === undefined ? {} : { record: permissionRecordIdentity }),
+          },
+    [
+      permissionRecordMode,
+      permissionRecordSource,
+      permissionRecordThreadId,
+      permissionRecordIdentity,
+    ],
+  );
+  const threadPermission =
+    threadPermissionRecord === null
+      ? null
+      : threadPermissionDisplay({
+          thread: threadPermissionRecord,
+          change: permissionChangeInFlight,
+        });
+  // Once its event lands (or the chat changes) the change is done; dropped during render, so a
+  // later move back to the old values never reads as saving again.
+  if (
+    permissionChangeInFlight !== null &&
+    (threadPermissionRecord === null ||
+      threadPermissionRecord.threadId !== permissionChangeInFlight.threadId ||
+      permissionChangeLanded(threadPermissionRecord, permissionChangeInFlight))
+  ) {
+    setPermissionChangeInFlight(null);
+  }
   // Implicit drafts follow their current project/environment, including retargets.
   // Explicit composer choices and existing server threads retain their permissions.
-  const runtimeMode =
-    composerRuntimeMode ??
-    (isServerThread ? activeThread?.runtimeMode : undefined) ??
-    defaultRuntimeMode;
+  const runtimeMode = composerRuntimeMode ?? threadPermission?.runtimeMode ?? defaultRuntimeMode;
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = canWriteSourceControl && isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
@@ -2520,11 +2622,7 @@ export default function ChatView(props: ChatViewProps) {
     useState<ThreadPanelPresentation>("inline");
   const [threadPanelPopoverHandle] = useState(PopoverCreateHandle);
   const threadPanelOpen = useRightPanelStore((state) =>
-    selectThreadPanelOpen(
-      state.threadPanelVisibilityByThreadKey,
-      activeThreadRef,
-      threadPanelPresentation,
-    ),
+    selectThreadPanelOpen(state, activeThreadRef, threadPanelPresentation),
   );
 
   useEffect(() => {
@@ -3249,6 +3347,38 @@ export default function ChatView(props: ChatViewProps) {
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  // A new chat's permission source: the composer's explicit choice, else the
+  // instance's new-chat default. The server stores `override` wherever the
+  // provider cannot inherit, so this can never widen a saved chat.
+  const newThreadPermissionSource = (instanceId: ProviderInstanceId) =>
+    composerPermissionSource ??
+    newChatPermissionSourceFor({
+      driver:
+        providerStatuses.find((provider) => provider.instanceId === instanceId)?.driver ??
+        ProviderDriverKind.make(instanceId),
+      newChatPermissionSource: settings.providerInstances[instanceId]?.newChatPermissionSource,
+    });
+  // What became of each approval, for its timeline row: the choice, then whether it arrived.
+  const serverRuntimeRequests = serverProjection?.runtimeRequests;
+  const serverThreadProvider = providerStatuses.find(
+    (provider) => provider.instanceId === serverProjection?.thread.providerInstanceId,
+  );
+  const approvalProviderName = serverThreadProvider
+    ? permissionProviderName(serverThreadProvider.driver, serverThreadProvider.displayName)
+    : undefined;
+  const approvalRecords = useMemo(
+    () =>
+      serverRuntimeRequests === undefined
+        ? undefined
+        : deriveApprovalRecords({ runtimeRequests: serverRuntimeRequests }, approvalProviderName),
+    [approvalProviderName, serverRuntimeRequests],
+  );
+  // Commands and tool calls their approval never allowed: they read as declined, not as run or
+  // failed, in the work log and the finish card.
+  const declinedApprovalItemIds = useMemo(
+    () => (serverProjection === null ? undefined : deriveDeclinedApprovalItemIds(serverProjection)),
+    [serverProjection],
+  );
   const pagesProvider = providerStatuses.find(
     (provider) => provider.instanceId === nativeShellSelection?.instanceId,
   );
@@ -3348,6 +3478,9 @@ export default function ChatView(props: ChatViewProps) {
   const serverUpdateFailureDismissed =
     serverUpdateState === dismissedServerUpdateState ||
     isServerUpdateFailureDismissed(serverUpdateState);
+  // Answers this client sent to the environment, including those waiting for the connection.
+  const runtimeResponseAttempts = useRuntimeResponseAttempts(environmentId);
+  const answersAwaitingReconnect = countRuntimeResponsesAwaitingReconnect(runtimeResponseAttempts);
   const systemComposerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const items: ComposerBannerStackItem[] = [];
     const updateRunning = serverUpdateState.status === "running";
@@ -3376,11 +3509,17 @@ export default function ChatView(props: ChatViewProps) {
     const suppressUnavailableBanner =
       environmentReconnecting && (updateRunning || !reconnectWarningGraceElapsed);
     if (activeEnvironmentUnavailableState && unavailableConnection && !suppressUnavailableBanner) {
+      const banner = environmentUnavailableBanner({
+        label: activeEnvironmentUnavailableState.label,
+        connection: unavailableConnection,
+        answersAwaitingReconnect,
+      });
       items.push({
         id: `environment-unavailable:${activeEnvironmentUnavailableState.environmentId}`,
         variant: unavailableConnection.phase === "error" ? "error" : "warning",
         icon: <WifiOffIcon />,
-        title: `${activeEnvironmentUnavailableState.label} is ${environmentReconnecting ? "reconnecting" : "offline"}`,
+        title: banner.title,
+        ...(banner.description === null ? {} : { description: banner.description }),
         actions: (
           <>
             {!environmentReconnecting ? (
@@ -3487,6 +3626,7 @@ export default function ChatView(props: ChatViewProps) {
     automaticEnvironment,
     autoBalanceUpdateBanner,
     activeEnvironmentUnavailableState,
+    answersAwaitingReconnect,
     handleReconnectActiveEnvironment,
     canDisconnectActiveEnvironment,
     disconnectingEnvironment,
@@ -3610,7 +3750,7 @@ export default function ChatView(props: ChatViewProps) {
       }
     });
     return () => cancelAnimationFrame(frame);
-  }, [needsYouTarget, pendingApprovals, pendingUserInputs, pageTabActive]);
+  }, [needsYouTarget, pendingApprovals, pendingUserInputs, pageTabActive, lostRequests]);
   const activePendingUserInput = pendingUserInputs[0] ?? null;
   const activePendingRequestKey = JSON.stringify([
     environmentId,
@@ -3776,6 +3916,38 @@ export default function ChatView(props: ChatViewProps) {
     hasComposerAttachments: composerHasAttachments,
   });
   const activePendingApproval = pendingApprovals[0] ?? null;
+  // Cards answer only over a live connection and a synchronized thread, and say why not.
+  const activePendingApprovalResponseState = runtimeRequestCardState({
+    request: activePendingApproval,
+    attempts: runtimeResponseAttempts,
+    connectionPhase: activeEnvironmentConnectionPhase,
+    threadStatus,
+    canOperate: canOperateThread,
+    responding:
+      activePendingApproval !== null &&
+      respondingRequestIds.includes(activePendingApproval.requestId),
+  });
+  const activePendingUserInputResponseState = runtimeRequestCardState({
+    request: activePendingUserInput,
+    attempts: runtimeResponseAttempts,
+    connectionPhase: activeEnvironmentConnectionPhase,
+    threadStatus,
+    canOperate: canOperateThread,
+    responding:
+      activePendingUserInput !== null &&
+      respondingUserInputRequestIds.includes(activePendingUserInput.requestId),
+  });
+  // A failed reply is explained by the thread as it is when the failure arrives.
+  const runtimeRequestTruthRef = useRef({
+    threadStatus,
+    runtimeRequests: serverProjection?.runtimeRequests ?? null,
+  });
+  useEffect(() => {
+    runtimeRequestTruthRef.current = {
+      threadStatus,
+      runtimeRequests: serverProjection?.runtimeRequests ?? null,
+    };
+  }, [serverProjection?.runtimeRequests, threadStatus]);
   // The open /usage-limits panel for this thread, model and turn. Only the open
   // moment is stored: the rows read live provider data, so a redeemed reset
   // credit or refreshed probe shows through. Anything that spends quota closes
@@ -4242,6 +4414,10 @@ export default function ChatView(props: ChatViewProps) {
               nodes: serverProjection.nodes,
               plans: serverProjection.plans,
             }),
+        ...(approvalRecords === undefined ? {} : { approvalRecords }),
+        ...(declinedApprovalItemIds === undefined
+          ? {}
+          : { declinedItemIds: declinedApprovalItemIds }),
       },
       previous?.threadKey === activeThreadKey ? previous.projection : null,
     );
@@ -4250,6 +4426,8 @@ export default function ChatView(props: ChatViewProps) {
   }, [
     activeThreadKey,
     anchoredTimelineMessages,
+    approvalRecords,
+    declinedApprovalItemIds,
     optimisticUserMessages,
     serverVisibleTurnItems,
     serverProjection,
@@ -5690,16 +5868,12 @@ export default function ChatView(props: ChatViewProps) {
     [activeProject, activeProjectScripts, persistProjectScripts],
   );
 
+  // A saved chat's mode changes on the server now, so a narrowing chosen during a run is queued
+  // for when it stops (`permissionChangePending`) even if no message follows; a new chat keeps
+  // the mode on its draft until it is created.
   const handleRuntimeModeChange = useCallback(
     async (mode: RuntimeMode): Promise<boolean> => {
       if (mode === runtimeMode && mode !== "full-access") return true;
-      const apply = () => {
-        setComposerDraftRuntimeMode(composerDraftTarget, mode);
-        if (isLocalDraftThread) {
-          setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
-        }
-        scheduleComposerFocus();
-      };
       if (mode === "full-access") {
         const confirmed = await requestConfirmDialog(
           "Enable Bypass permissions for this chat? Claude may run commands and change files without asking. Child agents will still require approvals. Publishing still requires your confirmation.",
@@ -5707,18 +5881,159 @@ export default function ChatView(props: ChatViewProps) {
         );
         if (!confirmed) return false;
       }
-      apply();
+      const request = runtimeModeChangeRequest({
+        serverThreadId: isServerThread ? activeThreadId : null,
+        runtimeMode: mode,
+      });
+      if (request === null) {
+        setComposerDraftRuntimeMode(composerDraftTarget, mode);
+        // Picking a preset for a new chat overrides the provider's own settings, as the
+        // permission command does for a saved chat.
+        setComposerDraftPermissionSource(composerDraftTarget, "override");
+        if (isLocalDraftThread) {
+          setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
+        }
+        scheduleComposerFocus();
+        return true;
+      }
+      // Until its event reaches the chat, the chip, popover and picker show this change as saving.
+      const change: PermissionChangeInFlight = {
+        threadId: request.threadId,
+        permissionSource: request.permissionSource,
+        runtimeMode: request.runtimeMode,
+        before: threadPermissionRecord ?? {
+          permissionSource: request.permissionSource,
+          runtimeMode,
+        },
+        acknowledged: false,
+      };
+      setPermissionChangeInFlight(change);
+      const result = await setThreadPermission({ environmentId, input: request });
+      setPermissionChangeInFlight((current) =>
+        current !== change
+          ? current
+          : result._tag === "Failure"
+            ? null
+            : { ...change, acknowledged: true },
+      );
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Could not change this chat's permissions",
+              description: error instanceof Error ? error.message : "An unexpected error occurred.",
+            }),
+          );
+        }
+        return false;
+      }
+      // The saved chat now carries the mode; a draft copy would resend it with the next message.
+      setComposerDraftRuntimeMode(composerDraftTarget, null);
+      scheduleComposerFocus();
       return true;
     },
     [
+      activeThreadId,
+      environmentId,
       isLocalDraftThread,
+      isServerThread,
       runtimeMode,
       scheduleComposerFocus,
       composerDraftTarget,
+      setComposerDraftPermissionSource,
       setComposerDraftRuntimeMode,
       setDraftThreadContext,
+      setThreadPermission,
+      threadPermissionRecord,
     ],
   );
+
+  // A saved chat changes its permission source on the server now (a narrowing during a run waits
+  // for it to stop); a new chat keeps the choice on its draft until it is created.
+  const handlePermissionSourceChange = useCallback(
+    async (permissionSource: PermissionSource, nextRuntimeMode: RuntimeMode) => {
+      if (!isServerThread || activeThreadId === null) {
+        setComposerDraftPermissionSource(composerDraftTarget, permissionSource);
+        if (permissionSource === "override") {
+          setComposerDraftRuntimeMode(composerDraftTarget, nextRuntimeMode);
+        }
+        scheduleComposerFocus();
+        return;
+      }
+      const change: PermissionChangeInFlight = {
+        threadId: activeThreadId,
+        permissionSource,
+        runtimeMode: nextRuntimeMode,
+        before: threadPermissionRecord ?? { permissionSource, runtimeMode },
+        acknowledged: false,
+      };
+      setPermissionChangeInFlight(change);
+      const result = await setThreadPermission({
+        environmentId,
+        input: {
+          threadId: activeThreadId,
+          permissionSource,
+          runtimeMode: nextRuntimeMode,
+          // A narrowing during a run applies once it stops; the popover offers Stop and apply
+          // now. The server ignores this when nothing is running.
+          whileRunning: "apply-after-run",
+        },
+      });
+      setPermissionChangeInFlight((current) =>
+        current !== change
+          ? current
+          : result._tag === "Failure"
+            ? null
+            : { ...change, acknowledged: true },
+      );
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not change this chat's permissions",
+            description: error instanceof Error ? error.message : "An unexpected error occurred.",
+          }),
+        );
+        return;
+      }
+      // The saved chat now carries the preset; a draft copy would resend it as a mode change.
+      setComposerDraftRuntimeMode(composerDraftTarget, null);
+    },
+    [
+      activeThreadId,
+      composerDraftTarget,
+      environmentId,
+      isServerThread,
+      runtimeMode,
+      scheduleComposerFocus,
+      setComposerDraftPermissionSource,
+      setComposerDraftRuntimeMode,
+      setThreadPermission,
+      threadPermissionRecord,
+    ],
+  );
+
+  // "Stop and apply now": the server stops the run and applies the chat's stored settings itself.
+  const handleStopAndApplyPermissions = useCallback(async () => {
+    if (!isServerThread || threadPermissionRecord === null) return;
+    const result = await setThreadPermission({
+      environmentId,
+      input: stopAndApplyPermissionRequest(threadPermissionRecord),
+    });
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not apply this chat's permissions now",
+          description: error instanceof Error ? error.message : "An unexpected error occurred.",
+        }),
+      );
+    }
+  }, [environmentId, isServerThread, setThreadPermission, threadPermissionRecord]);
 
   const handleInteractionModeChange = useCallback(
     (mode: ProviderInteractionMode) => {
@@ -7344,6 +7659,10 @@ export default function ChatView(props: ChatViewProps) {
     (height: number) => {
       const nextHeight = Math.ceil(height);
       if (nextHeight <= 0) return;
+      if (composerCoverHeightRef.current !== nextHeight) {
+        composerCoverHeightRef.current = nextHeight;
+        setComposerCoverHeight(nextHeight);
+      }
       const isResting = overlayComposerIsResting({
         composerMounted: composerMountedRef.current,
         composerReportedResting: composerRestingRef.current,
@@ -7411,6 +7730,9 @@ export default function ChatView(props: ChatViewProps) {
     publishComposerOverlayHeight(composerOverlayElement.getBoundingClientRect().height);
   }, [activeThreadKey, composerOverlayElement, publishComposerOverlayHeight]);
 
+  // Tracks the overlay's size, and re-measures in the commit that docks the
+  // centered draft composer so the first transcript frame is not cut at the
+  // full-pane height.
   useLayoutEffect(() => {
     if (!composerOverlayElement) return;
 
@@ -7420,7 +7742,7 @@ export default function ChatView(props: ChatViewProps) {
 
     updateHeight();
     return observeResize(composerOverlayElement, updateHeight);
-  }, [composerOverlayElement, publishComposerOverlayHeight, showScrollToBottom]);
+  }, [composerOverlayElement, publishComposerOverlayHeight, showScrollToBottom, isDraftHeroState]);
   // Swapping the composer for the status bar (or back) changes what the
   // overlay holds, so rebuild the reservation from the new content.
   useLayoutEffect(() => {
@@ -8011,15 +8333,57 @@ export default function ChatView(props: ChatViewProps) {
   // message clears it as a side effect of the send path.
   // Memoized: it is the timeline's list footer, and a new element re-renders that footer.
   // nowMinute keeps the relative time fresh.
-  const finishEvidence = useMemo(
-    () =>
-      nativeShellMode || paintOnlyDisplayedTimeline || !serverProjection
-        ? null
-        : deriveFinishEvidence(
-            latestExecutedRun(serverProjection.runs),
-            serverProjection.turnItems,
-          ),
-    [nativeShellMode, paintOnlyDisplayedTimeline, serverProjection],
+  // Evidence follows the latest turn that is not itself a check, so a check run after the turn
+  // shows up among its checks instead of replacing it.
+  const finishEvidence = useMemo(() => {
+    if (nativeShellMode || paintOnlyDisplayedTimeline || !serverProjection) return null;
+    const subject = latestCheckSubjectRun(serverProjection);
+    return deriveFinishEvidence(
+      subject,
+      serverProjection.turnItems,
+      subject === null
+        ? undefined
+        : {
+            turnOrdinal: subject.ordinal,
+            checks: checksForRun(serverProjection, subject.id, {
+              historyComplete: !serverThreadHistory.hasMoreHistory,
+            }),
+          },
+      serverProjection.runtimeRequests,
+      declinedApprovalItemIds,
+    );
+  }, [
+    declinedApprovalItemIds,
+    nativeShellMode,
+    paintOnlyDisplayedTimeline,
+    serverProjection,
+    serverThreadHistory.hasMoreHistory,
+  ]);
+  const openCheckOutput = useCallback(
+    (path: string) => {
+      const attachment = shellOutputAttachment(path);
+      if (attachment) openFileAttachment(attachment);
+    },
+    [openFileAttachment],
+  );
+  const askForCheckFix = useCallback(
+    (check: FinishCheckEvidence) => {
+      const prompt = checkFixPrompt({
+        turnLabel:
+          finishEvidence?.turnOrdinal === undefined
+            ? "the latest turn"
+            : `Turn ${finishEvidence.turnOrdinal}`,
+        command: check.command,
+        exitCode: check.exitCode,
+        timedOut: check.timedOut,
+        output: check.output,
+      });
+      const existing =
+        useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.prompt ?? "";
+      setComposerDraftPrompt(composerDraftTarget, existing ? `${existing}\n\n${prompt}` : prompt);
+      window.requestAnimationFrame(() => focusComposer());
+    },
+    [composerDraftTarget, finishEvidence, focusComposer, setComposerDraftPrompt],
   );
 
   const threadStatusLine = useMemo(() => {
@@ -8201,8 +8565,42 @@ export default function ChatView(props: ChatViewProps) {
           },
         })
       : null;
+  const lostRequestBanner = useMemo(
+    () =>
+      activeThreadId && lostRequests.length > 0
+        ? lostRequestBannerItem({
+            requests: lostRequests,
+            canOperateThread,
+            onAskAgain: async (requestIds) => {
+              const result = await askAgainLostRequests({
+                environmentId,
+                input: { threadId: activeThreadId, requestIds },
+              });
+              if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
+                throw squashAtomCommandFailure(result);
+            },
+            onDismiss: async (requestIds) => {
+              const result = await dismissLostRequests({
+                environmentId,
+                input: { threadId: activeThreadId, requestIds },
+              });
+              if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
+                throw squashAtomCommandFailure(result);
+            },
+          })
+        : null,
+    [
+      activeThreadId,
+      askAgainLostRequests,
+      canOperateThread,
+      dismissLostRequests,
+      environmentId,
+      lostRequests,
+    ],
+  );
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const limitRecoveryItems = limitRecoveryBanner === null ? [] : [limitRecoveryBanner];
+    const lostRequestItems = lostRequestBanner === null ? [] : [lostRequestBanner];
     const backgroundWorkItems = [
       childInputBannerItem,
       goalBannerItem,
@@ -8219,6 +8617,7 @@ export default function ChatView(props: ChatViewProps) {
         ...projectCloneItems,
         ...systemComposerBannerItems,
         ...backgroundWorkItems,
+        ...lostRequestItems,
       ];
     }
     return [
@@ -8228,6 +8627,7 @@ export default function ChatView(props: ChatViewProps) {
       ...projectCloneItems,
       ...systemComposerBannerItems,
       ...backgroundWorkItems,
+      ...lostRequestItems,
       {
         id: `branch-mismatch:${activeBranchMismatchKey}`,
         variant: "info",
@@ -8285,6 +8685,7 @@ export default function ChatView(props: ChatViewProps) {
     showBranchMismatchBanner,
     systemComposerBannerItems,
     usageLimitsBanner,
+    lostRequestBanner,
   ]);
 
   useEffect(() => {
@@ -10360,6 +10761,7 @@ export default function ChatView(props: ChatViewProps) {
                       modelSelection: target.selection,
                       runtimeMode,
                       interactionMode: target.interactionMode,
+                      permissionSource: newThreadPermissionSource(target.selection.instanceId),
                       branch: activeThreadBranch,
                       worktreePath: null,
                       createdAt: messageCreatedAt,
@@ -10634,7 +11036,10 @@ export default function ChatView(props: ChatViewProps) {
         titleSeed = "New thread";
       }
     }
-    const title = truncate(titleSeed);
+    const { title, titleSeed: generatedTitleSeed } = resolveDraftSubmissionTitle(
+      draftThread?.title,
+      titleSeed,
+    );
     const threadCreateModelSelection = createModelSelection(
       ctxSelectedModelSelection.instanceId,
       ctxSelectedModel || activeProjectDefaultModelSelection?.model || DEFAULT_MODEL,
@@ -10700,6 +11105,9 @@ export default function ChatView(props: ChatViewProps) {
                       modelSelection: threadCreateModelSelection,
                       runtimeMode,
                       interactionMode: sendInteractionMode,
+                      permissionSource: newThreadPermissionSource(
+                        threadCreateModelSelection.instanceId,
+                      ),
                       branch: activeThreadBranch,
                       worktreePath: activeThread.worktreePath,
                       createdAt: activeThread.createdAt,
@@ -10760,7 +11168,7 @@ export default function ChatView(props: ChatViewProps) {
             })(),
           },
           modelSelection: ctxSelectedModelSelection,
-          titleSeed: title,
+          ...(generatedTitleSeed === undefined ? {} : { titleSeed: generatedTitleSeed }),
           runtimeMode,
           interactionMode: sendInteractionMode,
           dispatchMode: turnDispatchMode,
@@ -10927,7 +11335,12 @@ export default function ChatView(props: ChatViewProps) {
   };
 
   const onRespondToApproval = useCallback(
-    async (requestId: RuntimeRequestId, decision: ProviderApprovalDecision) => {
+    async (
+      requestId: RuntimeRequestId,
+      decision: ProviderApprovalDecision,
+      // The chosen option's server id and any reason; the server refuses a decision it can't match.
+      response?: ApprovalResponseInput,
+    ) => {
       if (!activeThreadId || !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope))
         return;
       if (
@@ -10945,19 +11358,21 @@ export default function ChatView(props: ChatViewProps) {
           threadId: activeThreadId,
           requestId,
           decision,
+          ...response,
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
-          error instanceof Error ? error.message : "Failed to submit approval decision.",
-        );
+        toastRuntimeResponseFailure({
+          ...runtimeRequestTruthRef.current,
+          requestId,
+          kind: "approval",
+          error: squashAtomCommandFailure(result),
+        });
       }
       setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
     },
-    [activeThreadId, environmentId, pendingApprovals, respondToThreadApproval, setThreadError],
+    [activeThreadId, environmentId, pendingApprovals, respondToThreadApproval],
   );
 
   const onRespondToUserInput = useCallback(
@@ -11018,11 +11433,12 @@ export default function ChatView(props: ChatViewProps) {
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
-          error instanceof Error ? error.message : "Failed to submit user input.",
-        );
+        toastRuntimeResponseFailure({
+          ...runtimeRequestTruthRef.current,
+          requestId,
+          kind: "user-input",
+          error: squashAtomCommandFailure(result),
+        });
       }
       userInputResponsesInFlight.current.delete(responseKey);
       setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
@@ -11045,16 +11461,62 @@ export default function ChatView(props: ChatViewProps) {
         input: { threadId: activeThreadId, requestId },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
-          error instanceof Error ? error.message : "Failed to dismiss the question.",
-        );
+        toastRuntimeResponseFailure({
+          ...runtimeRequestTruthRef.current,
+          requestId,
+          kind: "dismiss",
+          error: squashAtomCommandFailure(result),
+        });
       }
       setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
     },
-    [activeThreadId, dismissThreadUserInput, environmentId, setThreadError],
+    [activeThreadId, dismissThreadUserInput, environmentId],
+  );
+
+  // Sends an unconfirmed reply again under its original command, so a reply that already
+  // landed is confirmed instead of applied twice.
+  const onRetryRuntimeResponse = useCallback(
+    async (requestId: RuntimeRequestId) => {
+      const attempt = runtimeResponseAttempts.get(requestId);
+      if (!attempt || attempt.phase !== "unconfirmed") return;
+      const setResponding =
+        attempt.kind === "approval" ? setRespondingRequestIds : setRespondingUserInputRequestIds;
+      setResponding((existing) =>
+        existing.includes(requestId) ? existing : [...existing, requestId],
+      );
+      const result =
+        attempt.kind === "approval"
+          ? await respondToThreadApproval({
+              environmentId,
+              input: { ...attempt.input, commandId: attempt.commandId },
+            })
+          : attempt.kind === "user-input"
+            ? await respondToThreadUserInput({
+                environmentId,
+                input: { ...attempt.input, commandId: attempt.commandId },
+              })
+            : await dismissThreadUserInput({
+                environmentId,
+                input: { ...attempt.input, commandId: attempt.commandId },
+              });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        toastRuntimeResponseFailure({
+          ...runtimeRequestTruthRef.current,
+          requestId,
+          kind: attempt.kind,
+          error: squashAtomCommandFailure(result),
+        });
+      }
+      setResponding((existing) => existing.filter((id) => id !== requestId));
+    },
+    [
+      dismissThreadUserInput,
+      environmentId,
+      respondToThreadApproval,
+      respondToThreadUserInput,
+      runtimeResponseAttempts,
+    ],
   );
 
   const setActivePendingUserInputQuestionIndex = useCallback(
@@ -12451,7 +12913,7 @@ export default function ChatView(props: ChatViewProps) {
         <div className="relative flex min-h-0 min-w-0 flex-1">
           {/* Chat column */}
           <div
-            className={cn("flex min-h-0 min-w-0 flex-1", pageTabActive && "invisible")}
+            className={cn("flex min-h-0 min-w-0 flex-1 flex-col", pageTabActive && "invisible")}
             inert={pageTabActive}
             aria-hidden={pageTabActive || undefined}
             role="tabpanel"
@@ -12549,7 +13011,15 @@ export default function ChatView(props: ChatViewProps) {
                 />
               </div>
               {/* Messages Wrapper */}
-              <div className="relative flex min-h-0 flex-1 flex-col bg-background">
+              <div
+                className="relative flex min-h-0 flex-1 flex-col bg-background"
+                // The centered draft composer fills the pane; it covers no transcript.
+                style={
+                  isDraftHeroState || composerCoverHeight === 0
+                    ? undefined
+                    : ({ "--scroll-end-cover": `${composerCoverHeight}px` } as CSSProperties)
+                }
+              >
                 {/* Messages — LegendList handles virtualization and scrolling internally */}
                 <MessagesTimeline
                   isSideChat={
@@ -12603,7 +13073,11 @@ export default function ChatView(props: ChatViewProps) {
                               sessionBusy={isWorking || !latestRunSettled}
                             />
                           ) : null}
-                          <FinishEvidenceCard evidence={finishEvidence} />
+                          <FinishEvidenceCard
+                            evidence={finishEvidence}
+                            onOpenCheckOutput={openCheckOutput}
+                            onAskForFix={askForCheckFix}
+                          />
                         </div>
                         {threadStatusLine}
                       </>
@@ -12626,7 +13100,11 @@ export default function ChatView(props: ChatViewProps) {
                               sessionBusy={isWorking || !latestRunSettled}
                             />
                           ) : null}
-                          <FinishEvidenceCard evidence={finishEvidence} />
+                          <FinishEvidenceCard
+                            evidence={finishEvidence}
+                            onOpenCheckOutput={openCheckOutput}
+                            onAskForFix={askForCheckFix}
+                          />
                         </div>
                         {threadStatusLine}
                       </>
@@ -12802,6 +13280,7 @@ export default function ChatView(props: ChatViewProps) {
                                 }
                               />
                             ) : null}
+                            <BrowserCaptureCards target={composerDraftTarget} />
                             {!composerMounted ? null : (
                               <ChatComposer
                                 onOpenProviderVoice={
@@ -12898,6 +13377,13 @@ export default function ChatView(props: ChatViewProps) {
                                 activePendingDraftAnswers={activePendingDraftAnswers}
                                 activePendingQuestionIndex={activePendingQuestionIndex}
                                 respondingRequestIds={respondingRequestIds}
+                                activePendingApprovalResponseState={
+                                  activePendingApprovalResponseState
+                                }
+                                activePendingUserInputResponseState={
+                                  activePendingUserInputResponseState
+                                }
+                                onRetryRuntimeResponse={onRetryRuntimeResponse}
                                 showPlanFollowUpPrompt={showPlanFollowUpPrompt}
                                 activeProposedPlan={activeProposedPlan}
                                 threadSyncPhase={
@@ -12905,6 +13391,32 @@ export default function ChatView(props: ChatViewProps) {
                                 }
                                 runtimeMode={runtimeMode}
                                 interactionMode={interactionMode}
+                                threadPermissionSource={threadPermission?.permissionSource ?? null}
+                                permissionChangeSaving={threadPermission?.saving === true}
+                                permissionChangePending={
+                                  serverProjection?.thread.permissionChangePending != null
+                                }
+                                permissionChangeRunning={
+                                  serverProjection?.thread.permissionChangePending?.running
+                                }
+                                onStopAndApplyPermissions={handleStopAndApplyPermissions}
+                                liveProviderSessionId={
+                                  serverProjection
+                                    ? (liveProviderSession(
+                                        serverProjection.providerSessions,
+                                        serverProjection.thread.providerInstanceId,
+                                      )?.id ?? null)
+                                    : undefined
+                                }
+                                activePermissionsReportedAt={
+                                  serverProjection
+                                    ? (liveProviderSession(
+                                        serverProjection.providerSessions,
+                                        serverProjection.thread.providerInstanceId,
+                                      )?.activePermissions?.reportedAt ?? null)
+                                    : undefined
+                                }
+                                onChangePermissionSource={handlePermissionSourceChange}
                                 lockedProvider={modelPickerLockedProvider}
                                 providerStatuses={providerStatuses as ServerProvider[]}
                                 providerCatalogKnown={serverConfig !== null}
@@ -13051,14 +13563,15 @@ export default function ChatView(props: ChatViewProps) {
                           </div>
                         </div>
                       </ComposerSurface.Shell>
+                      {/* The timeline scrolls under the overlay. The shell is glass on purpose; the model/usage row and the bottom gap below it must be opaque or message text shows through them. */}
                       <div
                         ref={setComposerDetailsHost}
                         data-composer-details-host
-                        className="@container/composer-details relative mx-auto w-full max-w-(--chat-content-max-width) empty:hidden"
+                        className="@container/composer-details relative mx-auto w-full max-w-(--chat-content-max-width) bg-background empty:hidden"
                       />
                       <div
                         aria-hidden
-                        className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
+                        className="h-[calc(env(safe-area-inset-bottom)+1rem)] bg-background sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
                       />
                     </div>
                   </div>

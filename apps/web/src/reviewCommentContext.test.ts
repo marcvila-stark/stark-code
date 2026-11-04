@@ -1,9 +1,13 @@
 import { parsePatchFiles } from "@pierre/diffs/utils/parsePatchFiles";
 import { describe, expect, it } from "vite-plus/test";
 
+import { RunId } from "@starkfuture/contracts";
+
 import {
+  buildDiffFileReviewComment,
   buildDiffReviewComment,
   buildFileReviewComment,
+  diffFileHasCommentableLines,
   formatReviewCommentFence,
   inferReviewCommentFenceLanguage,
   restoreDiffReviewCommentRange,
@@ -111,5 +115,97 @@ describe("review comment context parsing", () => {
       end: 2,
       endSide: "additions",
     });
+  });
+});
+
+describe("whole-file diff comments", () => {
+  const parse = (lines: ReadonlyArray<string>, key: string) =>
+    parsePatchFiles(lines.join("\n"), key)[0]!.files[0]!;
+  const comment = (fileDiff: ReturnType<typeof parse>) =>
+    buildDiffFileReviewComment({
+      id: "file-comment",
+      sectionId: "turn:run-7",
+      sectionTitle: "Turn 7",
+      filePath: "src/app.ts",
+      fileDiff,
+      text: "Split this file.",
+      runId: RunId.make("run-7"),
+    });
+
+  it("spans every hunk without the unchanged lines between them", () => {
+    const fileDiff = parse(
+      [
+        "diff --git a/src/app.ts b/src/app.ts",
+        "--- a/src/app.ts",
+        "+++ b/src/app.ts",
+        "@@ -1,3 +1,3 @@",
+        " one",
+        "-two",
+        "+TWO",
+        " three",
+        "@@ -40,2 +40,3 @@",
+        " forty",
+        "+forty-one",
+        " forty-two",
+      ],
+      "file-comment-hunks",
+    );
+    const result = comment(fileDiff);
+    expect(result).toMatchObject({
+      rangeLabel: "whole file",
+      runId: "run-7",
+      text: "Split this file.",
+      diff: [
+        "@@ -1,3 +1,3 @@",
+        " one",
+        "-two",
+        "+TWO",
+        " three",
+        "@@ -40,2 +40,3 @@",
+        " forty",
+        "+forty-one",
+        " forty-two",
+      ].join("\n"),
+    });
+    expect(restoreDiffReviewCommentRange(fileDiff, result!)).toMatchObject({
+      start: 2,
+      side: "deletions",
+      end: 41,
+      endSide: "additions",
+    });
+  });
+
+  it("anchors a deletion-only file on the removed lines", () => {
+    const fileDiff = parse(
+      [
+        "diff --git a/src/app.ts b/src/app.ts",
+        "--- a/src/app.ts",
+        "+++ b/src/app.ts",
+        "@@ -1,2 +0,0 @@",
+        "-one",
+        "-two",
+      ],
+      "file-comment-deletions",
+    );
+    expect(comment(fileDiff)?.selection).toEqual({
+      start: 1,
+      side: "deletions",
+      end: 2,
+      endSide: "deletions",
+    });
+  });
+
+  it("has nothing to anchor to in a pure rename", () => {
+    const fileDiff = parse(
+      [
+        "diff --git a/src/old.ts b/src/app.ts",
+        "similarity index 100%",
+        "rename from src/old.ts",
+        "rename to src/app.ts",
+      ],
+      "file-comment-rename",
+    );
+    expect(diffFileHasCommentableLines(fileDiff)).toBe(false);
+    expect(comment(fileDiff)).toBeNull();
   });
 });

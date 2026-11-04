@@ -5,6 +5,7 @@ import { useSettingsScope } from "./SettingsScopeContext";
 import { SettingsPageContainer } from "./settingsLayout";
 import { McpServersPanel } from "../chat/McpServersPanel";
 import { SettingsScopeSentence } from "./SettingsScopeSentence";
+import { resolveConnectedToolsAgent } from "./mcpServersSettings.logic";
 import { SettingsDestination } from "./AlphaSettings";
 import { Link } from "@tanstack/react-router";
 
@@ -15,22 +16,16 @@ export function McpServersSettings() {
       project.environmentId === environment?.environmentId &&
       ((scope.kind !== "project" && scope.kind !== "checkout") ||
         scope.members.some(
-          (member) =>
-            member.environmentId === project.environmentId &&
-            member.id === project.id,
+          (member) => member.environmentId === project.environmentId && member.id === project.id,
         )),
   );
-  const providers =
-    environment?.serverConfig?.providers.filter(
-      (provider) =>
-        provider.driver === "codex" || provider.driver === "claudeAgent",
-    ) ?? [];
   const [projectId, setProjectId] = useState<ProjectId | null>(null);
   const [instanceId, setInstanceId] = useState<ProviderInstanceId | null>(null);
-  const project =
-    projects.find((entry) => entry.id === projectId) ?? projects[0];
-  const provider =
-    providers.find((entry) => entry.instanceId === instanceId) ?? providers[0];
+  const project = projects.find((entry) => entry.id === projectId) ?? projects[0];
+  const { agents: providers, agent: provider } = resolveConnectedToolsAgent(
+    environment?.serverConfig?.providers ?? [],
+    instanceId,
+  );
   return (
     <SettingsPageContainer showScope={false}>
       <div className="rounded-lg border border-border/60">
@@ -92,9 +87,7 @@ export function McpServersSettings() {
                     <select
                       aria-label="Connected tools folder"
                       value={project.id}
-                      onChange={(event) =>
-                        setProjectId(ProjectId.make(event.target.value))
-                      }
+                      onChange={(event) => setProjectId(ProjectId.make(event.target.value))}
                     >
                       {projects.map((entry) => (
                         <option key={entry.id} value={entry.id}>
@@ -112,9 +105,7 @@ export function McpServersSettings() {
                       aria-label="Connected tools agent"
                       value={provider.instanceId}
                       onChange={(event) =>
-                        setInstanceId(
-                          ProviderInstanceId.make(event.target.value),
-                        )
+                        setInstanceId(ProviderInstanceId.make(event.target.value))
                       }
                     >
                       {providers.map((entry) => (

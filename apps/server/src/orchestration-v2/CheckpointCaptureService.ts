@@ -15,6 +15,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
+import { collectTurnWriteEvidence, fileChangeWrittenPaths } from "../checkpointing/FileOrigins.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
@@ -31,6 +32,29 @@ export class CheckpointCaptureExecutionError extends Schema.TaggedError<Checkpoi
 ) {}
 
 const isCheckpointCaptureExecutionError = Schema.is(CheckpointCaptureExecutionError);
+
+/** Item types that show whether a turn wrote files: edits, commands, and other tools. */
+const TURN_WRITE_ITEM_TYPES = [
+  "file_change",
+  "command_execution",
+  "dynamic_tool",
+  "hook_run",
+  "subagent",
+] as const satisfies ReadonlyArray<OrchestrationV2TurnItem["type"]>;
+
+/** Paths the root agent's completed edit tools wrote; native file restore replays these. */
+function collectRootAgentWrittenPaths(
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
+  rootNodeId: OrchestrationV2ExecutionNode["id"],
+) {
+  const paths = new Set<string>();
+  for (const item of items) {
+    if (item.type !== "file_change" || item.status !== "completed" || item.nodeId !== rootNodeId)
+      continue;
+    for (const path of fileChangeWrittenPaths(item) ?? []) paths.add(path);
+  }
+  return [...paths];
+}
 
 export interface CheckpointCaptureServiceV2Shape {
   readonly execute: (input: {
@@ -120,6 +144,10 @@ export const layer: Layer.Layer<
             scope,
             ordinalWithinScope: baselineOrdinalWithinScope,
           });
+      const runItems = (yield* projections.getThreadRecords(input.threadId, ["turnItems"], {
+        turnItemRunId: run.id,
+        turnItemTypes: [...TURN_WRITE_ITEM_TYPES],
+      })).turnItems;
       const checkpoint = yield* checkpoints.capture({
         scope,
         runId: run.id,
@@ -127,34 +155,8 @@ export const layer: Layer.Layer<
         ordinalWithinScope: run.ordinal,
         appRunOrdinal: run.ordinal,
         capturedAt,
-        agentWrittenPaths: yield* projections
-          .getThreadRecords(input.threadId, ["turnItems"], {
-            turnItemRunId: run.id,
-            turnItemTypes: ["file_change"],
-            turnItemStatuses: ["completed"],
-          })
-          .pipe(
-            Effect.map((records) => {
-              const paths = new Set<string>();
-              for (const item of records.turnItems) {
-                if (
-                  item.type !== "file_change" ||
-                  item.status !== "completed" ||
-                  item.nodeId !== rootNode.id
-                )
-                  continue;
-                if (item.agentWrittenPaths?.length) {
-                  for (const path of item.agentWrittenPaths) paths.add(path);
-                } else if (item.changes?.length) {
-                  for (const change of item.changes) {
-                    paths.add(change.path);
-                    if (change.oldPath) paths.add(change.oldPath);
-                  }
-                } else paths.add(item.fileName);
-              }
-              return [...paths];
-            }),
-          ),
+        agentWrittenPaths: collectRootAgentWrittenPaths(runItems, rootNode.id),
+        writeEvidence: collectTurnWriteEvidence(runItems),
       });
       // Match RunExecutionService: capture loaded the waiting run before
       // materializing baselines. Omit delegatedCompletion so a newer cohort

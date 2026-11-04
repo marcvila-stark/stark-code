@@ -99,6 +99,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
       anchor={props.anchor}
       handle={props.handle}
       onPresentationChange={props.onPresentationChange}
+      onHidden={props.onComposerFocusRequest}
     >
       {(density) => (
         <>

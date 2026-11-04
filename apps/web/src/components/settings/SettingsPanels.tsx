@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type BackgroundActivityProfile,
   type DesktopUpdateChannel,
+  type DesktopUpdateState,
   ProviderDriverKind,
   type ProviderInstanceId,
   type ScopedThreadRef,
@@ -50,12 +51,10 @@ import { APP_VERSION, HOSTED_APP_CHANNEL, HOSTED_APP_CHANNEL_LABEL } from "../..
 import { IS_NIGHTLY_BUILD, NightlyMobileBetaRow } from "../NightlyMobileBeta";
 import { CliCommandSettingsRow } from "./CliCommandSettingsRow";
 import {
-  canCheckForUpdate,
-  getDesktopUpdateButtonTooltip,
-  getDesktopUpdateInstallConfirmationMessage,
-  isDesktopUpdateButtonDisabled,
-  resolveDesktopUpdateButtonAction,
+  type DesktopUpdateIntent,
+  describeDesktopUpdateState,
 } from "../../components/desktopUpdate.logic";
+import { runDesktopUpdateIntent } from "../../components/desktopUpdateActions";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { TraitsPicker } from "../chat/TraitsPicker";
 import { isElectron } from "../../env";
@@ -234,22 +233,46 @@ function backgroundActivityProfileSettings(profile: BackgroundActivityProfile) {
   };
 }
 
-function AboutVersionTitle() {
+function AboutVersionTitle({ version }: { readonly version: string }) {
   return (
     <span className="inline-flex items-baseline gap-2">
       <span>Version</span>
-      <code className="text-2xs font-medium text-muted-foreground">{APP_VERSION}</code>
+      <code className="text-2xs font-medium text-muted-foreground">{version}</code>
     </span>
+  );
+}
+
+/** Release notes from the update feed, as plain text; nothing remote is loaded. */
+function AboutReleaseNotes({ state }: { readonly state: DesktopUpdateState }) {
+  if (state.status !== "available" && state.status !== "downloaded") return null;
+  const occurrences = new Map<string, number>();
+  const notes = state.releaseNotes
+    .flatMap((note) => note.items)
+    .slice(0, 6)
+    .map((item) => {
+      const occurrence = occurrences.get(item) ?? 0;
+      occurrences.set(item, occurrence + 1);
+      return { item, key: `${occurrence}:${item}` };
+    });
+  if (notes.length === 0) return null;
+  return (
+    <ul className="mt-2 list-disc space-y-0.5 ps-5 text-xs text-muted-foreground">
+      {notes.map(({ item, key }) => (
+        <li key={key}>{item}</li>
+      ))}
+    </ul>
   );
 }
 
 function AboutVersionSection() {
   const updateState = useDesktopUpdateState();
   const [isChangingUpdateChannel, setIsChangingUpdateChannel] = useState(false);
-  const [isUpdateActionPending, setIsUpdateActionPending] = useState(false);
+  const [pendingIntent, setPendingIntent] = useState<DesktopUpdateIntent | null>(null);
 
   const hasDesktopBridge = typeof window !== "undefined" && Boolean(window.desktopBridge);
   const selectedUpdateChannel = updateState?.channel ?? "latest";
+  // The desktop app lists the channels its feed serves; older builds list none.
+  const availableUpdateChannels = updateState?.availableChannels ?? ["latest", "nightly"];
   const selectedHostedAppChannel = hasDesktopBridge ? null : HOSTED_APP_CHANNEL;
   // Show the beta app links as soon as someone picks Nightly, before the update installs.
   const showNightlyMobileBeta =
@@ -285,136 +308,65 @@ function AboutVersionSection() {
     [selectedUpdateChannel],
   );
 
-  const handleButtonClick = useCallback(async () => {
-    const bridge = window.desktopBridge;
-    if (!bridge) return;
+  const runIntent = useCallback(
+    (intent: DesktopUpdateIntent) => {
+      if (pendingIntent !== null) return;
+      setPendingIntent(intent);
+      void runDesktopUpdateIntent(intent, { state: updateState }).finally(() =>
+        setPendingIntent(null),
+      );
+    },
+    [pendingIntent, updateState],
+  );
 
-    const action = updateState ? resolveDesktopUpdateButtonAction(updateState) : "none";
-
-    if (action === "download") {
-      void bridge.downloadUpdate().catch((error: unknown) => {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not download update",
-            description: error instanceof Error ? error.message : "Download failed.",
-          }),
-        );
-      });
-      return;
-    }
-
-    if (action === "install") {
-      if (isUpdateActionPending) return;
-      setIsUpdateActionPending(true);
-      let confirmed = false;
-      try {
-        confirmed = await ensureLocalApi().dialogs.confirm(
-          getDesktopUpdateInstallConfirmationMessage(
-            updateState ?? { availableVersion: null, downloadedVersion: null },
-          ),
-        );
-      } catch (error) {
-        setIsUpdateActionPending(false);
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not confirm update",
-            description: error instanceof Error ? error.message : "Update confirmation failed.",
-          }),
-        );
-        return;
-      }
-      if (!confirmed) {
-        setIsUpdateActionPending(false);
-        return;
-      }
-      void bridge
-        .installUpdate()
-        .catch((error: unknown) => {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: error instanceof Error ? error.message : "Install failed.",
-            }),
-          );
-        })
-        .finally(() => setIsUpdateActionPending(false));
-      return;
-    }
-
-    if (typeof bridge.checkForUpdate !== "function") return;
-    void bridge
-      .checkForUpdate()
-      .then((result) => {
-        if (!result.checked) {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not check for updates",
-              description:
-                result.state.message ?? "Automatic updates are not available in this build.",
-            }),
-          );
-        }
-      })
-      .catch((error: unknown) => {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not check for updates",
-            description: error instanceof Error ? error.message : "Update check failed.",
-          }),
-        );
-      });
-  }, [isUpdateActionPending, updateState]);
-
-  const action = updateState ? resolveDesktopUpdateButtonAction(updateState) : "none";
-  const buttonTooltip = updateState ? getDesktopUpdateButtonTooltip(updateState) : null;
-  const buttonDisabled =
-    action === "none"
-      ? !canCheckForUpdate(updateState)
-      : isDesktopUpdateButtonDisabled(updateState);
-
-  const actionLabel: Record<string, string> = { download: "Download", install: "Install" };
-  const statusLabel: Record<string, string> = {
-    checking: "Checking…",
-    downloading: "Downloading…",
-    "up-to-date": "Up to Date",
-  };
-  const buttonLabel =
-    actionLabel[action] ?? statusLabel[updateState?.status ?? ""] ?? "Check for Updates";
-  const description =
-    action === "download" || action === "install"
-      ? "Update available."
-      : "Current version of the application.";
+  const presentation =
+    hasDesktopBridge && updateState ? describeDesktopUpdateState(updateState) : null;
+  const description = presentation
+    ? presentation.detail
+      ? `${presentation.headline} · ${presentation.detail}`
+      : presentation.headline
+    : "Current version of the application.";
 
   return (
     <>
       <SettingsRow
         id={searchableSetting("app-version").id}
-        title={<AboutVersionTitle />}
+        title={<AboutVersionTitle version={updateState?.currentVersion ?? APP_VERSION} />}
         description={description}
         control={
-          <Tooltip>
-            <TooltipTrigger
-              render={
+          presentation && (presentation.primary || presentation.secondary) ? (
+            <div className="flex items-center gap-2">
+              {presentation.secondary ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={pendingIntent !== null}
+                  onClick={() => {
+                    if (presentation.secondary) runIntent(presentation.secondary.intent);
+                  }}
+                >
+                  {presentation.secondary.label}
+                </Button>
+              ) : null}
+              {presentation.primary ? (
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={buttonDisabled || isUpdateActionPending}
-                  onClick={handleButtonClick}
+                  disabled={pendingIntent !== null}
+                  onClick={() => {
+                    if (presentation.primary) runIntent(presentation.primary.intent);
+                  }}
                 >
-                  {buttonLabel}
+                  {presentation.primary.label}
                 </Button>
-              }
-            />
-            {buttonTooltip ? <TooltipPopup>{buttonTooltip}</TooltipPopup> : null}
-          </Tooltip>
+              ) : null}
+            </div>
+          ) : null
         }
-      />
-      {hasDesktopBridge ? (
+      >
+        {updateState && hasDesktopBridge ? <AboutReleaseNotes state={updateState} /> : null}
+      </SettingsRow>
+      {hasDesktopBridge && availableUpdateChannels.length > 1 ? (
         <SettingsRow
           {...searchableSetting("update-track")}
           description="Use stable releases or nightly builds. Switch back anytime."
@@ -2584,7 +2536,7 @@ export function AboutPreferencesPanel() {
           <>
             <SettingsRow
               id={searchableSetting("app-version").id}
-              title={<AboutVersionTitle />}
+              title={<AboutVersionTitle version={APP_VERSION} />}
               description="Current version of the application."
             />
             {IS_NIGHTLY_BUILD ? <NightlyMobileBetaRow /> : null}

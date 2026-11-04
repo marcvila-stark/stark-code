@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Electron-builder invokes this signing hook outside an Effect runtime.
 import { sign as signApplication, type SignOptions } from "@electron/osx-sign";
 import * as NodePath from "node:path";
 

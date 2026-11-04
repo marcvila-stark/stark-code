@@ -8,7 +8,7 @@ import { STARK_CODE_DARK_THEME_COLORS } from "@starkfuture/shared/themePalettes"
 import { EnvironmentId, ThreadId } from "@starkfuture/contracts";
 
 import { HtmlRenderDialog } from "./HtmlRenderDialog";
-import { HtmlRenderFrame } from "./HtmlRenderFrame";
+import { HtmlRenderFrame, HtmlRenderGallery } from "./HtmlRenderFrame";
 
 const { refresh, showError, openLink, openChangeRequestLink } = vi.hoisted(() => ({
   refresh: vi.fn(),
@@ -108,6 +108,104 @@ it("closes with the close button or Escape", async () => {
   expect(onClose).toHaveBeenCalledOnce();
 });
 
+it("closes on bare Escape only from the focused expanded iframe", async () => {
+  const frame = document.querySelector<HTMLIFrameElement>("iframe")!;
+  const posted = vi.spyOn(frame.contentWindow!, "postMessage");
+  await act(() => frame.dispatchEvent(new Event("load")));
+  expect(posted).toHaveBeenCalledWith(
+    expect.objectContaining({
+      method: "stark-code/notifications/shortcuts",
+      params: expect.objectContaining({
+        shortcuts: expect.arrayContaining([expect.objectContaining({ key: "escape" })]),
+      }),
+    }),
+    "*",
+  );
+  const notify = async (source: MessageEventSource | null, params = {}) =>
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source,
+          data: {
+            jsonrpc: "2.0",
+            method: "stark-code/notifications/keydown",
+            params: { key: "Escape", code: "Escape", ...params },
+          },
+        }),
+      );
+    });
+  await notify(frame.contentWindow);
+  expect(onClose).not.toHaveBeenCalled();
+  frame.focus();
+  await notify(window);
+  await notify(frame.contentWindow, { ctrlKey: true });
+  await notify(frame.contentWindow, { code: "KeyQ" });
+  expect(onClose).not.toHaveBeenCalled();
+  await notify(frame.contentWindow);
+  expect(onClose).toHaveBeenCalledOnce();
+  expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-forms");
+});
+
+it("does not replay bare Escape from an inline preview into the app", async () => {
+  await renderInline();
+  const frame = document.querySelector<HTMLIFrameElement>("iframe")!;
+  const replayed = vi.fn();
+  window.addEventListener("keydown", replayed);
+  try {
+    frame.focus();
+    await act(() =>
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source: frame.contentWindow,
+          data: {
+            jsonrpc: "2.0",
+            method: "stark-code/notifications/keydown",
+            params: { key: "Escape", code: "Escape" },
+          },
+        }),
+      ),
+    );
+    expect(replayed).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  } finally {
+    window.removeEventListener("keydown", replayed);
+  }
+});
+
+it("closes the focused expanded frame after transient user activation expires", async () => {
+  const original = Object.getOwnPropertyDescriptor(navigator, "userActivation");
+  Object.defineProperty(navigator, "userActivation", {
+    configurable: true,
+    value: { isActive: false },
+  });
+  const frame = document.querySelector<HTMLIFrameElement>("iframe")!;
+  const notify = async (source: MessageEventSource | null) =>
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source,
+          data: {
+            jsonrpc: "2.0",
+            method: "stark-code/notifications/keydown",
+            params: { key: "Escape", code: "Escape" },
+          },
+        }),
+      );
+    });
+  try {
+    await notify(frame.contentWindow);
+    expect(onClose).not.toHaveBeenCalled();
+    frame.focus();
+    await notify(window);
+    expect(onClose).not.toHaveBeenCalled();
+    await notify(frame.contentWindow);
+    expect(onClose).toHaveBeenCalledOnce();
+  } finally {
+    if (original) Object.defineProperty(navigator, "userActivation", original);
+    else Reflect.deleteProperty(navigator, "userActivation");
+  }
+});
+
 async function renderInline() {
   await act(() =>
     root.render(
@@ -183,3 +281,39 @@ it.each([null, new Error("Disconnected")])(
     );
   },
 );
+
+it("navigates inline previews without reloading a visited page", async () => {
+  await act(() =>
+    root.render(
+      <HtmlRenderGallery
+        environmentId={EnvironmentId.make("environment")}
+        renders={[
+          { attachmentId: "desktop", title: "Desktop", height: 400 },
+          { attachmentId: "mobile", title: "Mobile", height: 500 },
+        ]}
+        threadRef={undefined}
+      />,
+    ),
+  );
+  const first = container.querySelector('iframe[title="Desktop"]');
+  expect(first).not.toBeNull();
+  expect(container.querySelector('iframe[title="Mobile"]')).toBeNull();
+  const navigate = async (label: string) => {
+    const button = [
+      ...container.querySelectorAll<HTMLButtonElement>(`button[aria-label="${label}"]`),
+    ].find((candidate) => !candidate.closest("[hidden]"));
+    expect(button).toBeDefined();
+    await act(() => button!.click());
+  };
+  await navigate("Next preview");
+  const second = container.querySelector('iframe[title="Mobile"]');
+  expect(second).not.toBeNull();
+  expect(first!.closest("[hidden]")).not.toBeNull();
+  expect(second!.closest("[hidden]")).toBeNull();
+  await navigate("Previous preview");
+  expect(container.querySelector('iframe[title="Desktop"]')).toBe(first);
+  expect(first!.closest("[hidden]")).toBeNull();
+  await navigate("Previous preview");
+  expect(container.querySelector('iframe[title="Mobile"]')).toBe(second);
+  expect(second!.closest("[hidden]")).toBeNull();
+});

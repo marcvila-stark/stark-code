@@ -83,6 +83,19 @@ const registrationRecordStore = vi.hoisted(() => ({
   } | null,
 }));
 
+// Registration mechanics use an explicit fake relay, never the local-build default.
+vi.mock("../cloud/publicConfig", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../cloud/publicConfig")>();
+  const constants = (await import("expo-constants")).default;
+  return {
+    ...actual,
+    resolveCloudPublicConfig: () => ({
+      ...actual.resolveCloudPublicConfig(),
+      relay: { url: constants.expoConfig?.extra?.relay?.url ?? null },
+    }),
+  };
+});
+
 vi.mock("expo-constants", () => ({
   default: {
     expoConfig: {

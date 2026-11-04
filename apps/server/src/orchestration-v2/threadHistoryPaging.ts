@@ -5,6 +5,7 @@ import type {
   ThreadId,
   TurnItemId,
 } from "@starkfuture/contracts";
+import { openLostRuntimeRequests } from "@starkfuture/shared/orchestrationV2LostRequests";
 
 /**
  * Match the V1 conversation windows. Item/byte budgets only apply to histories
@@ -362,6 +363,37 @@ function retainedInterruptRequestTurnItems(
   return retained;
 }
 
+/**
+ * Items an open lost request's notice reads (see lostRuntimeRequestDetail):
+ * its own item and the command item its node hangs off. They are kept outside
+ * the visible window, since the notice stays until the user acts on it.
+ */
+function openLostRequestTurnItems(
+  projection: OrchestrationV2ThreadProjection,
+): OrchestrationV2TurnItem[] {
+  const requestIds = new Set(
+    openLostRuntimeRequests(projection.runtimeRequests).map((request) => String(request.id)),
+  );
+  if (requestIds.size === 0) return [];
+  const commandNodeIds = new Set(
+    projection.nodes.flatMap((node) =>
+      node.runtimeRequestId !== null &&
+      requestIds.has(String(node.runtimeRequestId)) &&
+      node.parentNodeId !== null
+        ? [String(node.parentNodeId)]
+        : [],
+    ),
+  );
+  return projection.turnItems.filter(
+    (item) =>
+      ((item.type === "approval_request" || item.type === "user_input_request") &&
+        requestIds.has(String(item.requestId))) ||
+      (item.type === "command_execution" &&
+        item.nodeId !== null &&
+        commandNodeIds.has(String(item.nodeId))),
+  );
+}
+
 function localTurnItemsForVisibleWindow(
   projection: OrchestrationV2ThreadProjection,
   visible: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
@@ -471,8 +503,10 @@ export function buildBoundedThreadProjection(input: {
   };
   const latestLocalTurnOrdinal = computeLatestLocalTurnOrdinal(input.projection.turnItems);
 
+  const lostRequestTurnItems = openLostRequestTurnItems(controlProjection);
   // Reserve bytes for small interrupt-request dependencies that may sit outside
-  // the recent window but are required for visibility of results inside it.
+  // the recent window but are required for visibility of results inside it,
+  // and for the items open lost requests are explained by.
   const dependencyReserve = (() => {
     // Upper bound: all request items in the full projection. Window selection
     // uses this reserve so the final contribution stays under the cap.
@@ -481,6 +515,9 @@ export function buildBoundedThreadProjection(input: {
       if (item.type === "run_interrupt_request") {
         reserve += bytesOfJson(item);
       }
+    }
+    for (const item of lostRequestTurnItems) {
+      reserve += bytesOfJson(item);
     }
     return reserve;
   })();
@@ -518,6 +555,9 @@ export function buildBoundedThreadProjection(input: {
     turnItemById.set(String(item.id), item);
   }
   for (const item of dependencyTurnItems) {
+    turnItemById.set(String(item.id), item);
+  }
+  for (const item of lostRequestTurnItems) {
     turnItemById.set(String(item.id), item);
   }
   const turnItems = [...turnItemById.values()];

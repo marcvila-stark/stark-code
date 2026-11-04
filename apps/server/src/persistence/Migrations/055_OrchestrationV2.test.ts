@@ -13,7 +13,7 @@ layer("055_OrchestrationV2", (it) => {
     Effect.sync(() => {
       assert.deepStrictEqual(
         migrationEntries.map(([id]) => id),
-        Array.from({ length: 62 }, (_, index) => index + 1),
+        Array.from({ length: 64 }, (_, index) => index + 1),
       );
     }),
   );
@@ -34,6 +34,8 @@ layer("055_OrchestrationV2", (it) => {
         [60, "ThreadSnapshotWindowIndexes"],
         [61, "PullRequestReviewGuides"],
         [62, "ThreadFailureLookupIndex"],
+        [63, "ScheduledTaskRuns"],
+        [64, "PermissionSource"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
 
@@ -62,6 +64,8 @@ layer("055_OrchestrationV2", (it) => {
         { migration_id: 60, name: "ThreadSnapshotWindowIndexes" },
         { migration_id: 61, name: "PullRequestReviewGuides" },
         { migration_id: 62, name: "ThreadFailureLookupIndex" },
+        { migration_id: 63, name: "ScheduledTaskRuns" },
+        { migration_id: 64, name: "PermissionSource" },
       ]);
 
       const tables = yield* sql<{ readonly name: string }>`
@@ -111,6 +115,7 @@ layer("055_OrchestrationV2", (it) => {
       assert.ok(eventColumns.some(({ name }) => name === "application_event_version"));
       assert.ok(receiptColumns.some(({ name }) => name === "command_type"));
       assert.ok(threadColumns.some(({ name }) => name === "provider_instance_id"));
+      assert.ok(threadColumns.some(({ name }) => name === "permission_source"));
       assert.ok(subagentColumns.some(({ name }) => name === "driver"));
       assert.ok(subagentColumns.some(({ name }) => name === "provider_instance_id"));
 

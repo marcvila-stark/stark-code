@@ -2,7 +2,9 @@ import type { ThreadId } from "@starkfuture/contracts";
 import * as HostProcess from "@starkfuture/shared/HostProcess";
 import {
   clampHtmlRenderHeight,
+  findHtmlRenderLocalImages,
   HTML_RENDER_COLUMN_WIDTH,
+  HTML_RENDER_IMAGE_MIME_TYPES,
   HTML_RENDER_MAX_TITLE_LENGTH,
   HTML_RENDER_MEASURE_FONTS,
   HTML_RENDER_MEASURE_WIDTHS,
@@ -109,7 +111,10 @@ export class HtmlRender extends Context.Service<
       readonly title: string;
       readonly height: number;
     }) => Effect.Effect<HtmlRenderReference, HtmlRenderPrepareError | HtmlRenderStoreError>;
-    /** Screenshots a page in headless Chrome, tolerating unreadable local images. */
+    /**
+     * Screenshots a page in headless Chrome, tolerating unreadable local images.
+     * Never installs the browser: without it, fails with its status instead.
+     */
     readonly preview: (input: {
       readonly html: string;
       readonly width?: number | undefined;
@@ -117,49 +122,19 @@ export class HtmlRender extends Context.Service<
     }) => Effect.Effect<
       HtmlPreview,
       | Exclude<HtmlRenderPrepareError, HtmlRenderImagesNotFoundError>
-      | PreviewBrowser.PreviewBrowserInstallError
-      | PreviewBrowser.PreviewBrowserInstallingError
-      | PreviewBrowser.PreviewBrowserUnsupportedError
+      | PreviewBrowser.PreviewBrowserNotReadyError
       | PreviewBrowserHost.PreviewBrowserHostError
       | HeadlessChrome.HtmlRenderBrowserError
     >;
   }
 >()("stark-code/htmlRender/HtmlRender") {}
 
-const IMAGE_MIME_TYPES: Record<string, string> = {
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-  avif: "image/avif",
-  svg: "image/svg+xml",
-  bmp: "image/bmp",
-  ico: "image/x-icon",
-};
-const IMAGE_EXTENSIONS = Object.keys(IMAGE_MIME_TYPES).join("|");
-// POSIX `/…` (not protocol-relative `//…`) or Windows `C:\…` / `C:/…`.
-const ABSOLUTE_PATH = String.raw`(?:/(?!/)|[a-z]:[\\/])`;
-// An absolute image path that is a whole quoted string ("…", '…', `…`) or an
-// unquoted CSS url(…). URLs, data:, blob:, and relative paths never match.
-const LOCAL_IMAGE_PATTERN = new RegExp(
-  String.raw`(["'\x60])(${ABSOLUTE_PATH}(?:(?!\1)[^\r\n]){0,2048}?\.(?:${IMAGE_EXTENSIONS}))\1` +
-    String.raw`|url\(\s*(${ABSOLUTE_PATH}[^\s"'\x60()]{0,2048}?\.(?:${IMAGE_EXTENSIONS}))\s*\)`,
-  "gid",
-);
-
-const findLocalImages = (html: string) =>
-  Array.from(html.matchAll(LOCAL_IMAGE_PATTERN)).flatMap((match) => {
-    const span = match.indices?.[2] ?? match.indices?.[3];
-    return span ? [{ start: span[0], end: span[1], path: html.slice(span[0], span[1]) }] : [];
-  });
-
 // Inside a JS string literal a Windows path's backslashes are escaped.
 const filePathFor = (reference: string) =>
   /^[a-z]:/i.test(reference) ? reference.replaceAll("\\\\", "\\") : reference;
 
 const dataUriPrefix = (path: string) =>
-  `data:${IMAGE_MIME_TYPES[path.slice(path.lastIndexOf(".") + 1).toLowerCase()] ?? "application/octet-stream"};base64,`;
+  `data:${HTML_RENDER_IMAGE_MIME_TYPES[path.slice(path.lastIndexOf(".") + 1).toLowerCase()] ?? "application/octet-stream"};base64,`;
 
 const latin1 = (bytes: Uint8Array, start: number, end: number) =>
   String.fromCharCode(...bytes.subarray(start, end));
@@ -230,7 +205,7 @@ const afterDoctype = (text: string, from: number) => {
 /** Replaces every local image reference with a data URI; unreadable paths stay as written. */
 const inlineLocalImages = Effect.fn("HtmlRender.inlineLocalImages")(function* (html: string) {
   const fileSystem = yield* FileSystem.FileSystem;
-  const references = findLocalImages(html);
+  const references = findHtmlRenderLocalImages(html);
   const files = yield* Effect.forEach(
     [...new Set(references.map((reference) => reference.path))],
     (path) =>
@@ -367,6 +342,17 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  // Previews only use a browser that is already installed. One that finished
+  // installing since the first check is used rather than reported missing.
+  const readyExecutable = Effect.gen(function* () {
+    const installed = yield* previewBrowser.installed;
+    if (Option.isSome(installed)) return installed.value;
+    const status = yield* previewBrowser.status;
+    const finished = status.state === "ready" ? yield* previewBrowser.installed : Option.none();
+    if (Option.isSome(finished)) return finished.value;
+    return yield* new PreviewBrowser.PreviewBrowserNotReadyError({ status });
+  });
+
   // Never installs the browser: html_render must not depend on it.
   const measure = (html: string) =>
     Effect.gen(function* () {
@@ -457,8 +443,8 @@ const make = Effect.gen(function* () {
       Math.max(MIN_PREVIEW_WIDTH, Math.round(input.width ?? HTML_RENDER_COLUMN_WIDTH)),
     );
     const appearance = input.appearance ?? "dark";
+    const executable = yield* readyExecutable;
     const inlined = yield* inline(input.html);
-    const executable = yield* previewBrowser.executable;
     const theme = htmlRenderTheme(
       appearance === "light" ? STARK_CODE_LIGHT_THEME_COLORS : STARK_CODE_DARK_THEME_COLORS,
       appearance,

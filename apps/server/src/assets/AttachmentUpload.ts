@@ -143,6 +143,62 @@ export const validateAttachmentUploadToken = Effect.fn("AttachmentUpload.validat
   return claims;
 });
 
+const sameBytes = (left: Uint8Array, right: Uint8Array) =>
+  left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
+
+/**
+ * A draft keeps its images as bytes and uploads them again each time it is
+ * opened on a new launch, so one pasted image would leave a new pending file
+ * per launch until the pending sweep removes them. When a pending upload with
+ * the same bytes and extension exists, the new upload's name becomes a hard
+ * link to it instead of a second copy. Each name stays a complete file that
+ * is claimed, swept or deleted on its own; the shared modification time is
+ * set to the new upload's, so the sweep gives the new name its full day.
+ *
+ * Returns false, leaving the upload to be renamed into place, when nothing
+ * matches or the link cannot be made.
+ */
+const linkToPendingCopy = Effect.fn("AttachmentUpload.linkToPendingCopy")(
+  function* (input: {
+    readonly attachmentsDir: string;
+    readonly partPath: string;
+    readonly finalPath: string;
+    readonly extension: string;
+  }) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const written = yield* fileSystem.stat(input.partPath);
+    if (Option.isNone(written.mtime)) return false;
+    const candidates = (yield* fileSystem.readDirectory(input.attachmentsDir)).filter(
+      (entry) =>
+        entry.endsWith(input.extension) &&
+        parseThreadSegmentFromAttachmentId(entry.slice(0, -input.extension.length)) ===
+          PENDING_ATTACHMENT_THREAD_SEGMENT,
+    );
+    let bytes: Uint8Array | null = null;
+    for (const entry of candidates) {
+      const candidate = path.join(input.attachmentsDir, entry);
+      const info = yield* fileSystem.stat(candidate);
+      if (info.type !== "File" || info.size !== written.size) continue;
+      bytes ??= yield* fileSystem.readFile(input.partPath);
+      if (!sameBytes(bytes, yield* fileSystem.readFile(candidate))) continue;
+      yield* fileSystem.link(candidate, input.finalPath);
+      return yield* fileSystem
+        .utimes(input.finalPath, written.mtime.value, written.mtime.value)
+        .pipe(
+          Effect.as(true),
+          // An old shared time would get the new name swept early: keep a copy instead.
+          Effect.catch(() =>
+            fileSystem.remove(input.finalPath, { force: true }).pipe(Effect.as(false)),
+          ),
+        );
+    }
+    return false;
+  },
+  // A candidate swept meanwhile, or a filesystem without hard links.
+  Effect.orElseSucceed(() => false),
+);
+
 export type StoreAttachmentUploadResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly status: number; readonly detail: string };
@@ -201,7 +257,16 @@ export const storeAttachmentUpload = Effect.fn("AttachmentUpload.store")(functio
         detail: `Body was ${receivedBytes} bytes, expected ${claims.sizeBytes}.`,
       } satisfies StoreAttachmentUploadResult;
     }
-    yield* fileSystem.rename(partPath, finalPath);
+    const linked =
+      claims.type === "image"
+        ? yield* linkToPendingCopy({
+            attachmentsDir: config.attachmentsDir,
+            partPath,
+            finalPath,
+            extension,
+          })
+        : false;
+    if (!linked) yield* fileSystem.rename(partPath, finalPath);
     return { ok: true } satisfies StoreAttachmentUploadResult;
   }).pipe(
     Effect.catch((cause) =>

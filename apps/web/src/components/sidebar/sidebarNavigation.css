@@ -94,6 +94,11 @@ html[data-theme-id="stark-chat"] [data-app-sidebar="threads"][data-app-sidebar][
   padding-bottom: 25px;
 }
 
+.stark-sidebar-brandrow[data-has-backdrop] {
+  color: white;
+  --sidebar-foreground: white;
+}
+
 .stark-sidebar-environment {
   position: absolute;
   bottom: 2px;

@@ -183,7 +183,15 @@ export type AgentSessionRecentThread =
     }
   | { readonly _tag: "AlreadyImported"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
+  | { readonly _tag: "RanInStark" }
   | { readonly _tag: "Skipped" };
+
+/** Whether a Stark thread ran this native session, so it is not imported. */
+export type RanInStark = (session: {
+  readonly provider: AgentSessionSource;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+}) => boolean;
 
 export type AgentSessionLocalThread =
   | AgentSessionRecentThread
@@ -203,6 +211,7 @@ export class AgentSessionScanner extends Context.Service<
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      ranInStark?: RanInStark,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
     /** Read local history without project, checkout-existence, or age filters. */
     readonly allThreads: (
@@ -281,6 +290,40 @@ function extractText(
     .join("\n");
 }
 
+/**
+ * Stark puts its own context ahead of a prompt in `<stark_code_…>` blocks, such
+ * as `<stark_code_preview_browser>`, so the agent cannot mistake it for the
+ * user's words. Its own sessions record those blocks as part of the user
+ * message. Returns the text without the leading blocks, empty when the message
+ * was only Stark context, and any other text unchanged.
+ */
+const LEADING_STARK_CONTEXT_BLOCK = /^\s*<(stark_code_[a-z0-9_]+)>[\s\S]*?<\/\1>/;
+
+function withoutStarkContext(text: string): string {
+  let rest = text;
+  let match = LEADING_STARK_CONTEXT_BLOCK.exec(rest);
+  if (match === null) return text;
+  while (match !== null) {
+    rest = rest.slice(match[0].length);
+    match = LEADING_STARK_CONTEXT_BLOCK.exec(rest);
+  }
+  return rest.trim();
+}
+
+const CODEX_ROLLOUT_SESSION_ID_PATTERN =
+  /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+
+/**
+ * The session id a transcript's file name carries, read without opening it.
+ * Claude names the file after the session; Codex ends the rollout name with it.
+ */
+function transcriptFileSessionId(source: AgentSessionSource, fileName: string): string | null {
+  if (source === "claudeAgent") {
+    return fileName.endsWith(".jsonl") ? fileName.slice(0, -".jsonl".length) : null;
+  }
+  return CODEX_ROLLOUT_SESSION_ID_PATTERN.exec(fileName)?.[1] ?? null;
+}
+
 function normalizeTimestamp(value: string | undefined, fallback: string): string {
   if (value === undefined) return fallback;
   const parsed = DateTime.make(value);
@@ -324,9 +367,12 @@ function parseAgentSessionRecords(
   let model: string | null = null;
   let hasCodexSessionId = false;
   const messages: Array<AgentSessionThreadMessage & { readonly codexResponseUser: boolean }> = [];
+  // The first message a person wrote, which names the thread. A message that is
+  // only Stark context does not count, but still makes the session importable.
   let firstUserMessage:
     | (AgentSessionThreadMessage & { readonly codexResponseUser: boolean })
     | undefined;
+  let hasUserMessage = false;
   // A Codex response item can include generated setup text beside the real
   // prompt. Suppress response-user records only when the shared turn ID and a
   // verbatim event copy prove which prompt the user submitted.
@@ -386,8 +432,11 @@ function parseAgentSessionRecords(
   const retainMessage = (
     message: AgentSessionThreadMessage & { readonly codexResponseUser: boolean },
   ) => {
-    if (firstUserMessage === undefined && message.role === "user") {
-      firstUserMessage = message;
+    if (message.role === "user") {
+      hasUserMessage = true;
+      if (firstUserMessage === undefined && withoutStarkContext(message.text).trim().length > 0) {
+        firstUserMessage = message;
+      }
     }
     messages.push(message);
     if (messages.length > messageLimit) messages.shift();
@@ -500,22 +549,35 @@ function parseAgentSessionRecords(
     });
   }
 
-  const visibleMessages = messages.map(
-    ({ codexResponseUser: _codexResponseUser, ...message }) => message,
-  );
-  if (providerSessionId.trim().length === 0 || firstUserMessage === undefined) return null;
-  const firstUserMessageRetained = messages.includes(firstUserMessage);
-  const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
-  const retainedMessages = firstUserMessageRetained
-    ? visibleMessages
-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(messageLimit - 1))];
-  const derivedTitle = visibleFirstUserMessage.text.trim().split("\n")[0]?.slice(0, 100).trim();
+  if (providerSessionId.trim().length === 0 || !hasUserMessage) return null;
+  // Imported threads show what the person wrote, as Stark's own threads do.
+  const visible = ({
+    codexResponseUser: _codexResponseUser,
+    ...message
+  }: (typeof messages)[number]): AgentSessionThreadMessage =>
+    message.role === "user" ? { ...message, text: withoutStarkContext(message.text) } : message;
+  const visibleMessages = messages
+    .map(visible)
+    .filter((message) => message.role !== "user" || message.text.trim().length > 0);
+  const evictedFirstUserMessage =
+    firstUserMessage === undefined || messages.includes(firstUserMessage)
+      ? undefined
+      : visible(firstUserMessage);
+  const retainedMessages =
+    evictedFirstUserMessage === undefined
+      ? visibleMessages
+      : [evictedFirstUserMessage, ...visibleMessages.slice(-(messageLimit - 1))];
+  if (retainedMessages.length === 0) return null;
+  const derivedTitle =
+    firstUserMessage === undefined
+      ? undefined
+      : withoutStarkContext(firstUserMessage.text).trim().split("\n")[0]?.slice(0, 100).trim();
 
   return {
     source: input.source,
     providerInstanceId: input.providerInstanceId,
     providerSessionId,
-    title: title ?? (derivedTitle && derivedTitle.length > 0 ? derivedTitle : "Imported thread"),
+    title: title ?? (derivedTitle && derivedTitle.length > 0 ? derivedTitle : "Untitled session"),
     model,
     createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
     updatedAt: fallbackTimestamp,
@@ -1527,6 +1589,7 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    ranInStark: RanInStark,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -1581,6 +1644,22 @@ export const make = Effect.gen(function* () {
     return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
       Stream.mapEffect(({ candidate, transcript }) =>
         Effect.gen(function* () {
+          // Checked before any read so Stark's own sessions never use up the
+          // import budget. The id inside the transcript is checked again below.
+          const fileSessionId = transcriptFileSessionId(
+            candidate.source,
+            path.basename(transcript.filePath),
+          );
+          if (
+            fileSessionId !== null &&
+            ranInStark({
+              provider: candidate.source,
+              providerInstanceId: candidate.providerInstanceId,
+              providerSessionId: fileSessionId,
+            })
+          ) {
+            return Option.some<AgentSessionRecentThread>({ _tag: "RanInStark" });
+          }
           const completed = completedByFile.get(
             `${candidate.providerInstanceId}\0${transcript.filePath}`,
           );
@@ -1659,6 +1738,15 @@ export const make = Effect.gen(function* () {
           if (parsedThread === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
+          if (
+            ranInStark({
+              provider: parsedThread.source,
+              providerInstanceId: parsedThread.providerInstanceId,
+              providerSessionId: parsedThread.providerSessionId,
+            })
+          ) {
+            return Option.some<AgentSessionRecentThread>({ _tag: "RanInStark" });
+          }
 
           const source: AgentSessionImportSource = {
             ...identity,
@@ -1686,7 +1774,8 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    ranInStark = () => false,
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, ranInStark));
 
   // CLI startup writes a header before any user prompt. Stable empty sessions
   // must not consume every refresh batch and starve older conversations.

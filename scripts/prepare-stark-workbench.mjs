@@ -4,6 +4,11 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import * as NodeChildProcess from "node:child_process";
 import {
+  adaptStarkPagesCss,
+  adaptStarkPagesRenderer,
+  adaptStarkPagesChrome,
+} from "./adapt-stark-pages-reader.mjs";
+import {
   adaptStarkPagesPanel,
   STARK_PAGES_PRESENTATION_VERSION,
 } from "./adapt-stark-pages-panel.mjs";
@@ -52,7 +57,22 @@ export function prepareStarkWorkbench({
       { stdio: "pipe" },
     );
     const panelPath = NodePath.join(temporary, "packages/spage/src/panel.js");
-    NodeFS.writeFileSync(panelPath, adaptStarkPagesPanel(NodeFS.readFileSync(panelPath, "utf8")));
+    NodeFS.writeFileSync(
+      panelPath,
+      adaptStarkPagesChrome(adaptStarkPagesPanel(NodeFS.readFileSync(panelPath, "utf8"))),
+    );
+    for (const [relative, adapt] of [
+      ["packages/pages-renderer/src/css.js", adaptStarkPagesCss],
+      ["packages/pages-renderer/src/render.js", adaptStarkPagesRenderer],
+      // The offline archive materializes workspace dependencies; spage imports
+      // this copy, while kit commands can import the package source directly.
+      ["node_modules/@stark/pages-renderer/src/css.js", adaptStarkPagesCss],
+      ["node_modules/@stark/pages-renderer/src/render.js", adaptStarkPagesRenderer],
+      ["packages/spage/src/follower.js", adaptStarkPagesChrome],
+    ]) {
+      const path = NodePath.join(temporary, relative);
+      NodeFS.writeFileSync(path, adapt(NodeFS.readFileSync(path, "utf8")));
+    }
     NodeFS.writeFileSync(
       NodePath.join(temporary, ".stark-bundle.json"),
       JSON.stringify({

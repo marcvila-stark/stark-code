@@ -2,6 +2,7 @@ import { ORCHESTRATION_V2_WS_METHODS } from "@starkfuture/contracts";
 import { Atom } from "effect/reactivity";
 
 import {
+  createEnvironmentGuardedRpcQueryAtomFamily,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
@@ -86,6 +87,14 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
     archivedShellSnapshot: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:archived-shell-snapshot",
       tag: ORCHESTRATION_V2_WS_METHODS.getArchivedShellSnapshot,
+    }),
+    // Call only on servers whose config sets `threadHistorySearch`. A page left
+    // behind by a new query is dropped at once, which cancels its request.
+    threadHistory: createEnvironmentGuardedRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:thread-history",
+      tag: ORCHESTRATION_V2_WS_METHODS.searchThreadHistory,
+      staleTimeMs: 15_000,
+      idleTtlMs: 0,
     }),
   };
 }

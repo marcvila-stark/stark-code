@@ -110,6 +110,16 @@ export function BrowserDocumentFrame(props: {
   );
 }
 
+function isBareEscape(key: HtmlRenderShortcut) {
+  return (
+    key.key.toLowerCase() === "escape" &&
+    !key.metaKey &&
+    !key.ctrlKey &&
+    !key.shiftKey &&
+    !key.altKey
+  );
+}
+
 /**
  * A sandboxed agent HTML render in the app theme. The page reads the theme from
  * its URL fragment before first paint, then follows changes posted to its
@@ -124,6 +134,8 @@ export function HtmlRenderDocument(props: {
   readonly threadRef?: ScopedThreadRef | undefined;
   /** Receives the page's content height whenever it changes, so an inline frame can fit it. */
   readonly onContentHeight?: (height: number) => void;
+  /** Only an expanded preview opts into closing on an unhandled Escape from its frame. */
+  readonly onEscape?: () => void;
 }) {
   const theme = useHtmlRenderTheme();
   const frameRef = useRef<HTMLIFrameElement>(null);
@@ -138,6 +150,7 @@ export function HtmlRenderDocument(props: {
   const environmentKeybindings = useAtomValue(
     serverEnvironment.configValueAtom(props.threadRef?.environmentId ?? null),
   )?.keybindings;
+  const closeOnEscape = props.onEscape !== undefined;
   // The app resolves a replayed key in its live context, so every allowed
   // binding counts whatever its `when`, and a key that any binding gives to
   // another command stays with the page. Only Cmd/Ctrl chords: a printable key
@@ -153,7 +166,8 @@ export function HtmlRenderDocument(props: {
     });
     const blocked = [...keybindings, ...(environmentKeybindings ?? [])]
       .filter((binding) => !HTML_RENDER_SHORTCUT_COMMANDS.has(binding.command))
-      .map((binding) => resolve(binding.shortcut));
+      .map((binding) => resolve(binding.shortcut))
+      .filter((shortcut) => !closeOnEscape || !isBareEscape(shortcut));
     const shortcuts = new Map<string, HtmlRenderShortcut>();
     for (const { command, shortcut } of keybindings) {
       if (
@@ -163,8 +177,17 @@ export function HtmlRenderDocument(props: {
         shortcuts.set(shortcutConflictKey(shortcut), resolve(shortcut));
       }
     }
+    if (closeOnEscape) {
+      shortcuts.set("preview-escape", {
+        key: "escape",
+        metaKey: false,
+        ctrlKey: false,
+        shiftKey: false,
+        altKey: false,
+      });
+    }
     return { shortcuts: [...shortcuts.values()], blocked };
-  }, [environmentKeybindings, keybindings]);
+  }, [closeOnEscape, environmentKeybindings, keybindings]);
   const postShortcuts = () => {
     frameRef.current?.contentWindow?.postMessage(
       htmlRenderShortcutsMessage(shortcuts, blocked),
@@ -188,6 +211,13 @@ export function HtmlRenderDocument(props: {
           key.key === "Dead" ||
           allowed.some((shortcut) => shortcut.key === normalizeEventKey(key.key)))
       );
+    },
+  );
+  const closePreview = useEffectEvent(
+    (key: NonNullable<ReturnType<typeof readHtmlRenderKeyDown>>) => {
+      if (!props.onEscape || !isBareEscape(key) || key.code !== "Escape") return false;
+      props.onEscape();
+      return true;
     },
   );
   const openChangeRequestLink = useOpenChangeRequestLink(props.threadRef);
@@ -252,11 +282,19 @@ export function HtmlRenderDocument(props: {
         key === undefined ||
         frame === null ||
         event.source !== frame.contentWindow ||
-        document.activeElement !== frame ||
-        navigator.userActivation?.isActive === false
+        document.activeElement !== frame
       ) {
         return;
       }
+      // Escape closes only this preview. Never synthesize it into the app's
+      // general key handlers, where it could cancel a turn or dismiss another UI.
+      // Escape does not create transient user activation, so closing this frame
+      // must also work after the reader has spent time looking at its content.
+      if (isBareEscape(key)) {
+        closePreview(key);
+        return;
+      }
+      if (navigator.userActivation?.isActive === false) return;
       if (!isShortcut(key)) return;
       frame.dispatchEvent(
         new KeyboardEvent("keydown", { ...key, bubbles: true, cancelable: true }),

@@ -8,14 +8,17 @@ import {
   WS_METHODS,
 } from "@starkfuture/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/rpc";
+import * as Socket from "effect/socket/Socket";
 
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
@@ -23,6 +26,19 @@ import type { RpcSession } from "../rpc/session.ts";
 
 export class EnvironmentRpcUnavailableError extends Schema.TaggedError<EnvironmentRpcUnavailableError>()(
   "EnvironmentRpcUnavailableError",
+  {
+    environmentId: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+/**
+ * A request may have reached the server, but its answer was lost with the connection and no
+ * replacement session confirmed it in time. Unlike `EnvironmentRpcUnavailableError`, the
+ * command may have been applied.
+ */
+export class EnvironmentRpcOutcomeUnknownError extends Schema.TaggedError<EnvironmentRpcOutcomeUnknownError>()(
+  "EnvironmentRpcOutcomeUnknownError",
   {
     environmentId: Schema.String,
     message: Schema.String,
@@ -59,6 +75,7 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.subscribeServerLifecycle
   | typeof WS_METHODS.scheduledTasksSubscribe
   | typeof WS_METHODS.serverGetStorageCleanupReport
+  | typeof WS_METHODS.serverGetPreviewBrowserStatus
   | typeof WS_METHODS.subscribeTerminalEvents
   | typeof WS_METHODS.subscribeTerminalMetadata
   | typeof WS_METHODS.subscribePreviewEvents
@@ -208,6 +225,122 @@ export const requestGuarded = Effect.fn("EnvironmentRpc.request")(function* <
   });
   return yield* method(input).pipe(Effect.ensuring(completeObservation));
 });
+
+/** How long a request that lost its connection waits for a replacement: the supervisor's backoff cap. */
+const DEFAULT_RECONNECT_WAIT = Duration.minutes(5);
+
+const isSocketErrorReason = Schema.is(Socket.SocketErrorReason);
+
+/**
+ * The call may have reached the server and only its answer was lost: the socket failed, or the
+ * session closed under the open call. An interrupt of the caller's own fiber is not a loss.
+ */
+function lostTransport(cause: Cause.Cause<unknown>, callerFiberId: number): boolean {
+  return (
+    cause.reasons.length > 0 &&
+    cause.reasons.every((reason) =>
+      reason._tag === "Interrupt"
+        ? reason.fiberId !== callerFiberId
+        : reason._tag === "Fail" &&
+          isRpcClientError(reason.error) &&
+          isSocketErrorReason(reason.error.reason),
+    )
+  );
+}
+
+export interface ReconnectRequestOptions {
+  /** Longest wait for replacement sessions, counted from the first attempt. Defaults to 5 minutes. */
+  readonly maxWait?: Duration.Input;
+  /** Runs each time the request lost its connection and starts waiting for the next session. */
+  readonly onAwaitingReconnect?: Effect.Effect<void>;
+  /** Ends a wait early when it completes, for example once the environment was removed. */
+  readonly abandonWhen?: Effect.Effect<void>;
+}
+
+/**
+ * Sends a unary request whose answer must survive a dropped connection, such as a reply to an
+ * approval. When the socket fails or the session closes while the call is open, the request may
+ * already be applied, so the identical input is sent again on the supervisor's next session.
+ * Only use it for inputs the server deduplicates: an orchestration command keeps its
+ * `commandId`, and the server replays the receipt of a command it already committed instead of
+ * applying it twice.
+ *
+ * Every attempt checks the caller's grants again, so a revoked grant stops the resend. Without a
+ * session at the start nothing was sent, and it fails with `EnvironmentRpcUnavailableError`.
+ * Server rejections, authorization failures and client defects pass through untouched. When no
+ * replacement session arrives within `maxWait`, the environment is switched off, or
+ * `abandonWhen` completes, it fails with `EnvironmentRpcOutcomeUnknownError`.
+ */
+export const requestGuardedAcrossReconnect = Effect.fn("EnvironmentRpc.requestAcrossReconnect")(
+  function* <TTag extends EnvironmentUnaryRpcTag>(
+    tag: TTag,
+    input: EnvironmentRpcInput<TTag>,
+    options?: ReconnectRequestOptions,
+  ) {
+    const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+    yield* Effect.annotateCurrentSpan({
+      "environment.id": supervisor.target.environmentId,
+      "rpc.method": tag,
+    });
+    const callerFiberId = yield* Effect.withFiber((fiber) => Effect.succeed(fiber.id));
+    const deadline =
+      (yield* Clock.currentTimeMillis) +
+      Duration.toMillis(Duration.fromInputUnsafe(options?.maxWait ?? DEFAULT_RECONNECT_WAIT));
+    const observer = yield* EnvironmentRpcRequestObserver;
+    // The environment stops reconnecting when the user switches it off.
+    const switchedOff = SubscriptionRef.changes(supervisor.state).pipe(
+      Stream.filter((state) => !state.desired),
+      Stream.runHead,
+      Effect.asVoid,
+    );
+    const replacementFor = (lost: RpcSession) =>
+      SubscriptionRef.changes(supervisor.session).pipe(
+        Stream.mapEffect((candidate) =>
+          Option.isNone(candidate) || candidate.value === lost
+            ? Effect.succeed(Option.none<RpcSession>())
+            : candidate.value.ready.pipe(
+                Effect.as(Option.some(candidate.value)),
+                Effect.orElseSucceed(() => Option.none<RpcSession>()),
+              ),
+        ),
+        Stream.filter(Option.isSome),
+        Stream.runHead,
+        Effect.map(Option.flatten),
+      );
+
+    let session = yield* currentSession();
+    while (true) {
+      yield* authorizeRequest(tag, input);
+      const method = session.client[tag] as (
+        input: EnvironmentRpcInput<TTag>,
+      ) => Effect.Effect<EnvironmentRpcSuccess<TTag>, EnvironmentRpcFailure<TTag>>;
+      const completeObservation = yield* observer.observe({
+        environmentId: supervisor.target.environmentId,
+        method: tag,
+      });
+      const exit = yield* method(input).pipe(Effect.ensuring(completeObservation), Effect.exit);
+      if (Exit.isSuccess(exit)) return exit.value;
+      if (!lostTransport(exit.cause, callerFiberId)) return yield* Effect.failCause(exit.cause);
+
+      yield* options?.onAwaitingReconnect ?? Effect.void;
+      const remainingMs = Math.max(0, deadline - (yield* Clock.currentTimeMillis));
+      const stopped = Effect.raceFirst(switchedOff, options?.abandonWhen ?? Effect.never).pipe(
+        Effect.as(Option.none<RpcSession>()),
+      );
+      const next = yield* Effect.raceFirst(replacementFor(session), stopped).pipe(
+        Effect.timeoutOption(Duration.millis(remainingMs)),
+        Effect.map(Option.flatten),
+      );
+      if (Option.isNone(next)) {
+        return yield* new EnvironmentRpcOutcomeUnknownError({
+          environmentId: supervisor.target.environmentId,
+          message: `${supervisor.target.label} did not reconnect in time to confirm the request.`,
+        });
+      }
+      session = next.value;
+    }
+  },
+);
 
 export function runStreamGuarded<TTag extends EnvironmentStreamCommandRpcTag>(
   tag: TTag,

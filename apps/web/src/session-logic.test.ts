@@ -448,6 +448,59 @@ describe("V2 session presentation", () => {
     }
   });
 
+  it("reads a command its approval never allowed as declined, and rebuilds when that changes", () => {
+    const now = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
+    const threadId = ThreadId.make("thread-declined");
+    const command = {
+      id: TurnItemId.make("item-declined-command"),
+      threadId,
+      runId: RunId.make("run-declined"),
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      // Claude records the declined command as failed.
+      status: "failed" as const,
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      type: "command_execution" as const,
+      input: "mkdir -p build",
+      output: "Error: User declined tool execution.",
+    } satisfies OrchestrationV2TurnItem;
+    const visibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem> = [
+      {
+        position: 0,
+        visibility: "local",
+        sourceThreadId: threadId,
+        sourceItemId: command.id,
+        item: command,
+      },
+    ];
+    const status = (entries: ReadonlyArray<TimelineEntry>) =>
+      entries[0]?.kind === "work" ? entries[0].entry.toolLifecycleStatus : undefined;
+    const before = deriveTimelineEntriesFromVisibleTurnItemsWithState({
+      visibleTurnItems,
+      optimisticMessages: [],
+    });
+    expect(status(before.entries)).toBe("failed");
+    const declined = deriveTimelineEntriesFromVisibleTurnItemsWithState(
+      { visibleTurnItems, optimisticMessages: [], declinedItemIds: new Set([command.id]) },
+      before,
+    );
+    expect(status(declined.entries)).toBe("declined");
+    // The same ids in a new set keep the entries.
+    expect(
+      deriveTimelineEntriesFromVisibleTurnItemsWithState(
+        { visibleTurnItems, optimisticMessages: [], declinedItemIds: new Set([command.id]) },
+        declined,
+      ).entries,
+    ).toBe(declined.entries);
+  });
+
   it.each(["pending", "running", "completed"] as const)(
     "keeps %s task progress available to the composer and out of the timeline",
     (stepStatus) => {

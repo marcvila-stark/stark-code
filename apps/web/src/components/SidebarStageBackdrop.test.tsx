@@ -13,6 +13,8 @@ describe("SidebarStageBackdrop", () => {
     expect(resolveSidebarStageBackdropVariant("Nightly")).toBe("nightly");
     expect(resolveSidebarStageBackdropVariant("Dev", false)).toBeNull();
     expect(resolveSidebarStageBackdropVariant("Alpha")).toBeNull();
+    expect(resolveSidebarStageBackdropVariant("Alpha", false)).toBeNull();
+    expect(resolveSidebarStageBackdropVariant("Latest")).toBeNull();
   });
 
   it("resolves supported environment pill labels", () => {

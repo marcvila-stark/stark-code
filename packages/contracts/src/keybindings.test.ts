@@ -89,6 +89,12 @@ it.effect("parses keybinding rules", () =>
     });
     assert.strictEqual(parsedUsageOpen.command, "usage.open");
 
+    const parsedHistoryOpen = yield* decode(KeybindingRule, {
+      key: "mod+shift+y",
+      command: "history.open",
+    });
+    assert.strictEqual(parsedHistoryOpen.command, "history.open");
+
     const parsedThemeEditor = yield* decode(KeybindingRule, {
       key: "mod+alt+shift+t",
       command: "themeEditor.toggle",

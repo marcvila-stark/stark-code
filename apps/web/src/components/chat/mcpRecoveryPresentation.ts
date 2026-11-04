@@ -31,7 +31,7 @@ export function mcpRecoveryMessage(server: McpServerStatusEntry): string | null 
     // Report the observed VPN state without claiming this server depends on it.
     return `FortiClient is disconnected. ${
       server.recovery.state === "network-unavailable"
-        ? "This server is unreachable; automatic retries continue."
+        ? "This server is unreachable. Check whether it requires your VPN."
         : message
     }`;
   }

@@ -167,7 +167,7 @@ describe("planProjectCommand", () => {
   });
 
   it("limits monograms to two graphemes", () => {
-    for (const text of ["Stark", "é", "किखि", "क्ष्म", "각"]) {
+    for (const text of ["SF", "é", "किखि", "क्ष्म", "각"]) {
       const monogram = { kind: "monogram", text, color: "violet" } as const;
       assert.deepEqual(payloadOf(update({ projectIcon: monogram })).projectIcon, monogram);
     }

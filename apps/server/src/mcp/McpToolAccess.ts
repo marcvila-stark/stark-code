@@ -1,5 +1,6 @@
 import {
   OrchestratorMcpFailure,
+  type ProviderInstanceId,
   type ProviderInteractionMode,
   type RuntimeMode,
   type ThreadId,
@@ -15,14 +16,20 @@ import {
   DispatchModeLimit,
   type DispatchModeRefusal,
 } from "../orchestration-v2/DispatchModeLimit.ts";
+import { DispatchSettingsWrite } from "../orchestration-v2/DispatchSettingsWrite.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
-import { resolveInteractionMode, resolveRuntimeMode } from "./OrchestratorMcpService.ts";
+import {
+  resolveChildPolicy,
+  resolveInteractionMode,
+  resolveRuntimeMode,
+} from "./OrchestratorMcpService.ts";
 import {
   assertFullAccess,
   assertLiveCaller,
   assertTargetWithinLimits,
   type Caller,
   loadCaller,
+  loadLimits,
   readCaller,
   unavailable,
 } from "./threadAccess.ts";
@@ -92,7 +99,12 @@ export class Declaration<out Handler> {
     this.#handle = handle;
   }
   static {
-    declare = (handle) => new Declaration(builtHere, handle);
+    // An agent never holds the settings-write scope: whatever an MCP tool
+    // dispatches may not widen a chat's permissions or save an answer as a rule.
+    declare = (handle) =>
+      new Declaration(builtHere, (params) =>
+        handle(params).pipe(Effect.provideService(DispatchSettingsWrite, false)),
+      );
     checkedHandler = Struct.lambda<CheckedHandler>((declaration) => declaration.#handle);
   }
 }
@@ -178,13 +190,14 @@ export const writesThreads = <P, A, E, R>(
   declare((params: P) =>
     Effect.gen(function* () {
       const caller = yield* writingCaller;
+      const limits = yield* loadLimits(caller);
       for (const threadId of threads(params)) {
         if (threadId === undefined || threadId === caller.scope.thread?.threadId) continue;
         const target = yield* caller.threads
           .getThreadShell(threadId)
           .pipe(Effect.mapError(unavailable));
         if (target !== null && target.deletedAt === null) {
-          yield* assertTargetWithinLimits(caller.limits, target);
+          yield* assertTargetWithinLimits(limits, target);
         }
       }
       // The target's user can raise its modes after the check above; the
@@ -192,7 +205,11 @@ export const writesThreads = <P, A, E, R>(
       // refusal here, since handlers wrap dispatch errors their own way.
       const refused = yield* Ref.make<DispatchModeRefusal | undefined>(undefined);
       return yield* handle(params).pipe(
-        Effect.provideService(DispatchModeLimit, { ...caller.limits, refused }),
+        Effect.provideService(DispatchModeLimit, {
+          ...limits,
+          refused,
+          self: caller.scope.thread?.threadId,
+        }),
         Effect.catch((error) =>
           Effect.flatMap(Ref.get(refused), (refusal) =>
             Effect.fail<E | OrchestratorMcpFailure>(
@@ -220,20 +237,43 @@ export interface StartedModes {
   readonly interactionMode: ProviderInteractionMode;
 }
 
-/** Starts threads with the modes `modes` requests, which may not be broader than the caller's. */
+/**
+ * Starts threads with the modes `modes` requests, which may not be broader
+ * than the caller's. A thread caller starting one on another provider
+ * instance gets only that provider's narrowest mode, and only when it asks
+ * for it: no rank shows one provider's rules contain another's.
+ */
 export const startsThreads = <P, A, E, R>(
   modes: (params: P) => {
     readonly runtimeMode?: RuntimeMode | undefined;
     readonly interactionMode?: ProviderInteractionMode | undefined;
+    /** The provider the thread runs on, when the caller picks one. */
+    readonly modelSelection?: { readonly instanceId: ProviderInstanceId } | undefined;
   },
   handle: (params: P, modes: StartedModes) => Effect.Effect<A, E, R>,
 ) =>
   declare((params: P) =>
     Effect.gen(function* () {
-      const { limits } = yield* writingCaller;
+      const context = yield* writingCaller;
+      const { caller } = context;
+      const limits = yield* loadLimits(context);
       const requested = modes(params);
+      const targetInstanceId = requested.modelSelection?.instanceId;
+      const crossInstance =
+        caller !== undefined &&
+        targetInstanceId !== undefined &&
+        targetInstanceId !== caller.providerInstanceId;
       const started: StartedModes = {
-        runtimeMode: yield* resolveRuntimeMode(limits.runtimeMode, requested.runtimeMode),
+        runtimeMode: crossInstance
+          ? (yield* resolveChildPolicy({
+              parent: {
+                providerInstanceId: caller.providerInstanceId,
+                effective: limits.runtimeMode,
+              },
+              target: { providerInstanceId: targetInstanceId },
+              requested: requested.runtimeMode,
+            })).preset
+          : yield* resolveRuntimeMode(limits.runtimeMode, requested.runtimeMode),
         interactionMode: yield* resolveInteractionMode(
           limits.interactionMode,
           requested.interactionMode,
@@ -247,9 +287,10 @@ const fullAccessRequired =
   "Changing projects or environment settings needs a live full-access/default calling thread or a full-access client.";
 
 /**
- * Changes projects or environment settings, which needs a full-access/default
- * caller. `check` re-checks the caller wherever the handler waits before
- * writing, such as for a lock, since the caller's modes can change meanwhile.
+ * Changes projects or environment settings, which needs Stark's environment
+ * authority: a full-access/default caller whose provider really runs it.
+ * `check` re-checks the caller wherever the handler waits before writing,
+ * such as for a lock, since the caller's modes can change meanwhile.
  */
 export const writesEnvironment = <P, A, E, R>(
   handle: (

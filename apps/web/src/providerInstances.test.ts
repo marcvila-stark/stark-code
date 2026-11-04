@@ -415,6 +415,43 @@ describe("resolveSelectableProviderInstance", () => {
     expect(resolveSelectableProviderInstance(providers, undefined)).toBe(unprobed);
   });
 
+  it("starts on Claude when it is ready, even when the server lists Codex first", () => {
+    const providers = [
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent" }),
+    ];
+
+    expect(resolveSelectableProviderInstance(providers, undefined)).toBe("claudeAgent");
+  });
+
+  it.each([
+    ["signed out", { status: "error" as const }],
+    ["still being checked", { status: "warning" as const }],
+    ["turned off", { enabled: false }],
+    ["unavailable", { availability: "unavailable" as const }],
+  ])("skips Claude for a ready provider when Claude is %s", (_label, claudeState) => {
+    const providers = [
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent",
+        ...claudeState,
+      }),
+    ];
+
+    expect(resolveSelectableProviderInstance(providers, undefined)).toBe("codex");
+  });
+
+  it("keeps an explicit Codex choice while Claude is ready", () => {
+    const requested = ProviderInstanceId.make("codex");
+    const providers = [
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: requested }),
+      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent" }),
+    ];
+
+    expect(resolveSelectableProviderInstance(providers, requested)).toBe(requested);
+  });
+
   it("keeps a requested instance even when its probe errored", () => {
     const requested = ProviderInstanceId.make("codex");
     const providers = [
@@ -536,6 +573,26 @@ describe("resolveDefaultProviderModelSelection", () => {
     expect(resolveDefaultProviderModelSelection(providers, null)).toEqual({
       instanceId,
       model: modelSlug,
+    });
+  });
+
+  it("uses Claude's default model when no default is configured and Claude is ready", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("codex"),
+        instanceId: "codex",
+        models: [model("gpt-5.6", false, true)],
+      }),
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent",
+        models: [model("claude-opus-4-8", false, true)],
+      }),
+    ];
+
+    expect(resolveDefaultProviderModelSelection(providers, null)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-8",
     });
   });
 

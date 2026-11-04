@@ -251,7 +251,68 @@ it.layer(NodeServices.layer)("PreviewBrowser", (it) => {
         "PreviewBrowserUnsupportedError",
       );
       expect(yield* browser.installed).toEqual(Option.none());
+      expect(yield* browser.status).toEqual({ state: "unsupported", totalBytes: null });
+      expect(yield* browser.install).toEqual({ state: "unsupported", totalBytes: null });
       expect(requests).toEqual([]);
+    }),
+  );
+
+  it.effect("reports a missing browser without downloading, then installs it on request", () =>
+    Effect.gen(function* () {
+      const { browser, requests } = yield* makeHarness();
+      const totalBytes = browserArchive.byteLength;
+
+      expect(yield* browser.status).toEqual({ state: "not-installed", totalBytes });
+      expect(requests).toEqual([]);
+
+      const subscribed = yield* Deferred.make<void>();
+      const watched = yield* browser.changes.pipe(
+        Stream.tap(() => Deferred.succeed(subscribed, undefined)),
+        Stream.takeUntil((status) => status.state === "ready"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Deferred.await(subscribed);
+      expect(yield* browser.install).toMatchObject({ state: "installing", totalBytes });
+      const seen = Array.from(yield* Fiber.join(watched));
+
+      expect(seen[0]).toEqual({ state: "not-installed", totalBytes });
+      expect(seen).toContainEqual(expect.objectContaining({ state: "installing", totalBytes }));
+      expect(seen.at(-1)).toEqual({ state: "ready", totalBytes });
+      expect(yield* browser.status).toEqual({ state: "ready", totalBytes });
+      // Asking again once it is installed downloads nothing.
+      expect(yield* browser.install).toEqual({ state: "ready", totalBytes });
+      expect(requests).toHaveLength(1);
+    }),
+  );
+
+  it.effect("keeps a failed install visible until the user retries it", () =>
+    Effect.gen(function* () {
+      const { browser, requests } = yield* makeHarness({ sha256: "0".repeat(64) });
+
+      const subscribed = yield* Deferred.make<void>();
+      const failed = yield* browser.changes.pipe(
+        Stream.tap(() => Deferred.succeed(subscribed, undefined)),
+        Stream.filter((status) => status.state === "failed"),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* Deferred.await(subscribed);
+      yield* browser.install;
+      expect(Option.getOrThrow(yield* Fiber.join(failed))).toEqual({
+        state: "failed",
+        totalBytes: browserArchive.byteLength,
+        failure: "The download failed its size or SHA-256 check. Nothing was installed.",
+      });
+      expect((yield* browser.status).state).toBe("failed");
+
+      expect((yield* browser.install).state).toBe("installing");
+      // Subscribed after the retry started, so the first failure seen is the retry's.
+      yield* browser.changes.pipe(
+        Stream.filter((status) => status.state === "failed"),
+        Stream.runHead,
+      );
+      expect(requests).toHaveLength(2);
     }),
   );
 });

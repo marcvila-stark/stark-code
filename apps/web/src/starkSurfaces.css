@@ -141,14 +141,6 @@
 [data-stark-sidebar-layout] {
   --stark-native-titlebar-inset: 0px;
 }
-[data-stark-sidebar-layout][data-native-window-controls="macos"] {
-  --workspace-topbar-height: 76px;
-  --stark-native-titlebar-inset: 24px;
-}
-[data-stark-sidebar-layout][data-native-window-controls="macos"][data-sidebar-state="collapsed"] {
-  --workspace-topbar-height: 52px;
-  --stark-native-titlebar-inset: 0px;
-}
 [data-chat-header],
 [data-conversation-titlebar-controls],
 [data-right-panel-tabbar][data-conversation-titlebar="true"] {

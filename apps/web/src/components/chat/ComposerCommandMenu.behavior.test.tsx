@@ -47,6 +47,7 @@ it("shows Plugin and MCP source badges and a fallback footer, then only inserts 
       path: "/plugins/deploy/skills/ship/SKILL.md",
       enabled: true,
       pluginName: "deploy",
+      permissionWarning: PROVIDER_PERMISSION_WARNING,
     },
     label: "/deploy:ship",
     description: "Ship the app",

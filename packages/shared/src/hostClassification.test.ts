@@ -7,7 +7,6 @@ describe("isPublicFaviconHost", () => {
     for (const host of [
       "github.com",
       "www.google.com",
-      "unconfigured.invalid",
       "sub.domain.example.co.uk",
       "8.8.8.8",
       "1.1.1.1",
@@ -50,6 +49,7 @@ describe("isPublicFaviconHost", () => {
       "printer.local",
       "api.internal",
       "router.home.arpa",
+      "unconfigured.invalid",
       "home.arpa",
       "box.tailnet.ts.net",
       "AIR.TAILE8BEA7.TS.NET",

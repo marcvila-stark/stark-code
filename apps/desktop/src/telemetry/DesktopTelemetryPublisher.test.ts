@@ -488,6 +488,84 @@ describe("DesktopTelemetryPublisher", () => {
       }).pipe(Effect.provide(layer));
     }),
   );
+  it.effect("routes gate statuses by backend and sends maintenance requests without replay", () =>
+    Effect.gen(function* () {
+      const layerPower = Layer.succeed(
+        ElectronPowerMonitor.ElectronPowerMonitor,
+        ElectronPowerMonitor.ElectronPowerMonitor.of({
+          isOnBatteryPower: Effect.succeed(false),
+          getSystemIdleTime: Effect.succeed(0),
+          getSystemIdleState: () => Effect.succeed("active"),
+          getCurrentThermalState: Effect.succeed("nominal"),
+          onSimpleEvent: () => Effect.void,
+          onThermalStateChange: () => Effect.void,
+          onSpeedLimitChange: () => Effect.void,
+        }),
+      );
+      const layer = DesktopTelemetryPublisher.layer.pipe(
+        Layer.provide(Layer.mergeAll(layerElectronApp([]), layerPower, layerHistory)),
+      );
+
+      yield* Effect.gen(function* () {
+        const publisher = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
+
+        yield* publisher.handleControlForSource("wsl:default", {
+          version: 1,
+          type: "maintenanceStatus",
+          replyTo: "update-1",
+          status: {
+            requestId: "update-1",
+            state: "closed",
+            ready: true,
+            blockers: [],
+            leaseExpiresAtUnixMs: 30_000,
+            recoveryHold: null,
+          },
+        });
+        const status = Option.getOrThrow(yield* Stream.runHead(publisher.maintenanceStatuses));
+        assert.equal(status.sourceId, "wsl:default");
+        assert.equal(status.message.replyTo, "update-1");
+        assert.isTrue(status.message.status.ready);
+
+        // Sent before any backend attached: a later backend must not receive it.
+        yield* publisher.sendMaintenanceRequest({
+          version: 1,
+          type: "maintenanceRequest",
+          requestId: "stale",
+          action: "prepare",
+          mode: "probe",
+        });
+        const decoder = new TextDecoder();
+        const decodeMessage = Schema.decodeUnknownEffect(
+          Schema.fromJsonString(DesktopHostTelemetryMessage),
+        );
+        const received = yield* publisher.encoded.pipe(
+          Stream.mapEffect((bytes) => decodeMessage(decoder.decode(bytes).trim())),
+          Stream.filter((message) => message.type === "maintenanceRequest"),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        // The subscriber attaches asynchronously; keep sending until it has one.
+        const request = yield* Effect.raceFirst(
+          Fiber.join(received),
+          publisher
+            .sendMaintenanceRequest({
+              version: 1,
+              type: "maintenanceRequest",
+              requestId: "update-2",
+              action: "renew",
+            })
+            .pipe(Effect.andThen(Effect.yieldNow), Effect.forever),
+        );
+        const message = Option.getOrThrow(request);
+        if (message.type !== "maintenanceRequest") {
+          return assert.fail("Expected a maintenance request.");
+        }
+        assert.equal(message.requestId, "update-2");
+        assert.equal(message.action, "renew");
+      }).pipe(Effect.provide(layer));
+    }),
+  );
 });
 
 describe("DesktopRendererHistory", () => {

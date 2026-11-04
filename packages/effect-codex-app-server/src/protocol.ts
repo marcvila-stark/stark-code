@@ -46,6 +46,16 @@ export interface CodexAppServerPatchedProtocolOptions {
   readonly onRequest?: (
     request: CodexAppServerIncomingRequest,
   ) => Effect.Effect<unknown, CodexError.CodexAppServerError>;
+  /**
+   * Called once for every request `onRequest` handled: with success when its
+   * result was encoded and accepted by the live transport, otherwise with the
+   * failure (the transport had ended, the result did not encode, or the
+   * handler failed or was interrupted and sent no result).
+   */
+  readonly onResponseOutcome?: (
+    requestId: string | number,
+    outcome: Exit.Exit<void, CodexError.CodexAppServerError>,
+  ) => Effect.Effect<void>;
   readonly onTermination?: (error: CodexError.CodexAppServerError) => Effect.Effect<void, never>;
 }
 
@@ -314,6 +324,14 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                 );
               }
 
+              const reportOutcome = (outcome: Exit.Exit<void, CodexError.CodexAppServerError>) =>
+                options.onResponseOutcome?.(request.id, outcome) ?? Effect.void;
+              const noResult = Exit.fail(
+                new CodexError.CodexAppServerTransportError({
+                  operation: "write-response",
+                  cause: `No result was sent for ${request.method} request ${String(request.id)}.`,
+                }),
+              );
               return handler(request).pipe(
                 Effect.matchEffect({
                   onFailure: (error) =>
@@ -323,9 +341,11 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                         error,
                         request.method,
                       ),
-                    ),
-                  onSuccess: (result) => respond(request.id, result),
+                    ).pipe(Effect.ensuring(reportOutcome(noResult))),
+                  onSuccess: (result) =>
+                    respond(request.id, result).pipe(Effect.onExit(reportOutcome)),
                 }),
+                Effect.onInterrupt(() => reportOutcome(noResult)),
                 Effect.ensuring(
                   Ref.update(activeRequestHandlers, (count) => Math.max(0, count - 1)),
                 ),

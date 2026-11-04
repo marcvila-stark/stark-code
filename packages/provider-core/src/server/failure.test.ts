@@ -17,6 +17,7 @@ import {
   MAX_PROVIDER_FAILURE_CODE_LENGTH,
   MAX_PROVIDER_FAILURE_MESSAGE_LENGTH,
   ContextHandoffBudgetError,
+  ProviderWorkspaceBusyError,
 } from "./failure.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
@@ -99,6 +100,30 @@ it("preserves actionable handoff errors wrapped by turn startup", () => {
     makeProviderFailure({ cause: Cause.fail(cause) }).message,
     new ContextHandoffBudgetError().message,
   );
+});
+
+it("says an agent in this chat's own terminal holds the folder, without linking back to it", () => {
+  const threadId = ThreadId.make("thread:terminal-agent");
+  const cause = new ProviderAdapter.ProviderAdapterTurnStartError({
+    driver: ProviderDriverKind.make("claudeAgent"),
+    threadId,
+    providerThreadId: ProviderThreadId.make("provider-thread:terminal-agent"),
+    runId: RunId.make("run:terminal-agent"),
+    cause: Cause.fail(
+      new ProviderWorkspaceBusyError({
+        threadId,
+        blockingThreadId: threadId,
+        blockingThreadTitle: "Same chat",
+        reason: "terminal_agent",
+      }),
+    ),
+  });
+  const failure = makeProviderFailure({ cause, class: "provider_error" });
+  assert.equal(
+    failure.message,
+    "An agent is running in this chat's terminal. Exit it, then try again.",
+  );
+  assert.deepEqual(failure.blockedBy, { threadId, reason: "terminal_agent" });
 });
 
 it("does not expose defect text nested inside a known error category", () => {

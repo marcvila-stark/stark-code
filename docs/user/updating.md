@@ -5,28 +5,71 @@ When a server is behind your web or desktop app, an update notice appears in the
 conversation and **Settings → Connections**. Update the machine named in that
 notice.
 
+## Update the Mac app
+
+Stark Code checks for a new version shortly after it starts and then every
+hour, and downloads it in the background. To check now, use **Settings → About**,
+the update button at the bottom of the sidebar, **Check for updates** in the
+command palette, or **Stark Code → Check for Updates…** in the menu bar. Each
+one reports what it found, including "You're up to date".
+
+When a download is ready, Stark Code checks that it is signed by Stark Future and
+then offers **Restart to update**. **Later** keeps the update ready and stops
+reminding you for a day; **Remind me** in **Settings → About** turns reminders
+back on. The update never installs while you work, and only when you choose to
+restart.
+
+Restarting never interrupts work. Before it restarts, Stark Code checks that no
+task is running or waiting for your approval and that every window has saved
+its drafts, including files and images you attached. If something would be lost,
+it doesn't restart and tells you what to finish first, such as a running task
+or a file that is still uploading. Finish it, then choose **Restart to update**
+again.
+
+If updates are off, **Settings → About** says why, for example a development
+build, a build without a Stark update source, or updates not yet switched on for
+this release. Such a build never reports that it is up to date; install new
+versions from the installer your team provides.
+
+Before it installs, Stark Code backs up your chats, settings and saved drafts on
+this Mac. Backups stay private to this Mac and are never uploaded. If a new
+version can't open or update your data, it says what happened and quits without
+changing it; reinstall the version you used before. To go back to a backup, quit
+Stark Code and run `stark-code backup list`, then `stark-code backup restore <id>`.
+The data it replaces is kept. Afterwards scheduled tasks and other background
+work stay paused until you choose **Resume** when Stark Code starts, or run
+`stark-code backup resume` while it is closed.
+
+When a check or download fails, Stark Code says what went wrong: you're offline,
+the update server can't be reached or returned an error or an invalid release,
+the download was damaged or not signed by Stark Future (it is deleted), or the
+disk is full. A failed download is retried on its own a few times; the update
+button shows when. A failed background check never hides an update that is
+already available.
+
+If the installer doesn't respond while restarting, Stark Code keeps running the
+current version and says so. If the installer accepts the update afterwards, it
+installs the next time you quit Stark Code. If Stark Code comes back on its old
+version, it tells you the update did not apply; use **Restart to update** to try
+again.
+
 ## Update everything at once
 
 The update button at the bottom of the sidebar updates every connected machine
 in one step. It updates outdated providers, then servers that are behind, then
-the desktop app you are using, which restarts last. Servers move to the
-version your desktop app is installing, or to your web app's version. A
-background service stays on its current release channel. A remote desktop app
-installs the latest release from its own channel. Hover the button to see what
-it will update.
+the desktop app you are using, which restarts last, after the same checks as
+**Restart to update**. Servers move to the version your desktop app is
+installing, or to your web app's version. A background service stays on its
+current release channel. Hover the button to see what it will update.
 
-Server updates appear only after that version is published to npm. Remote
-desktop apps do not wait for npm. The confirmation lists each machine it skips
-and why, such as a machine that is offline or needs a manual update. Use the
-notice or **Settings → Connections** for those.
+Server updates appear only after that version is published to npm. Desktop
+apps on other machines update only from their own window. The confirmation
+lists each machine it skips and why, such as a machine that is offline or needs
+a manual update. Use the notice or **Settings → Connections** for those.
 
-If a desktop app restarts on its old version, Stark Code tells you the update did
-not apply. It does not install that version again on its own, even when another
-device asks. Use the update button on that machine to retry.
-
-The confirmation counts the running threads that the restarts will interrupt,
-and how many can resume afterwards. See **Continue threads after restarts**
-below.
+The confirmation counts the running threads that the server restarts will
+interrupt, and how many can resume afterwards. See **Continue threads after
+restarts** below.
 
 ## Before you update
 
@@ -44,9 +87,13 @@ interrupted, and threads without saved provider resume state need a new message.
 A thread that finished its turn to wait on a monitor, subagent, or background task
 is woken and told that this work stopped. A background shell, such as a dev server,
 does not wake it; the thread learns about it with your next message.
-A thread is not resumed while it waits for your approval, answer, or secret, or
-while it is archived, snoozed, or settled. After three automatic resumes in a row,
-the thread waits for your next message.
+A thread is not resumed while it waits for your approval, answer, or secret, while
+an answer you gave may not have reached the agent, or while it is archived, snoozed,
+or settled. After three automatic resumes in a row, the thread waits for your next
+message. An approval or question that was open when Stark Code stopped is marked
+lost; see
+[Decisions and recorded results](./thread-sidebar.md#decisions-and-recorded-results)
+to ask again or dismiss it.
 
 Updates from the previous orchestration system preserve conversation transcripts but cannot carry
 every kind of runtime history forward. Read [Threads from older Stark Code versions](./thread-migration.md)
@@ -67,12 +114,12 @@ Update the side the notice names, then reconnect.
 
 The offered action depends on how the server runs:
 
-| Action                     | What to do                                                                                                                                                                                      |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Update server**          | Keep the client open while it installs and reconnects. Supported background services update remotely. For a desktop-hosted server, this also closes and relaunches the desktop app on the host. |
-| **Update the desktop app** | Update the desktop app on the machine running the server, then reopen it if needed.                                                                                                             |
-| **Copy update command**    | Run the command on the named host to update the detected global npm install, then restart the server with your usual options.                                                                   |
-| **Copy relaunch command**  | Stop the command-line server on its host and relaunch with the copied command, keeping your usual subcommand and options. This does not update an installed `stark-code` command.                       |
+| Action                     | What to do                                                                                                                                                                        |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Update server**          | Keep the client open while it installs and reconnects. Supported background services update remotely.                                                                             |
+| **Update the desktop app** | Update the desktop app on the machine running the server, then reopen it if needed.                                                                                               |
+| **Copy update command**    | Run the command on the named host to update the detected global npm install, then restart the server with your usual options.                                                     |
+| **Copy relaunch command**  | Stop the command-line server on its host and relaunch with the copied command, keeping your usual subcommand and options. This does not update an installed `stark-code` command. |
 
 On the host, run:
 

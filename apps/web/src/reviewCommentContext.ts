@@ -1,5 +1,9 @@
 import type { FileDiffMetadata, SelectedLineRange, SelectionSide } from "@pierre/diffs";
-import { PullRequestContextMetadata, type PullRequestReviewPosition } from "@starkfuture/contracts";
+import {
+  PullRequestContextMetadata,
+  type PullRequestReviewPosition,
+  RunId,
+} from "@starkfuture/contracts";
 import * as Schema from "effect/Schema";
 
 const ReviewCommentSelectionSchema = Schema.Struct({
@@ -23,6 +27,7 @@ export const ReviewCommentContextSchema = Schema.Struct({
   fenceLanguage: Schema.optional(Schema.String),
   selection: Schema.optional(ReviewCommentSelectionSchema),
   pullRequest: Schema.optional(PullRequestContextMetadata),
+  runId: Schema.optional(RunId),
 });
 
 export interface ReviewCommentContext {
@@ -38,6 +43,8 @@ export interface ReviewCommentContext {
   readonly fenceLanguage?: string | undefined;
   readonly selection?: ReviewCommentSelection | undefined;
   readonly pullRequest?: PullRequestContextMetadata | undefined;
+  /** The turn a comment made in a turn's diff reviews. */
+  readonly runId?: RunId | undefined;
 }
 
 interface DiffReviewLine {
@@ -407,6 +414,7 @@ export function buildDiffReviewComment(input: {
   fileDiff: FileDiffMetadata;
   range: SelectedLineRange;
   text: string;
+  runId?: RunId | undefined;
 }): ReviewCommentContext | null {
   const includeExpandedContext = !input.fileDiff.isPartial;
   const startIndex = findDiffReviewLineIndex(
@@ -452,7 +460,69 @@ export function buildDiffReviewComment(input: {
       end: input.range.end,
       endSide: input.range.endSide ?? input.range.side ?? "additions",
     },
+    ...(input.runId === undefined ? {} : { runId: input.runId }),
   };
+}
+
+/** Whether a file's diff has added or removed lines a comment can anchor to. */
+export function diffFileHasCommentableLines(fileDiff: FileDiffMetadata): boolean {
+  return fileDiff.hunks.some((hunk) =>
+    hunk.hunkContent.some(
+      (segment) => segment.type !== "context" && segment.additions + segment.deletions > 0,
+    ),
+  );
+}
+
+/**
+ * The range a whole-file comment anchors to: the file's first to last changed line. Null for
+ * a file without changed lines (binary, pure rename, empty), which cannot take a diff comment.
+ */
+export function diffFileCommentRange(fileDiff: FileDiffMetadata): SelectedLineRange | null {
+  const changed = buildDiffReviewLines(fileDiff, !fileDiff.isPartial).filter(
+    (line) => line.change !== "context",
+  );
+  const first = changed[0] ? getDiffReviewSelectionPoint(changed[0]) : null;
+  const last = changed.at(-1) ? getDiffReviewSelectionPoint(changed.at(-1)!) : null;
+  if (!first || !last) return null;
+  return { start: first.lineNumber, side: first.side, end: last.lineNumber, endSide: last.side };
+}
+
+/**
+ * A comment on a whole file in a diff. It anchors at the file's last changed line and carries
+ * the file's hunks, not the unchanged lines between them.
+ */
+export function buildDiffFileReviewComment(input: {
+  id: string;
+  sectionId: string;
+  sectionTitle: string;
+  filePath: string;
+  fileDiff: FileDiffMetadata;
+  text: string;
+  runId?: RunId | undefined;
+}): ReviewCommentContext | null {
+  const range = diffFileCommentRange(input.fileDiff);
+  if (!range) return null;
+  const comment = buildDiffReviewComment({ ...input, range });
+  if (!comment) return null;
+  const rows = buildDiffReviewLines(input.fileDiff, false);
+  const hunks: string[] = [];
+  let rowIndex = 0;
+  for (const hunk of input.fileDiff.hunks) {
+    const rowCount = hunk.hunkContent.reduce(
+      (count, segment) =>
+        count +
+        (segment.type === "context" ? segment.lines : segment.additions + segment.deletions),
+      0,
+    );
+    hunks.push(
+      `@@ -${hunk.deletionStart},${hunk.deletionCount} +${hunk.additionStart},${hunk.additionCount} @@`,
+      ...rows
+        .slice(rowIndex, rowIndex + rowCount)
+        .map((line) => `${getDiffChangeMarker(line.change)}${line.content}`),
+    );
+    rowIndex += rowCount;
+  }
+  return { ...comment, rangeLabel: "whole file", diff: hunks.join("\n") };
 }
 
 export function buildReviewCommentRenderablePatch(comment: ReviewCommentContext): string {

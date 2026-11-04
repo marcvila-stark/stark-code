@@ -15,8 +15,10 @@ const approval: PendingApproval = {
   detail: "git status",
   responseCapability: "live",
 };
-const render = (next: PendingApproval) =>
-  act(() => root.render(<ComposerPendingApprovalPanel approval={next} pendingCount={1} />));
+const render = (next: PendingApproval, cwd?: string) =>
+  act(() =>
+    root.render(<ComposerPendingApprovalPanel approval={next} cwd={cwd} pendingCount={1} />),
+  );
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   container = document.createElement("div");
@@ -41,7 +43,7 @@ it("never interprets an agent's benign prose as the command awaiting approval", 
   expect(container.querySelector('[aria-label="Command explanation"]')?.textContent).toContain(
     "Uncommitted changes can be lost",
   );
-  expect(container.querySelector('[aria-label="Command"]')?.textContent).toBe("git status");
+  expect(container.querySelector('[aria-label="Command"]')).toBeNull();
 });
 
 it("updates warnings with the pending command and removes them for non-live or non-command requests", async () => {
@@ -49,7 +51,7 @@ it("updates warnings with the pending command and removes them for non-live or n
   expect(container.textContent).toContain("Caution:");
   await render({ ...approval, command: "git status" });
   expect(container.textContent).not.toContain("Caution:");
-  expect(container.textContent).toContain("Shows which files");
+  expect(container.textContent).toContain("Expected to read only — shows which files");
   await render({ ...approval, responseCapability: "not_resumable", command: "git status" });
   expect(container.querySelector('[aria-label="Command explanation"]')).toBeNull();
   expect(container.textContent).toContain("Provider process is gone");
@@ -67,4 +69,23 @@ it("keeps the destructive part visible while allowing the user to inspect all st
   expect(container.textContent).toContain("Affected files have not been checked");
   await render({ ...approval, requestId: RuntimeRequestId.make("next"), command: "git status" });
   expect(container.querySelector('button[aria-expanded="false"]')).not.toBeNull();
+});
+
+it("warns when a file-change approval names no files or reaches outside the chat's folder", async () => {
+  const fileApproval: PendingApproval = {
+    ...approval,
+    requestKind: "file-change",
+    detail: "Update the files.",
+  };
+  await render(fileApproval);
+  expect(container.textContent).toContain("did not name the files or supply a diff");
+  await render(
+    {
+      ...fileApproval,
+      proposedChanges: [{ operation: "delete", path: "/Users/example/private/index.ts" }],
+    },
+    "/work/project",
+  );
+  expect(container.textContent).toContain("index.ts is outside this chat's folder.");
+  expect(container.textContent).not.toContain("did not name the files");
 });

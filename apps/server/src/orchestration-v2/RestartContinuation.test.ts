@@ -340,6 +340,7 @@ it.effect.each([
               runRecoveryOnce: Effect.succeed(false),
             }),
             Layer.mock(EffectOutbox.EffectOutboxV2)({
+              listUnsettled: () => Effect.succeed([]),
               reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
             }),
           ),
@@ -401,6 +402,7 @@ it.effect("lets a cut blocking delegate_task wake its parent like an async task"
           IdAllocator.layer,
           Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -647,6 +649,7 @@ it.effect.each([
                 runRecoveryOnce: Effect.succeed(false),
               }),
               Layer.mock(EffectOutbox.EffectOutboxV2)({
+                listUnsettled: () => Effect.succeed([]),
                 listByCommandId: () => Effect.succeed([]),
                 reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
               }),
@@ -734,6 +737,7 @@ it.effect("does not cancel or resume a run that completes while shutdown intent 
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -1118,4 +1122,172 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
         [],
       );
     }),
+);
+
+it.effect.each([
+  { name: "a decision lost to the restart", decision: undefined, deliveryUncertain: undefined },
+  {
+    name: "an answer whose delivery the restart interrupted",
+    decision: "accept",
+    deliveryUncertain: true,
+  },
+] as const)("does not continue a turn cut with $name", ({ decision, deliveryUncertain }) =>
+  Effect.gen(function* () {
+    const base = makeProjection();
+    const runtimeRequests = [
+      {
+        id: RuntimeRequestId.make("request:restart-lost"),
+        nodeId: NodeId.make("node:restart-lost"),
+        providerTurnId: base.providerTurns[0]!.id,
+        kind: "command",
+        status: "expired",
+        responseCapability: { type: "not_resumable", reason: "The server restarted." },
+        ...(decision === undefined ? {} : { decision }),
+        lost: {
+          cause: "server_restart",
+          lostAt: now,
+          ...(deliveryUncertain === undefined ? {} : { deliveryUncertain }),
+        },
+      },
+    ];
+    assert.isUndefined(
+      restartContinuationRun(
+        { ...base, runtimeRequests } as unknown as OrchestrationV2ThreadProjection,
+        now,
+      ),
+    );
+    assert.lengthOf(
+      yield* continuationTexts({
+        ...cutMidTurn(),
+        runtimeRequests,
+      } as unknown as OrchestrationV2ThreadProjection),
+      0,
+    );
+  }),
+);
+
+// A settled root woken for awaited background work: the restart cancels an
+// answer to that work's question before delivery, so the step stays with the user.
+it.effect("does not wake a settled run whose background question's answer went undelivered", () =>
+  Effect.gen(function* () {
+    const base = makeProjection();
+    const startedAt = DateTime.subtract(now, { minutes: 5 });
+    const answered = {
+      id: RuntimeRequestId.make("request:background-question"),
+      nodeId: NodeId.make("node:background-question"),
+      // The background work asked; the root's own provider turn had ended.
+      providerTurnId: null,
+      kind: "user_input",
+      status: "resolved",
+      responseCapability: { type: "live", providerSessionId: sessionId },
+      answers: { branch: "main" },
+      createdAt: startedAt,
+      resolvedAt: now,
+    };
+    const settled = {
+      ...base,
+      runs: [{ ...base.runs[0]!, status: "completed", requestedAt: startedAt, startedAt }],
+      providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
+      turnItems: [backgroundSubagent.turnItem],
+      subagents: [
+        {
+          id: "subagent:background",
+          runId,
+          origin: "provider_native",
+          driver,
+          providerInstanceId: instanceId,
+          status: "running",
+        },
+      ],
+      runtimeRequests: [answered],
+    } as unknown as OrchestrationV2ThreadProjection;
+    // Without the undelivered answer the awaited work wakes the run.
+    assert.equal(restartContinuationRun(settled, now)?.id, runId);
+
+    const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
+    const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed([threadId]),
+            getRuntimeRecoveryProjection: () => Effect.succeed(settled),
+            getRuntimeResponseContext: () =>
+              Effect.succeed({
+                request: answered,
+                node: undefined,
+                item: undefined,
+                session: undefined,
+              } as unknown as ProjectionStore.ProjectionRuntimeResponseContext),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            commitCommand: (input) =>
+              Effect.sync(() => {
+                commits.push(input);
+                return { committed: true, cancelledEffectCount: 1 } as never;
+              }),
+          }),
+          IdAllocator.layer,
+          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+            runRecoveryOnce: Effect.succeed(false),
+          }),
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () =>
+              Effect.succeed([
+                {
+                  id: "effect:background-answer",
+                  threadId,
+                  status: "pending",
+                  request: {
+                    type: "runtime-request.respond",
+                    providerSessionId: sessionId,
+                    requestId: answered.id,
+                    answers: answered.answers,
+                  },
+                } as unknown as EffectOutbox.OrchestrationEffectV2,
+              ]),
+            listByCommandId: () => Effect.succeed([]),
+            reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+          }),
+        ),
+      ),
+    );
+    yield* recovery.reconcile("startup");
+    assert.lengthOf(commits, 1);
+    assert.deepEqual(commits[0]!.effects, []);
+    const uncertain = commits[0]!.events.flatMap((event) =>
+      event.type === "runtime-request.updated" && event.payload.id === answered.id
+        ? [event.payload]
+        : [],
+    );
+    assert.lengthOf(uncertain, 1);
+    assert.deepEqual(uncertain[0]!.answers, answered.answers);
+    assert.isTrue(uncertain[0]!.lost?.deliveryUncertain);
+
+    // A wake a graceful shutdown recorded before the loss is refused on delivery
+    // until the user asks again or dismisses the answer.
+    const woken = {
+      ...settled,
+      runs: [
+        {
+          ...settled.runs[0]!,
+          restartCancelledBackgroundWork: [{ kind: "monitor", label: "Watch CI run 42" }],
+        },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const withLoss = (closed: Record<string, DateTime.Utc>) =>
+      ({
+        ...woken,
+        runtimeRequests: [
+          {
+            ...answered,
+            status: "cancelled",
+            responseCapability: { type: "not_resumable", reason: "The server shut down." },
+            lost: { cause: "server_shutdown", lostAt: now, deliveryUncertain: true, ...closed },
+          },
+        ],
+      }) as unknown as OrchestrationV2ThreadProjection;
+    assert.lengthOf(yield* continuationTexts(withLoss({})), 0);
+    assert.lengthOf(yield* continuationTexts(withLoss({ dismissedAt: now })), 1);
+  }),
 );

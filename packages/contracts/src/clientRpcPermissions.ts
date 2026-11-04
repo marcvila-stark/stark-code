@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { GitPreparePullRequestThreadInput } from "./git.ts";
 import {
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthFilesystemReadScope,
   AuthTerminalOperateScope,
   AuthProvidersManageScope,
@@ -10,11 +11,36 @@ import {
   type AuthEnvironmentScope,
 } from "./auth.ts";
 import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
+import { approvalOptionIdClass } from "./providerPolicy.ts";
 import { WS_METHODS } from "./rpc.ts";
+
+/**
+ * Whether a dispatched command changes what a chat may do beyond the
+ * narrowest preset, or answers an approval with a decision the provider
+ * persists. Both need the settings-write scope (O12). The orchestrator checks
+ * the same rules again against the thread it actually changes.
+ */
+export function dispatchNeedsSettingsWrite(command: unknown): boolean {
+  if (typeof command !== "object" || command === null || !("type" in command)) return false;
+  const fields = command as Record<string, unknown>;
+  switch (fields.type) {
+    case "runtime-request.respond":
+      return (
+        fields.decision === "acceptAlways" ||
+        (typeof fields.optionId === "string" &&
+          approvalOptionIdClass(fields.optionId) === "persistent")
+      );
+    case "thread.permission.set":
+      return fields.permissionSource !== "override" || fields.runtimeMode !== "approval-required";
+    case "thread.runtime-mode.set":
+      return fields.runtimeMode !== "approval-required";
+    default:
+      return false;
+  }
+}
 
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
-  [WS_METHODS.agentSessionsImport]: AuthOrchestrationOperateScope,
   [WS_METHODS.agentSessionsSyncConfigure]: AuthSettingsWriteScope,
   [WS_METHODS.claudeAccountsSnapshot]: AuthProvidersManageScope,
   [WS_METHODS.claudeAccountsCommand]: AuthProvidersManageScope,
@@ -31,6 +57,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.checkpointRestoreFiles]: AuthOrchestrationOperateScope,
   [WS_METHODS.checkpointUndoRestore]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverRunStorageCleanup]: AuthSettingsWriteScope,
+  // Downloads a browser build onto the host, like installing a provider CLI.
+  [WS_METHODS.serverInstallPreviewBrowser]: AuthProvidersManageScope,
   // Endpoint checks exist to configure exports, so they need the same grant as saving them.
   [WS_METHODS.serverCheckOtlpEndpoint]: AuthSettingsWriteScope,
   [WS_METHODS.pullRequestsRunAction]: AuthSourceControlWriteScope,
@@ -66,6 +94,11 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.scheduledTasksRunNow]: AuthOrchestrationOperateScope,
   [WS_METHODS.scheduledTasksRotateWebhookToken]: AuthOrchestrationOperateScope,
   [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: AuthOrchestrationOperateScope,
+  [ORCHESTRATION_V2_WS_METHODS.searchThreadHistory]: AuthOrchestrationReadScope,
+  // Import writes threads into the project from the CLI homes on that machine.
+  [WS_METHODS.agentSessionsImport]: AuthOrchestrationOperateScope,
+  // Runs carry no prompt or request data, so reading them needs only the scope that lists tasks.
+  [WS_METHODS.scheduledTasksListRuns]: AuthOrchestrationReadScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 
@@ -77,14 +110,20 @@ export function clientRpcRequiredScopes(
 ): readonly AuthEnvironmentScope[] {
   if (method === WS_METHODS.agentSessionsSyncConfigure)
     return [AuthSettingsWriteScope, AuthOrchestrationOperateScope];
+  if (method === ORCHESTRATION_V2_WS_METHODS.dispatchCommand && dispatchNeedsSettingsWrite(input))
+    return [AuthOrchestrationOperateScope, AuthSettingsWriteScope];
+  // A scheduled task runs unattended later, so saving one above the narrowest
+  // preset widens what runs on this environment just as setting a chat does.
+  // A task saved without a mode gets one from the project default, which only
+  // the service can resolve, so ScheduledTaskService checks the stored mode
+  // against the session's grant again.
   if (
-    method === ORCHESTRATION_V2_WS_METHODS.dispatchCommand &&
+    method === WS_METHODS.scheduledTasksUpsert &&
     typeof input === "object" &&
     input !== null &&
-    "type" in input &&
-    input.type === "runtime-request.respond" &&
-    "decision" in input &&
-    input.decision === "acceptAlways"
+    "runtimeMode" in input &&
+    input.runtimeMode !== undefined &&
+    input.runtimeMode !== "approval-required"
   )
     return [AuthOrchestrationOperateScope, AuthSettingsWriteScope];
   if (

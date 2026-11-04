@@ -192,34 +192,38 @@ it("shares status polling between banner and open panel and drops stale sign-in 
   expect(state.query.refresh).toHaveBeenCalledTimes(2);
 });
 
-it("shows FortiClient disconnection as advisory for the attempted server", async () => {
-  turnItems = [attempted("Public docs.find")];
-  state.query.data = {
-    live: true,
-    reconnectScope: "server",
-    servers: [
-      server("Public docs", "failed", {
-        state: "network-unavailable",
-        attempts: 2,
-        vpnState: "forticlient-disconnected",
-      }),
-    ],
-  };
-  await render();
-  expect(container.textContent).toContain("FortiClient is disconnected.");
-  expect(container.textContent).toContain(
-    "This server is unreachable; automatic retries continue.",
-  );
-  expect(container.textContent).not.toContain("Connect it, then check again");
-  state.query.data = {
-    live: true,
-    reconnectScope: "server",
-    servers: [server("Public docs", "failed", { state: "waiting", attempts: 2 })],
-  };
-  await render();
-  expect(container.textContent).not.toContain("FortiClient");
-  expect(container.textContent).toContain("Waiting for a safe moment to retry.");
-});
+it.each(["server", "all"] as const)(
+  "shows FortiClient advisory without promising a reconnect for %s scope",
+  async (reconnectScope) => {
+    turnItems = [attempted("Public docs.find")];
+    state.query.data = {
+      live: true,
+      reconnectScope,
+      servers: [
+        server("Public docs", "failed", {
+          state: "network-unavailable",
+          attempts: 2,
+          vpnState: "forticlient-disconnected",
+        }),
+      ],
+    };
+    await render();
+    expect(container.textContent).toContain("FortiClient is disconnected.");
+    expect(container.textContent).toContain(
+      "This server is unreachable. Check whether it requires your VPN.",
+    );
+    expect(container.textContent).not.toContain("Connect it, then check again");
+    expect(container.textContent).not.toContain("automatic retries continue");
+    state.query.data = {
+      live: true,
+      reconnectScope: "server",
+      servers: [server("Public docs", "failed", { state: "waiting", attempts: 2 })],
+    };
+    await render();
+    expect(container.textContent).not.toContain("FortiClient");
+    expect(container.textContent).toContain("Waiting for a safe moment to retry.");
+  },
+);
 
 it("does not show unrelated disconnected plugins before a tool is attempted", async () => {
   turnItems = [];

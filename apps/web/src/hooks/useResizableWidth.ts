@@ -69,7 +69,9 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
     if (typeof window === "undefined") return defaultWidth;
     try {
       const stored = getLocalStorageItem(storageKey, WidthSchema);
-      return clamp(stored ?? defaultWidth);
+      // Keep the user's preference; a narrow window only limits its display.
+      // Clamping here would permanently shrink this mounted panel even after widening.
+      return stored ?? defaultWidth;
     } catch (error) {
       console.error("Could not read persisted panel width.", error);
       return defaultWidth;

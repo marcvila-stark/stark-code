@@ -70,17 +70,32 @@ environment's time zone, which may differ from your phone's.
 
 You can edit, pause, resume, run immediately, or delete a task from the list.
 Webhook tasks only run when their URL is called, so they can't be run
-immediately.
+immediately. Each task shows how its latest run went and when it started.
 Leaving an edited form asks before discarding unsaved changes.
+
+## Scheduled task runs
+
+Every time a task fires, from its schedule, **Run now** or its webhook, it
+records a run. On desktop and web, choose **Runs** from a task's menu in
+**Settings → Scheduled tasks**, or from the task in a thread's **Automations**
+details, to see its recent runs: what started each one, its state, how long it
+took, and a link to the thread it ran in. A run lasts until the agent's turn
+ends, so a prompt waiting behind other work in its thread shows as queued.
+
+A run that was starting when the environment stopped shows as interrupted once
+it is back, and a fixed-time run that was due while it was off shows as skipped.
+Pressing **Run now** again before the first press answers doesn't start a
+second run. Deleting a task deletes its runs; the threads they started stay.
 
 ## Webhook automations
 
 In **Settings → Scheduled tasks**, choose **On webhook**
 as a task's schedule to run it whenever another service calls its URL, such as
-GitHub on a new pull request or a CI job that failed. A public URL needs a
-[Stark Connect](remote-access.md) managed tunnel; after you save the task, copy
-its URL from the editor. Without one, the editor shows only the URL's path.
-**Rotate** replaces the URL and the old one stops working.
+GitHub on a new pull request or a CI job that failed. The sender must reach this
+environment's address directly, for example on your network, over Tailscale or
+through a proxy you run. After you save the task, copy its URL from the editor;
+when the editor doesn't know the environment's address, it shows only the URL's
+path. **Rotate** replaces the URL and the old one stops working.
 
 The prompt decides what the agent sees. Placeholders pull values out of the
 request: `{{body.path}}` for a JSON or form field, `{{headers.name}}`,
@@ -98,14 +113,10 @@ one on.
 On desktop and web, pick **Deliveries** from a task's menu to see recent
 requests and the prompt each one produced.
 
-If the environment is offline, the sender gets an error and nothing runs;
-redeliver from the sender, such as GitHub's **Recent Deliveries**, once it is
-back. To have Stark Connect keep requests instead, turn on **Hold webhooks while
-offline** in **Settings → Connections**. Stark Connect then stores requests to a
-Stark Connect URL for up to 24 hours and delivers them when the environment
-returns. Leave it off if you don't want request bodies stored outside your
-machine. To skip requests that waited too long, set **Skip requests older
-than** on the task.
+If the environment is offline or unreachable, the sender gets an error and
+nothing runs. Requests are not held for later, so redeliver from the sender,
+such as GitHub's **Recent Deliveries**, once it is back. To skip requests that
+waited too long, set **Skip requests older than** on the task.
 
 ## Defaults and inheritance
 

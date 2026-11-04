@@ -127,6 +127,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   threadAutoSettlement: Schema.optionalKey(Schema.Boolean),
   storageCleanup: Schema.optionalKey(Schema.Boolean),
   storageCleanupRun: Schema.optionalKey(Schema.Boolean),
+  /** Server reports its preview browser status and installs it on request. */
+  previewBrowserInstall: Schema.optionalKey(Schema.Boolean),
   /** Server checks OTLP endpoints for the telemetry export settings. */
   otlpEndpointCheck: Schema.optionalKey(Schema.Boolean),
   projectWorktreeCleanup: Schema.optionalKey(Schema.Boolean),
@@ -227,6 +229,13 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
       "server"`) and streams them over `/api/preview-stream`. Clients
       without a local browser runtime open server tabs here. */
   serverBrowser: Schema.optionalKey(Schema.Boolean),
+  /** Server keeps `check` on human shell commands and validates the turn it checks. Older
+      servers drop the field and run a plain command, so clients hide check actions when
+      this is absent. */
+  userShellChecks: Schema.optionalKey(Schema.Boolean),
+  /** Server keeps a run history per scheduled task (`scheduledTasks.listRuns`, `latestRun`).
+      Absent on older servers, so clients hide run history instead of calling the RPC. */
+  scheduledTaskRuns: Schema.optionalKey(Schema.Boolean),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

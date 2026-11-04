@@ -1,4 +1,5 @@
 import {
+  CommandId,
   ContextHandoffId,
   MessageId,
   CheckpointId,
@@ -17,11 +18,13 @@ import {
   TurnItemId,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2ProjectedTurnItem,
-  type OrchestrationV2TurnItem,
+  OrchestrationV2TurnItem,
+  OrchestrationV2UserShellCommand,
 } from "@starkfuture/contracts";
 import { resolveUserMessagePresentation } from "@starkfuture/client-runtime/user-message";
 import { summarizeToolGroup } from "@starkfuture/client-runtime/work-log/presentation";
 import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -42,6 +45,27 @@ import {
 const threadId = ThreadId.make("thread-1");
 const sourceThreadId = ThreadId.make("thread-source");
 const runId = RunId.make("run-1");
+
+it("keeps a blocked hook's explanation readable in the mobile feed", () => {
+  const item: OrchestrationV2TurnItem = {
+    ...base("blocked-hook", "2026-10-31T00:00:00.000Z", 1),
+    type: "hook_run",
+    provider: ProviderDriverKind.make("claudeAgent"),
+    eventName: "PreToolUse",
+    hookName: "review-command",
+    outcome: "blocked",
+    level: "warning",
+    summary: "Command blocked by a hook",
+    detail: "The project requires reviewing generated changes first.",
+  };
+  const entries = buildThreadFeed([projected(item, 0)]);
+  const activity = entries.flatMap((entry) =>
+    entry.type === "activity-group" ? entry.activities : [],
+  )[0];
+  expect(activity?.icon).toBe("warning");
+  expect(activity?.summary).toBe("Command blocked by a hook");
+  expect(activity?.detail).toBe("The project requires reviewing generated changes first.");
+});
 
 it("keeps historical plan detail accessible from its paged turn item", () => {
   const item = {
@@ -839,6 +863,35 @@ describe("buildThreadFeed", () => {
           ),
       ),
     ).toBe(false);
+  });
+
+  it("keeps approval wait out of the folded work time", () => {
+    const approval: OrchestrationV2TurnItem = {
+      ...base("item-approval", "2026-06-20T00:00:02.500Z", 2),
+      startedAt: DateTime.makeUnsafe("2026-06-20T00:00:01.500Z"),
+      type: "approval_request",
+      requestId: RuntimeRequestId.make("approval"),
+      requestKind: "command",
+    };
+    const feed = buildThreadFeed([
+      projected(userMessage(), 0),
+      projected(command(), 1),
+      projected(approval, 2),
+      projected({ ...assistantMessage(), ordinal: 3 }, 3),
+    ]);
+    const collapsed = deriveThreadFeedPresentation(
+      feed,
+      {
+        runId,
+        status: "completed",
+        startedAt: "2026-06-20T00:00:01.000Z",
+        completedAt: "2026-06-20T00:00:03.000Z",
+      },
+      new Set(),
+    );
+    expect(collapsed.find((entry) => entry.type === "run-fold")).toMatchObject({
+      label: "Worked for 1.0s · waited 1.0s for you",
+    });
   });
 
   it("keeps opening and final assistant messages around the first hidden work", () => {
@@ -2653,5 +2706,90 @@ describe("MCP apps", () => {
 
   it("keeps a running app call an ordinary work row", () => {
     expect(feed("running").some((candidate) => candidate.type === "mcp-app")).toBe(false);
+  });
+});
+
+const encodeTurnItem = Schema.encodeSync(OrchestrationV2TurnItem);
+const decodeTurnItem = Schema.decodeUnknownSync(OrchestrationV2TurnItem);
+const encodeUserShell = Schema.encodeSync(OrchestrationV2UserShellCommand);
+// The shell command fields a client knew before checks were added.
+const { check: _check, ...userShellFieldsBeforeChecks } = OrchestrationV2UserShellCommand.fields;
+const decodeUserShellBeforeChecks = Schema.decodeUnknownSync(
+  Schema.Struct(userShellFieldsBeforeChecks),
+);
+
+describe("recorded project checks", () => {
+  const shell = {
+    commandId: CommandId.make("command-check"),
+    command: "vp test",
+    respond: false,
+    timeoutMs: 600_000,
+  };
+  const check = { subjectRunId: RunId.make("run-0"), scriptId: "test", scriptName: "Test" };
+  // What the server sends: each item encoded for the wire and decoded by the client.
+  const received = (userShell: OrchestrationV2UserShellCommand) =>
+    [
+      { ...userMessage(), text: "vp test", userShell },
+      {
+        ...command(),
+        source: "user_shell" as const,
+        input: "vp test",
+        output: "1 failed",
+        exitCode: 1,
+        durationMs: 1_200,
+      },
+    ].map((item) => decodeTurnItem(encodeTurnItem(item)));
+  const shown = (items: ReadonlyArray<OrchestrationV2TurnItem>) =>
+    buildThreadFeed(items.map((item, index) => projected(item, index))).map((entry) =>
+      entry.type === "message"
+        ? { type: entry.type, role: entry.message.role, text: entry.message.text }
+        : entry.type === "activity-group"
+          ? {
+              type: entry.type,
+              activities: entry.activities.map((activity) => [
+                activity.summary,
+                activity.detail,
+                activity.icon,
+              ]),
+            }
+          : { type: entry.type },
+    );
+
+  it("decodes a check's turn link and shows the run like any shell command", () => {
+    const items = received({ ...shell, check });
+    const [userItem] = items;
+    expect(userItem?.type === "user_message" ? userItem.userShell?.check : null).toEqual(check);
+    expect(shown(items)).toEqual(shown(received(shell)));
+    expect(shown(items)).toEqual([
+      { type: "message", role: "user", text: "vp test" },
+      { type: "activity-group", activities: [["Command", "vp test", "command"]] },
+    ]);
+  });
+
+  it("lets a client that predates checks decode the same shell command", () => {
+    expect(decodeUserShellBeforeChecks(encodeUserShell({ ...shell, check }))).toEqual(shell);
+  });
+});
+
+it("reads a command its approval never allowed as declined, not run or failed", () => {
+  // Claude records a declined command as failed; the client knows its approval was declined.
+  const command = {
+    ...base("declined-command", "2026-06-20T00:00:02.000Z", 1),
+    status: "failed" as const,
+    type: "command_execution" as const,
+    input: "mkdir -p build",
+    output: "Error: User declined tool execution.",
+  } satisfies OrchestrationV2TurnItem;
+  const activities = (declinedItemIds?: ReadonlySet<string>) =>
+    buildThreadFeed([projected(command, 0)], declinedItemIds ? { declinedItemIds } : {}).flatMap(
+      (entry) => (entry.type === "activity-group" ? entry.activities : []),
+    );
+  expect(activities()[0]?.lifecycleStatus).toBe("failed");
+  const [declined] = activities(new Set([command.id]));
+  expect(declined?.lifecycleStatus).toBe("declined");
+  expect(declined?.workEntry.toolLifecycleStatus).toBe("declined");
+  expect(summarizeToolGroup([declined!.workEntry])).toEqual({
+    summary: "Declined 1 command",
+    hasFailure: false,
   });
 });

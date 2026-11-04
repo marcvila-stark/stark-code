@@ -431,9 +431,27 @@ export function summarizeStarkToolCalls(
     case "device":
       label = phrase("Used", "use", `device controls ${times}`);
       break;
-    case "html-preview":
-      label = phrase("Previewed", "preview", quantity(selected.length, "HTML page"));
+    case "html-preview": {
+      // A preview without Stark's browser returns its status instead of a screenshot.
+      const unpreviewed = selected.flatMap((call) => {
+        const state = asRecord(call.output?.previewBrowser)?.state;
+        return typeof state === "string" ? [state] : [];
+      });
+      const previewed = selected.length - unpreviewed.length;
+      if (completed.length > 0 && previewed === 0 && unpreviewed.length > 0) {
+        const state = unpreviewed.at(-1);
+        label =
+          state === "installing"
+            ? "Not previewed: preview browser still installing"
+            : state === "not-installed"
+              ? "Not previewed: preview browser not installed"
+              : "Not previewed: preview browser unavailable";
+      } else {
+        label = phrase("Previewed", "preview", quantity(previewed, "HTML page"));
+        if (unpreviewed.length > 0) label += `, ${unpreviewed.length} not previewed`;
+      }
       break;
+    }
     case "html-render":
       label = phrase("Rendered", "render", quantity(selected.length, "HTML page"));
       break;

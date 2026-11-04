@@ -3,15 +3,25 @@ import type { BrowserImportSource } from "@starkfuture/contracts";
 
 import {
   canCloseWizard,
+  copySignInsLabel,
+  deselectSites,
+  filterSites,
   initialWizardStep,
   initialTargetSelection,
   isRetryableReason,
   formatSkippedDomains,
   fullDiskAccessRecheckStep,
+  MAX_IMPORT_SITES,
   outcomeToStep,
+  parseSiteInput,
+  recommendedSiteGroups,
   refreshedSourceProfileDirectory,
   refreshedSourceStep,
   resolveWizardTarget,
+  selectSites,
+  siteCountLabel,
+  siteGroupSelectionLabel,
+  siteGroupState,
 } from "./browserImportWizard.logic";
 
 describe("wizard target selection", () => {
@@ -221,5 +231,193 @@ describe("formatSkippedDomains", () => {
     expect(formatSkippedDomains(["a.com", "b.com", "c.com", "d.com", "e.com"])).toBe(
       "a.com, b.com, c.com and 2 more",
     );
+  });
+});
+
+describe("recommendedSiteGroups", () => {
+  it("offers Stark hosts as one set, led by Stark Pages", () => {
+    const groups = recommendedSiteGroups([
+      "admin.starkfuture.com",
+      "example.com",
+      "pages.starkfuture.com",
+      "starkfuture.com",
+    ]);
+
+    expect(groups.recommended).toEqual([
+      {
+        id: "stark",
+        title: "Stark sites",
+        description: undefined,
+        hostsLabel: "pages.starkfuture.com and 2 more",
+        hosts: ["pages.starkfuture.com", "admin.starkfuture.com", "starkfuture.com"],
+      },
+    ]);
+    expect(groups.other).toEqual(["example.com"]);
+  });
+
+  it("does not treat look-alike hosts as Stark sites", () => {
+    const groups = recommendedSiteGroups(["notstarkfuture.com", "starkfuture.com.evil.io"]);
+
+    expect(groups.recommended).toEqual([]);
+    expect(groups.other).toEqual(["notstarkfuture.com", "starkfuture.com.evil.io"]);
+  });
+
+  it("names a single Stark host without a count", () => {
+    expect(recommendedSiteGroups(["shop.starkfuture.com"]).recommended[0]?.hostsLabel).toBe(
+      "shop.starkfuture.com",
+    );
+  });
+
+  it("offers only the sign-in providers the profile lists", () => {
+    const groups = recommendedSiteGroups([
+      "accounts.google.com",
+      "github.com",
+      "google.com",
+      "gist.github.com",
+    ]);
+
+    expect(groups.recommended).toEqual([
+      {
+        id: "signInProviders",
+        title: "Sign-in providers",
+        description: "Needed when a site asks you to sign in again",
+        hostsLabel: "accounts.google.com, github.com",
+        hosts: ["accounts.google.com", "github.com"],
+      },
+    ]);
+    // Only the exact provider hosts are grouped; siblings stay individual choices.
+    expect(groups.other).toEqual(["google.com", "gist.github.com"]);
+  });
+
+  it("lists Stark sites before sign-in providers and keeps every other host once", () => {
+    const groups = recommendedSiteGroups([
+      "login.live.com",
+      "pages.starkfuture.com",
+      "Example.com",
+      "example.com",
+    ]);
+
+    expect(groups.recommended.map((group) => group.id)).toEqual(["stark", "signInProviders"]);
+    expect(groups.other).toEqual(["example.com"]);
+  });
+
+  it("has nothing to offer for a profile without listed hosts", () => {
+    expect(recommendedSiteGroups([])).toEqual({ recommended: [], other: [] });
+  });
+});
+
+describe("site selection", () => {
+  it("adds a whole set at once without duplicating hosts", () => {
+    expect(selectSites(["a.com"], ["a.com", "b.com"])).toEqual({
+      selected: ["a.com", "b.com"],
+      limitReached: false,
+    });
+  });
+
+  it("refuses a step that would pass the import cap and keeps the selection", () => {
+    const full = Array.from({ length: MAX_IMPORT_SITES }, (_, index) => `site${index}.com`);
+
+    expect(selectSites(full, ["one-more.com"])).toEqual({ selected: full, limitReached: true });
+    // Re-selecting hosts already chosen does not count against the cap.
+    expect(selectSites(full, [full[0]!])).toEqual({ selected: full, limitReached: false });
+  });
+
+  it("does not half-select a set that only partly fits", () => {
+    const almost = Array.from({ length: MAX_IMPORT_SITES - 1 }, (_, index) => `site${index}.com`);
+
+    expect(selectSites(almost, ["x.com", "y.com"])).toEqual({
+      selected: almost,
+      limitReached: true,
+    });
+  });
+
+  it("removes a set's hosts and leaves the rest", () => {
+    expect(deselectSites(["a.com", "b.com", "c.com"], ["b.com", "z.com"])).toEqual([
+      "a.com",
+      "c.com",
+    ]);
+  });
+
+  it("reports a set as fully, partly, or not selected", () => {
+    expect(siteGroupState(["a.com", "b.com"], ["a.com", "b.com"])).toBe("all");
+    expect(siteGroupState(["a.com"], ["a.com", "b.com"])).toBe("some");
+    expect(siteGroupState(["c.com"], ["a.com", "b.com"])).toBe("none");
+  });
+
+  it("unticks one host inside a selected set and keeps the rest", () => {
+    const stark = ["pages.starkfuture.com", "admin.starkfuture.com", "starkfuture.com"];
+    const all = selectSites(["example.com"], stark).selected;
+    const withoutAdmin = deselectSites(all, ["admin.starkfuture.com"]);
+
+    expect(withoutAdmin).toEqual(["example.com", "pages.starkfuture.com", "starkfuture.com"]);
+    expect(siteGroupState(withoutAdmin, stark)).toBe("some");
+    // Ticking it again completes the set without duplicating hosts.
+    const again = selectSites(withoutAdmin, ["admin.starkfuture.com"]);
+    expect(again.limitReached).toBe(false);
+    expect(siteGroupState(again.selected, stark)).toBe("all");
+    expect(again.selected).toHaveLength(4);
+  });
+
+  it("counts a partly chosen set and says nothing when it is all or none", () => {
+    const hosts = ["a.com", "b.com", "c.com"];
+
+    expect(siteGroupSelectionLabel(["a.com", "c.com", "x.com"], hosts)).toBe("2 of 3 selected");
+    expect(siteGroupSelectionLabel(hosts, hosts)).toBeUndefined();
+    expect(siteGroupSelectionLabel(["x.com"], hosts)).toBeUndefined();
+  });
+});
+
+describe("parseSiteInput", () => {
+  it("accepts an exact host, a pasted URL, or a cookie-style domain", () => {
+    expect(parseSiteInput("  Pages.StarkFuture.com ")).toBe("pages.starkfuture.com");
+    expect(parseSiteInput("https://pages.starkfuture.com/projects?x=1")).toBe(
+      "pages.starkfuture.com",
+    );
+    expect(parseSiteInput(".example.com")).toBe("example.com");
+  });
+
+  it("rejects anything that is not one exact host", () => {
+    expect(parseSiteInput("")).toBeUndefined();
+    expect(parseSiteInput("localhost")).toBeUndefined();
+    expect(parseSiteInput("*.example.com")).toBeUndefined();
+    expect(parseSiteInput("example-.com-")).toBeUndefined();
+    expect(parseSiteInput("not a site")).toBeUndefined();
+  });
+});
+
+describe("filterSites", () => {
+  it("matches part of a host and caps what is rendered", () => {
+    expect(filterSites(["a.example.com", "b.test.com", "c.example.com"], "EXAMPLE", 1)).toEqual({
+      visible: ["a.example.com"],
+      hiddenCount: 1,
+    });
+  });
+
+  it("shows every host for an empty filter", () => {
+    expect(filterSites(["a.com", "b.com"], "  ")).toEqual({
+      visible: ["a.com", "b.com"],
+      hiddenCount: 0,
+    });
+  });
+});
+
+describe("labels", () => {
+  it("counts a source profile's sites instead of its raw cookies", () => {
+    expect(siteCountLabel(undefined)).toBeUndefined();
+    expect(siteCountLabel([])).toBe("No sites");
+    expect(siteCountLabel(["a.com"])).toBe("1 site");
+    expect(siteCountLabel(["a.com", "b.com"])).toBe("2 sites");
+  });
+
+  it("marks a count the browser cut short", () => {
+    expect(siteCountLabel(["a.com", "b.com"], true)).toBe("2+ sites");
+    expect(siteCountLabel(["a.com"], true)).toBe("1+ sites");
+    expect(siteCountLabel(["a.com"], false)).toBe("1 site");
+  });
+
+  it("names what the confirm button copies", () => {
+    expect(copySignInsLabel(0)).toBe("Copy sign-ins");
+    expect(copySignInsLabel(1)).toBe("Copy sign-ins for 1 site");
+    expect(copySignInsLabel(4)).toBe("Copy sign-ins for 4 sites");
   });
 });

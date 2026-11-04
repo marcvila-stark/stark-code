@@ -8,6 +8,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import {
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthSettingsWriteScope,
   AuthProvidersManageScope,
   AuthSourceControlWriteScope,
@@ -260,6 +261,32 @@ describe("command permissions", () => {
     ),
   );
 
+  it.effect("requires provider administration on the destination to install the browser", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const install = createCommandPermissions(runtime, WS_METHODS.serverInstallPreviewBrowser);
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        expect(registry.get(install.permissionAtom(env))).toBe(false);
+        expect((yield* install.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+          "EnvironmentAuthorizationError",
+        );
+        registry.set(
+          sessions(env),
+          AsyncResult.success({
+            ...grant(true),
+            scopes: [AuthProvidersManageScope],
+            permissions: [AuthProvidersManageScope],
+          }),
+        );
+        expect(registry.get(install.permissionAtom(env))).toBe(true);
+        yield* install.authorize(registry, env);
+        registry.set(sessions(other), AsyncResult.success(grant(false)));
+        expect(registry.get(install.permissionAtom(other))).toBe(false);
+      }),
+    ),
+  );
+
   it.effect("requires the destination settings grant to run storage cleanup", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -305,6 +332,29 @@ describe("command permissions", () => {
         yield* check.authorize(registry, env);
       }),
     ),
+  );
+
+  it.effect(
+    "lets a read-only destination list scheduled task runs and refuses one without read",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = yield* setup;
+          const runs = createCommandPermissions(runtime, WS_METHODS.scheduledTasksListRuns);
+          const readOnly = {
+            ...grant(false),
+            scopes: [AuthOrchestrationReadScope],
+            permissions: [AuthOrchestrationReadScope],
+          };
+          registry.set(sessions(env), AsyncResult.success(readOnly));
+          expect(registry.get(runs.permissionAtom(env))).toBe(true);
+          yield* runs.authorize(registry, env, { id: ScheduledTaskId.make("scheduled-task:1") });
+          registry.set(sessions(other), AsyncResult.success(grant(false)));
+          expect((yield* runs.authorize(registry, other).pipe(Effect.flip)).requiredScope).toBe(
+            AuthOrchestrationReadScope,
+          );
+        }),
+      ),
   );
 
   it.effect("uses the target grant for both availability and execution", () =>
@@ -590,4 +640,37 @@ it.effect(
         registry.dispose();
       }
     }),
+);
+
+it.effect("lets a read-only grant search thread history but not import CLI sessions", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      const history = createCommandPermissions(
+        runtime,
+        ORCHESTRATION_V2_WS_METHODS.searchThreadHistory,
+      );
+      const importSessions = createCommandPermissions(runtime, WS_METHODS.agentSessionsImport);
+      registry.set(
+        sessions(env),
+        AsyncResult.success({
+          ...grant(false),
+          scopes: [AuthOrchestrationReadScope],
+          permissions: [AuthOrchestrationReadScope],
+        }),
+      );
+      expect(registry.get(history.permissionAtom(env))).toBe(true);
+      yield* history.authorize(registry, env);
+      expect(registry.get(importSessions.permissionAtom(env))).toBe(false);
+      expect((yield* importSessions.authorize(registry, env).pipe(Effect.flip)).requiredScope).toBe(
+        AuthOrchestrationOperateScope,
+      );
+
+      registry.set(sessions(env), AsyncResult.success(grant(false)));
+      expect(registry.get(history.permissionAtom(env))).toBe(false);
+      registry.set(sessions(env), AsyncResult.success(grant(true)));
+      expect(registry.get(importSessions.permissionAtom(env))).toBe(true);
+      yield* importSessions.authorize(registry, env);
+    }),
+  ),
 );

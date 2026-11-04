@@ -151,6 +151,45 @@ describe("AttachmentUpload", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect("stores a repeated image as a link to the pending copy it repeats", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const upload = (bytes: Uint8Array) =>
+        Effect.gen(function* () {
+          const issued = yield* issueAttachmentUploadUrl(uploadInput);
+          const token = issued.relativeUrl.slice(`${ATTACHMENT_UPLOAD_ROUTE_PREFIX}/`.length);
+          const claims = yield* validateAttachmentUploadToken(token);
+          if (!claims) throw new Error("Expected valid upload claims.");
+          expect(yield* storeAttachmentUpload(claims, bytes)).toEqual({ ok: true });
+          return {
+            id: issued.attachmentId,
+            path: NodePath.join(config.attachmentsDir, `${issued.attachmentId}.png`),
+          };
+        });
+      const pixels = new Uint8Array([1, 2, 3, 4, 5, 6]);
+
+      // A draft image uploaded on an earlier launch, then again when the draft reopens.
+      const earlier = yield* upload(pixels);
+      NodeFS.utimesSync(earlier.path, 1_000, 1_000);
+      const reopened = yield* upload(pixels);
+      const different = yield* upload(new Uint8Array([6, 5, 4, 3, 2, 1]));
+
+      // One copy on disk under both names; other bytes get their own file.
+      expect(NodeFS.statSync(reopened.path).ino).toBe(NodeFS.statSync(earlier.path).ino);
+      expect(NodeFS.statSync(different.path).ino).not.toBe(NodeFS.statSync(earlier.path).ino);
+      expect(NodeFS.readFileSync(reopened.path)).toEqual(Buffer.from(pixels));
+      // The repeat is as fresh as a new upload, so the pending sweep keeps it a full day.
+      expect(NodeFS.statSync(reopened.path).mtimeMs).toBeGreaterThan(1_000_000);
+      expect(
+        NodeFS.readdirSync(config.attachmentsDir).filter((entry) => entry.endsWith(".part")),
+      ).toEqual([]);
+
+      // Each name lives on its own: removing the earlier one keeps the repeat.
+      yield* deletePendingAttachment(earlier.id);
+      expect(NodeFS.readFileSync(reopened.path)).toEqual(Buffer.from(pixels));
+    }).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("streams generic files to a path with their original extension", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;

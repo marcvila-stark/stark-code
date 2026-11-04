@@ -43,7 +43,7 @@ const text = (value: unknown, max: number) =>
   typeof value === "string" ? value.replace(/[\p{Cc}\p{Cf}]/gu, " ").slice(0, max) : "";
 
 /** No metadata URL, endpoint, or redirect from the server may widen this network boundary. */
-export function isPinnedPagesRequest(raw: string | URL, method = "GET"): boolean {
+function isPinnedPagesRequest(raw: string | URL, method = "GET"): boolean {
   const url = new URL(raw);
   if (url.origin !== PAGES_ORIGIN || url.username || url.password || url.hash || url.search)
     return false;

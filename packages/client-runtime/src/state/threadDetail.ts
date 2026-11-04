@@ -12,11 +12,14 @@ import type { EnvironmentThread } from "./models.ts";
 import { EMPTY_ENVIRONMENT_THREAD_STATE, type EnvironmentThreadState } from "./threadState.ts";
 import {
   createQuestionHistoryProjector,
+  deriveLostThreadRequests,
   derivePendingThreadRequests,
   type PendingThreadRequests,
+  type ThreadLostRequest,
 } from "./threadRequests.ts";
 import { arrayElementsEqual, parseThreadKey, threadKey } from "./entities.ts";
 
+const EMPTY_LOST_REQUESTS: ReadonlyArray<ThreadLostRequest> = Object.freeze([]);
 const EMPTY_VISIBLE_TURN_ITEMS: OrchestrationV2ThreadProjection["visibleTurnItems"] = Object.freeze(
   [],
 );
@@ -172,6 +175,51 @@ export function createEnvironmentThreadDetailAtoms<E>(
     }).pipe(Atom.setIdleTTL(0), Atom.withLabel(`environment-thread-pending-requests:${key}`));
   });
 
+  // Recomputed only when a lost request, or the records that describe it, change.
+  const lostRequestsAtomFamily = Atom.family((key: string) => {
+    let previous: Pick<
+      OrchestrationV2ThreadProjection,
+      "runtimeRequests" | "turnItems" | "nodes"
+    > | null = null;
+    let value: ReadonlyArray<ThreadLostRequest> = EMPTY_LOST_REQUESTS;
+    return Atom.make((get) => {
+      const projection = Option.getOrNull(get(threadStateValueAtomFamily(key)).data);
+      if (projection === null) {
+        previous = null;
+        value = EMPTY_LOST_REQUESTS;
+        return value;
+      }
+      const runtimeRequests = projection.runtimeRequests.filter(
+        (request) => request.lost !== undefined,
+      );
+      const ids = new Set(runtimeRequests.map((request) => request.id));
+      const nodes = projection.nodes.filter(
+        (node) => node.runtimeRequestId !== null && ids.has(node.runtimeRequestId),
+      );
+      const commandNodeIds = new Set(nodes.map((node) => node.parentNodeId));
+      const turnItems =
+        ids.size === 0
+          ? []
+          : projection.turnItems.filter(
+              (item) =>
+                ((item.type === "approval_request" || item.type === "user_input_request") &&
+                  ids.has(item.requestId)) ||
+                (item.type === "command_execution" && commandNodeIds.has(item.nodeId)),
+            );
+      if (
+        previous === null ||
+        !arrayElementsEqual(previous.runtimeRequests, runtimeRequests) ||
+        !arrayElementsEqual(previous.turnItems, turnItems) ||
+        !arrayElementsEqual(previous.nodes, nodes)
+      ) {
+        previous = { runtimeRequests, turnItems, nodes };
+        const lost = deriveLostThreadRequests(previous);
+        value = lost.length === 0 ? EMPTY_LOST_REQUESTS : lost;
+      }
+      return value;
+    }).pipe(Atom.setIdleTTL(0), Atom.withLabel(`environment-thread-lost-requests:${key}`));
+  });
+
   const statusAtomFamily = Atom.family((key: string) =>
     Atom.make((get) => get(threadStateValueAtomFamily(key)).status).pipe(
       Atom.setIdleTTL(0),
@@ -203,5 +251,6 @@ export function createEnvironmentThreadDetailAtoms<E>(
     statusAtom: (ref: ScopedThreadRef) => statusAtomFamily(threadKey(ref)),
     errorAtom: (ref: ScopedThreadRef) => errorAtomFamily(threadKey(ref)),
     historyAtom: (ref: ScopedThreadRef) => historyAtomFamily(threadKey(ref)),
+    lostRequestsAtom: (ref: ScopedThreadRef) => lostRequestsAtomFamily(threadKey(ref)),
   };
 }

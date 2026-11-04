@@ -395,6 +395,14 @@ function cursorToolName(toolCall: ToolCall): string {
   return `mcp__${provider}__${tool}`;
 }
 
+/** Where generateImage put its image: the path it was asked for, or the one it reports. */
+function cursorGeneratedImagePath(toolCall: Extract<ToolCall, { readonly type: "generateImage" }>) {
+  return (
+    toolCall.args.filePath ??
+    (toolCall.result?.status === "success" ? toolCall.result.value.filePath : undefined)
+  );
+}
+
 function cursorToolFileName(toolCall: ToolCall): string {
   switch (toolCall.type) {
     case "write":
@@ -404,7 +412,7 @@ function cursorToolFileName(toolCall: ToolCall): string {
     case "ls":
       return toolCall.args.path;
     case "generateImage":
-      return toolCall.args.filePath ?? "generated-image";
+      return cursorGeneratedImagePath(toolCall) ?? "generated-image";
     default:
       return cursorToolName(toolCall);
   }
@@ -1216,6 +1224,11 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 ...base,
                 type: "file_change",
                 fileName: cursorToolFileName(toolCall),
+                // Without a path the file name is only a label, so say its file is unknown.
+                ...(toolCall.type === "generateImage" &&
+                cursorGeneratedImagePath(toolCall) === undefined
+                  ? { agentWrittenPaths: [] }
+                  : {}),
                 ...(toolCall.type === "edit" &&
                 toolCall.result?.status === "success" &&
                 toolCall.result.value.linesAdded !== undefined

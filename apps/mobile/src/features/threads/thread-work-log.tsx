@@ -925,10 +925,33 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
     const label = warning
       ? `Usage limit reached.${resetTime ? ` Retry after ${resetTime}.` : ""}`
       : row.summary;
+    // The chat that held this folder; a link back to the same chat goes nowhere.
+    const blockedBy = failureItem.failure.blockedBy;
+    const blockingThreadId =
+      blockedBy !== undefined && blockedBy.threadId !== failureItem.threadId
+        ? blockedBy.threadId
+        : null;
     return (
       <WorkLogPressable
+        accessibilityRole={blockingThreadId !== null ? "link" : undefined}
         accessibilityLabel={warning ? label : `${row.summary}: ${failureItem.failure.message}`}
-        accessibilityHint="Long press to copy."
+        accessibilityHint={
+          blockingThreadId !== null
+            ? "Opens the chat that holds this folder. Long press to copy."
+            : "Long press to copy."
+        }
+        onPress={
+          blockingThreadId === null
+            ? undefined
+            : () =>
+                // Push, so back returns to this chat.
+                navigation.dispatch(
+                  StackActions.push("Thread", {
+                    environmentId: String(props.environmentId),
+                    threadId: String(blockingThreadId),
+                  }),
+                )
+        }
         onLongPress={() => props.onCopyRow(row.id, row.getCopyText())}
       >
         <View className="flex-1 py-1">
@@ -970,6 +993,9 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
             <Text selectable className="ml-7 text-sm text-foreground">
               {failureItem.failure.message}
             </Text>
+          ) : null}
+          {blockingThreadId !== null ? (
+            <Text className="ml-7 pt-1 font-stark-medium text-sm text-link">Open that chat</Text>
           ) : null}
           {failureItem.failure.code === ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE &&
           failureItem.runId !== null ? (

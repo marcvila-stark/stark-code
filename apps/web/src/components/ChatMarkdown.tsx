@@ -122,6 +122,12 @@ import {
 } from "./chat/ExpandedImagePreview";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { markdownImageGallery, markdownImageItems } from "./chat/markdownImageGallery";
+import {
+  MarkdownPreviewGallery,
+  MarkdownPreviewImageContext,
+  markdownPreviewTitles,
+  rehypeMarkdownPreviewGalleries,
+} from "./chat/MarkdownPreviewGallery";
 import { MediaVideoPlayer } from "./media/MediaVideoPlayer";
 import { MediaActions, type MediaActionSource } from "./media/MediaActions";
 import { resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
@@ -1429,6 +1435,7 @@ function ChatMarkdownImage(props: {
   readonly originalUrl?: string | undefined;
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
 }) {
+  const registerPreviewImage = use(MarkdownPreviewImageContext);
   const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
   const src = props.src ?? loadedSrc;
@@ -1438,8 +1445,16 @@ function ChatMarkdownImage(props: {
   // Cached images are complete before `onLoad` can fire.
   const markLoadedIfComplete = useCallback(
     (image: HTMLImageElement | null) => {
-      if (!image) return;
-      if (image.complete && image.naturalWidth > 0) setLoadedSrc(image.currentSrc || image.src);
+      if (!image) {
+        registerPreviewImage?.(null);
+        return;
+      }
+      if (image.complete && image.naturalWidth > 0) {
+        setLoadedSrc(image.currentSrc || image.src);
+      }
+      if ((image.complete && image.naturalWidth > 0) || loadedSrc === src) {
+        registerPreviewImage?.(image);
+      }
       markdownImageItems.set(image, {
         src,
         name: props.alt.trim() || "image",
@@ -1447,16 +1462,18 @@ function ChatMarkdownImage(props: {
         ...(props.originalUrl ? { originalUrl: props.originalUrl } : {}),
       });
     },
-    [props.actionsSource, props.alt, props.originalUrl, src],
+    [loadedSrc, props.actionsSource, props.alt, props.originalUrl, registerPreviewImage, src],
   );
   const imageEvents = (loadingSrc: string) => ({
-    onLoad: () => {
+    onLoad: (event: React.SyntheticEvent<HTMLImageElement>) => {
       setLoadedSrc(loadingSrc);
       setFailedSrc(null);
+      registerPreviewImage?.(event.currentTarget);
     },
     onError: () => {
       setFailedSrc(loadingSrc);
       setLoadedSrc(null);
+      registerPreviewImage?.(null);
     },
   });
 
@@ -1927,11 +1944,13 @@ function rehypeHeadingIds() {
 const CHAT_MARKDOWN_RENDER_REHYPE_PLUGINS = [
   ...CHAT_MARKDOWN_REHYPE_PLUGINS,
   rehypeHeadingIds,
+  rehypeMarkdownPreviewGalleries,
 ] satisfies NonNullable<ReactMarkdownOptions["rehypePlugins"]>;
 
-const CHAT_MARKDOWN_LITERAL_HTML_REHYPE_PLUGINS = [rehypeHeadingIds] satisfies NonNullable<
-  ReactMarkdownOptions["rehypePlugins"]
->;
+const CHAT_MARKDOWN_LITERAL_HTML_REHYPE_PLUGINS = [
+  rehypeHeadingIds,
+  rehypeMarkdownPreviewGalleries,
+] satisfies NonNullable<ReactMarkdownOptions["rehypePlugins"]>;
 
 function MarkdownExternalLinkContent({
   host,
@@ -2883,7 +2902,15 @@ const CHAT_MARKDOWN_COMPONENTS = {
   h5: markdownHeadingRenderer(5),
   h6: markdownHeadingRenderer(6),
   div: function MarkdownDiv({ node, children, ...props }) {
-    const { onUseArtifactTemplate } = use(ChatMarkdownRendererContext);
+    const { onUseArtifactTemplate, expandMedia } = use(ChatMarkdownRendererContext);
+    const previewTitles = node && markdownPreviewTitles(node);
+    if (previewTitles) {
+      return (
+        <MarkdownPreviewGallery titles={previewTitles} onImageExpand={expandMedia}>
+          {children}
+        </MarkdownPreviewGallery>
+      );
+    }
     const artifactTemplate = artifactTemplateFromHastProperties(node?.properties);
     if (artifactTemplate) {
       return (

@@ -38,6 +38,7 @@ interface FakeCodexInput {
   forbidReasoningEffort?: boolean;
   requireArg?: string;
   forbidArg?: string;
+  requireDisabledPluginsAndApps?: boolean;
   stdinMustContain?: string;
   stdinMustNotContain?: string;
   /** What `codex mcp list --json` answers; a number exits with that code instead. */
@@ -56,6 +57,7 @@ function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
     forbidReasoningEffort: input.forbidReasoningEffort ?? false,
     requireArg: input.requireArg ?? null,
     forbidArg: input.forbidArg ?? null,
+    requireDisabledPluginsAndApps: input.requireDisabledPluginsAndApps ?? false,
     stdinMustContain: input.stdinMustContain ?? null,
     stdinMustNotContain: input.stdinMustNotContain ?? null,
     mcpServers: input.mcpServers ?? [],
@@ -78,6 +80,7 @@ function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
         "  process.exit(0);",
         "}",
         'const originalArgs = ` ${args.join(" ")} `;',
+        'const lastConfig = (key) => args.filter((arg, index) => index > 0 && args[index - 1] === "--config" && arg.startsWith(key + "=")).at(-1);',
         "let outputPath = null;",
         "let seenImage = false;",
         'let seenServiceTier = "";',
@@ -109,6 +112,7 @@ function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
         "if (check.forbidArg !== null && originalArgs.includes(` ${check.forbidArg} `)) {",
         '  fail("forbidden arg: " + check.forbidArg, 9);',
         "}",
+        'if (check.requireDisabledPluginsAndApps && (lastConfig("features.plugins") !== "features.plugins=false" || lastConfig("features.apps") !== "features.apps=false")) fail("plugins and apps must stay disabled", 10);',
         'if (check.requireImage && !seenImage) fail("missing --image input", 2);',
         "if (",
         "  check.requireServiceTier !== null &&",
@@ -323,8 +327,8 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
       {
         output: JSON.stringify({ title: "Remove default shapes" }),
         launchArgs: "--config features.plugins=true --config features.apps=true",
-        requireArg:
-          "--config features.plugins=true --config features.apps=true --config features.plugins=false --config features.apps=false --ephemeral",
+        requireArg: "--ephemeral",
+        requireDisabledPluginsAndApps: true,
       },
       (textGeneration) =>
         Effect.gen(function* () {

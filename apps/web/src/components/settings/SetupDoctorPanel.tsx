@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useAtomValue } from "@effect/atom-react";
 import { useNavigate } from "@tanstack/react-router";
 import type {
   EnvironmentId,
@@ -9,11 +10,14 @@ import type {
 import { serverEnvironment } from "../../state/server";
 import { useEnvironmentQuery } from "../../state/query";
 import { useEnvironment } from "../../state/environments";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { FoldedSettingsSection } from "./FoldedSettingsSection";
+import { SettingsSearchTarget } from "./settingsLayout";
 import {
   mcpSetupFindings,
   pagesSetupFindings,
+  previewBrowserSetup,
   providerSetupFindings,
   type SetupFinding,
 } from "./setupDoctor";
@@ -32,6 +36,9 @@ function Finding({ finding }: { finding: SetupFinding }) {
               attention: "Needs attention",
               unknown: "Not confirmed",
               disabled: "Disabled",
+              "not-installed": "Not installed",
+              installing: "Installing",
+              unavailable: "Unavailable",
             }[finding.state]
           }
         </span>
@@ -74,7 +81,51 @@ function McpInspection({
   );
 }
 
-/** Checks existing setup reports on demand. No install, login, reconnect or model request. */
+/** The headless browser HTML previews need, with the only control that installs it. */
+function PreviewBrowserSetup({ environmentId }: { environmentId: EnvironmentId }) {
+  const status = useAtomValue(serverEnvironment.previewBrowserStatus({ environmentId, input: {} }));
+  const allowed = useAtomValue(
+    serverEnvironment.installPreviewBrowser.permissionAtom(environmentId),
+  );
+  const install = useAtomCommand(serverEnvironment.installPreviewBrowser);
+  const [starting, setStarting] = useState(false);
+  const { finding, installLabel } = previewBrowserSetup(
+    status._tag === "Success" ? status.value : null,
+    status._tag === "Failure",
+  );
+  return (
+    <SettingsSearchTarget id="preview-browser" className="outline-none">
+      <ul>
+        <Finding finding={finding} />
+      </ul>
+      {installLabel === null ? null : (
+        <div className="space-y-1 pb-2">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!allowed || starting}
+            onClick={() => {
+              setStarting(true);
+              void install({ environmentId, input: {} }).finally(() => setStarting(false));
+            }}
+          >
+            {starting ? "Starting install…" : installLabel}
+          </Button>
+          {allowed ? null : (
+            <p className="text-xs text-muted-foreground">
+              Installing needs permission to manage agents on this machine.
+            </p>
+          )}
+        </div>
+      )}
+    </SettingsSearchTarget>
+  );
+}
+
+/**
+ * Checks existing setup reports on demand. No install, login, reconnect or model
+ * request, except the preview browser install the user starts from its row.
+ */
 export function SetupDoctorPanel({
   environmentId,
   environmentLabel,
@@ -126,6 +177,7 @@ export function SetupDoctorPanel({
       id="setup-doctor"
       title="Setup doctor"
       summary="Agent readiness and connection diagnostics"
+      revealForTargets={["preview-browser"]}
     >
       <div className="space-y-3 px-3 pb-3 sm:px-4">
         <p className="text-xs text-muted-foreground">
@@ -142,6 +194,9 @@ export function SetupDoctorPanel({
             <Finding key={finding.id} finding={finding} />
           ))}
         </ul>
+        {connected && environment?.serverConfig?.environment.capabilities.previewBrowserInstall ? (
+          <PreviewBrowserSetup environmentId={environmentId} />
+        ) : null}
         {projects.length > 1 ? (
           <label className="flex items-center gap-3 text-xs">
             Folder

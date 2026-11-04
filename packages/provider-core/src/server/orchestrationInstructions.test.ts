@@ -1,8 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  PREVIEW_BROWSER_SETTINGS_PATH,
   STARK_CODE_ORCHESTRATION_INSTRUCTIONS,
   starkAcpPromptWithInstructions,
+  starkPreviewBrowserNote,
   starkOrchestrationPromptForFirstRun,
   starkOrchestrationSystemPrompt,
 } from "./orchestrationInstructions.ts";
@@ -24,6 +26,37 @@ describe("Stark orchestration provider instructions", () => {
     assert.include(STARK_CODE_ORCHESTRATION_INSTRUCTIONS, "structured object, never as JSON text");
     assert.include(STARK_CODE_ORCHESTRATION_INSTRUCTIONS, '"everyMs":3600000');
     assert.include(STARK_CODE_ORCHESTRATION_INSTRUCTIONS, "bindToCurrentThread=false");
+  });
+
+  it("draws static diagrams with mermaid fences before reaching for the HTML tools", () => {
+    const visuals = STARK_CODE_ORCHESTRATION_INSTRUCTIONS.slice(
+      STARK_CODE_ORCHESTRATION_INSTRUCTIONS.indexOf("### Showing visuals"),
+    );
+    assert.include(visuals, "```mermaid");
+    assert.include(visuals, "no tool call and no approval");
+    assert.isBelow(visuals.indexOf("```mermaid"), visuals.indexOf("`html_preview`"));
+  });
+
+  it("tells the agent what to use instead while the preview browser is not ready", () => {
+    const totalBytes = 99_221_129;
+    const missing = starkPreviewBrowserNote({ state: "not-installed", totalBytes });
+    assert.include(missing, `${PREVIEW_BROWSER_SETTINGS_PATH} (about 99 MB)`);
+    assert.include(missing, "```mermaid");
+    assert.include(missing, "`html_render` without a preview");
+    assert.include(
+      starkPreviewBrowserNote({
+        state: "installing",
+        totalBytes,
+        downloadedBytes: 63_000_000,
+        unpacking: false,
+      }),
+      "still installing (63 of 99 MB downloaded)",
+    );
+    assert.include(
+      starkPreviewBrowserNote({ state: "failed", totalBytes, failure: "The disk is full." }),
+      "failed: The disk is full. The user can try again in",
+    );
+    assert.notInclude(starkPreviewBrowserNote({ state: "ready", totalBytes }), "mermaid");
   });
 
   it("injects prompt fallback only for an MCP-enabled first run", () => {

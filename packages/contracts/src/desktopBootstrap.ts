@@ -45,3 +45,26 @@ export type DesktopBackendBootstrap = typeof DesktopBackendBootstrap.Type;
     away, so a backend that sees a fresh marker at shutdown keeps its managed
     tunnel. */
 export const DESKTOP_UPDATE_RESTART_MARKER_FILE = "desktop-update-restart";
+
+// Data-protection refusals. Like 78, a supervisor must not restart a server
+// that exits with one of these: restarting cannot change the outcome.
+/** The database was written by a newer build. Nothing was changed. */
+export const SERVER_EXIT_CODE_SCHEMA_NEWER = 79;
+/** The database's migration history names migrations this build does not have. */
+export const SERVER_EXIT_CODE_SCHEMA_DIVERGENT = 80;
+/** The backup before a migration failed, so the migration did not run. */
+export const SERVER_EXIT_CODE_BACKUP_FAILED = 81;
+/** A migration failed and was rolled back. */
+export const SERVER_EXIT_CODE_MIGRATION_FAILED = 82;
+/** Another process holds the state for an update, backup or restore. */
+export const SERVER_EXIT_CODE_MAINTENANCE_IN_PROGRESS = 83;
+
+/** Exit codes a backend supervisor treats as terminal (no restart loop). */
+export const SERVER_TERMINAL_EXIT_CODES: ReadonlySet<number> = new Set([
+  SERVER_EXIT_CODE_STATE_DIR_OWNED,
+  SERVER_EXIT_CODE_SCHEMA_NEWER,
+  SERVER_EXIT_CODE_SCHEMA_DIVERGENT,
+  SERVER_EXIT_CODE_BACKUP_FAILED,
+  SERVER_EXIT_CODE_MIGRATION_FAILED,
+  SERVER_EXIT_CODE_MAINTENANCE_IN_PROGRESS,
+]);

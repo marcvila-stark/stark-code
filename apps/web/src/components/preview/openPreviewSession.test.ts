@@ -61,7 +61,11 @@ beforeEach(() => {
   runtimeMocks.electron = false;
   runtimeMocks.runtime = undefined;
   resetPreviewStateForTests();
-  useRightPanelStore.setState({ byThreadKey: {}, threadPanelVisibilityByThreadKey: {} });
+  useRightPanelStore.setState({
+    byThreadKey: {},
+    threadPanelInlineOpen: true,
+    threadPanelPopoverOpenByThreadKey: {},
+  });
   __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
 });
 

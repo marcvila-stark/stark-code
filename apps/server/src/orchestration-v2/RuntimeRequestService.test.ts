@@ -1,6 +1,7 @@
 import { assert, it, vi } from "@effect/vitest";
 import {
   NodeId,
+  ProviderDriverKind,
   ProviderSessionId,
   RuntimeRequestId,
   ThreadId,
@@ -13,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import type * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
+import { ProviderAdapterRuntimeRequestResponseError } from "@starkfuture/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
@@ -290,4 +292,92 @@ it.effect("preserves genuine provider session lookup failures as the cause", () 
     );
     assert.strictEqual(error.cause, lookupFailure);
   }).pipe(Effect.provide(layerTest));
+});
+
+it.effect(
+  "never sends a second response once the provider closed the request or took the answer",
+  () => {
+    const threadId = ThreadId.make("thread-runtime-request-closed");
+    const providerSessionId = ProviderSessionId.make("provider-session-runtime-request-closed");
+    const requestId = RuntimeRequestId.make("request-closed");
+    const respondToRuntimeRequest = vi.fn(
+      (_input: ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput) => Effect.void,
+    );
+    const getSession = vi.fn(() =>
+      Effect.succeed(Option.some({ respondToRuntimeRequest } as never)),
+    );
+    // D0 contract: OrchestrationV2RuntimeRequest.delivery.
+    const withDelivery = (state: "not_needed" | "delivered") =>
+      projectionWithRuntimeRequest({
+        ...resolvedRuntimeRequest(requestId, providerSessionId),
+        delivery: { state, attempts: 1 },
+      } as OrchestrationV2RuntimeRequest);
+    const respond = Effect.gen(function* () {
+      const service = yield* RuntimeRequestService.RuntimeRequestServiceV2;
+      return yield* service.respond({ threadId, providerSessionId, requestId, decision: "accept" });
+    });
+
+    return Effect.gen(function* () {
+      // Codex resolved the request on its own before the user's answer went out.
+      assert.equal(
+        yield* respond.pipe(
+          Effect.provide(layerRuntimeRequestTest(withDelivery("not_needed"), getSession)),
+        ),
+        "not_needed",
+      );
+      // An earlier attempt already handed this answer over.
+      assert.equal(
+        yield* respond.pipe(
+          Effect.provide(layerRuntimeRequestTest(withDelivery("delivered"), getSession)),
+        ),
+        "delivered",
+      );
+      assert.equal(getSession.mock.calls.length, 0);
+      assert.equal(respondToRuntimeRequest.mock.calls.length, 0);
+      // Without a recorded outcome the answer goes out, once.
+      assert.equal(
+        yield* respond.pipe(
+          Effect.provide(
+            layerRuntimeRequestTest(
+              projectionWithRuntimeRequest(resolvedRuntimeRequest(requestId, providerSessionId)),
+              getSession,
+            ),
+          ),
+        ),
+        "delivered",
+      );
+      assert.equal(respondToRuntimeRequest.mock.calls.length, 1);
+    });
+  },
+);
+
+it("tells an answer Stark never handed over from one whose handover failed", () => {
+  const error = (reason: RuntimeRequestService.RuntimeRequestResponseExecutionError["reason"]) =>
+    new RuntimeRequestService.RuntimeRequestResponseExecutionError({
+      reason,
+      threadId: ThreadId.make("thread-delivery"),
+      providerSessionId: ProviderSessionId.make("provider-session-delivery"),
+      requestId: RuntimeRequestId.make("request-delivery"),
+    }).delivery;
+  assert.equal(error("request-missing"), "not_delivered");
+  assert.equal(error("request-not-ready"), "not_delivered");
+  assert.equal(error("request-not-resumable"), "not_delivered");
+  assert.equal(error("provider-session-not-active"), "not_delivered");
+  assert.equal(error("unexpected-failure"), "uncertain");
+  // An adapter that proved nothing was waiting never handed the answer over.
+  const requestId = RuntimeRequestId.make("request-delivery");
+  const adapterError = (nothingWaiting: boolean) =>
+    new RuntimeRequestService.RuntimeRequestResponseExecutionError({
+      reason: "unexpected-failure",
+      threadId: ThreadId.make("thread-delivery"),
+      providerSessionId: ProviderSessionId.make("provider-session-delivery"),
+      requestId,
+      cause: new ProviderAdapterRuntimeRequestResponseError({
+        driver: ProviderDriverKind.make("codex"),
+        requestId,
+        ...(nothingWaiting ? { nothingWaiting } : {}),
+      }),
+    }).delivery;
+  assert.equal(adapterError(true), "not_delivered");
+  assert.equal(adapterError(false), "uncertain");
 });

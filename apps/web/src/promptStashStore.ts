@@ -300,3 +300,52 @@ export function writePromptStashStorageForTest(raw: string): void {
   baseStashStorage.setItem(PROMPT_STASH_STORAGE_KEY, raw);
   usePromptStashStore.setState({ entries: readPersistedEntries() ?? [] });
 }
+
+/**
+ * Before an update restart: writes the stash again and reports what would be
+ * lost. Images still encoding are attached only after the write, so they
+ * block the restart. Returns the uploaded attachments the stash references.
+ */
+export function preparePromptStashForRestart(): {
+  readonly blockers: ReadonlyArray<{
+    readonly kind: "image-encoding" | "storage-failed";
+    readonly message: string;
+    readonly count?: number;
+  }>;
+  readonly referencedAttachmentIds: ReadonlyArray<string>;
+  /** The stash as stored after the write, for the backup before the update. */
+  readonly storedJson: string | null;
+} {
+  const { entries } = usePromptStashStore.getState();
+  const encoding = entries.reduce((total, entry) => total + (entry.pendingImageCount ?? 0), 0);
+  const referencedAttachmentIds = new Set<string>();
+  for (const entry of entries) {
+    for (const file of entry.files ?? []) referencedAttachmentIds.add(file.attachmentId);
+  }
+  const { written, durable } = persistEntries(entries);
+  let storedJson: string | null = null;
+  try {
+    const raw = baseStashStorage.getItem(PROMPT_STASH_STORAGE_KEY);
+    storedJson = typeof raw === "string" ? raw : null;
+  } catch {
+    storedJson = null;
+  }
+  return {
+    blockers: [
+      ...(encoding > 0
+        ? [
+            {
+              kind: "image-encoding" as const,
+              message: "A stashed image is still being saved.",
+              count: encoding,
+            },
+          ]
+        : []),
+      ...(!written || !durable
+        ? [{ kind: "storage-failed" as const, message: "The prompt stash couldn't be saved." }]
+        : []),
+    ],
+    referencedAttachmentIds: [...referencedAttachmentIds],
+    storedJson,
+  };
+}

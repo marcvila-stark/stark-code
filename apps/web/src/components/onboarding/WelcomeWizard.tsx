@@ -87,8 +87,8 @@ import styles from "./OnboardingLayout.module.css";
 /**
  * First-run welcome wizard. Rendered over the workspace at `/welcome` on a
  * fresh install (no completed-onboarding flag, empty workspace): local agents →
- * optional browser import → main folder. Remote computers remain available
- * through an explicit connection choice. Re-run by clearing the flag.
+ * optional browser import → main folder. Existing remote setups keep their
+ * connection recovery flow; local alpha setup does not offer new remote computers.
  */
 
 type WizardStep = "connection" | "agents" | "browser" | "folder";
@@ -274,11 +274,15 @@ export function WelcomeWizard({
             <AgentsStep
               environmentIds={setupIds}
               localEnvironmentId={localSetupEnvironmentId}
-              onChooseComputers={() => {
-                setChoosingComputers(true);
-                setSelection(new Set(setupIds));
-                setStep("connection");
-              }}
+              onChooseComputers={
+                !localSetupEnvironmentId || setupIds.some((id) => id !== localSetupEnvironmentId)
+                  ? () => {
+                      setChoosingComputers(true);
+                      setSelection(new Set(setupIds));
+                      setStep("connection");
+                    }
+                  : undefined
+              }
               onContinue={() => setStep(hasBrowserImport ? "browser" : "folder")}
             />
           ) : step === "browser" ? (
@@ -674,7 +678,7 @@ function AgentsStep({
 }: {
   readonly environmentIds: readonly EnvironmentId[];
   readonly localEnvironmentId: EnvironmentId | null;
-  readonly onChooseComputers: () => void;
+  readonly onChooseComputers?: (() => void) | undefined;
   readonly onContinue: () => void;
 }) {
   const { environments } = useEnvironments();
@@ -701,10 +705,17 @@ function AgentsStep({
           ))}
         </div>
       </ScrollArea>
-      <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-5.75">
-        <Button variant="quiet" size="comfortable" onClick={onChooseComputers}>
-          Use another computer
-        </Button>
+      <div className="mt-6 flex flex-wrap items-center justify-end gap-3 border-t border-border pt-5.75">
+        {onChooseComputers ? (
+          <Button
+            className="mr-auto"
+            variant="quiet"
+            size="comfortable"
+            onClick={onChooseComputers}
+          >
+            Use another computer
+          </Button>
+        ) : null}
         <Button variant="brand" size="comfortable" autoFocus onClick={onContinue}>
           Continue
           <ArrowRightIcon className="size-3.5" />

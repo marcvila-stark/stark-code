@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { commandFailureMessage } from "@starkfuture/client-runtime/errors";
 import { ThreadId, type SavedPermissionRuleFile } from "@starkfuture/contracts";
 import { squashAtomCommandFailure } from "@starkfuture/client-runtime/state/runtime";
 import { useSettingsScope } from "./SettingsScopeContext";
@@ -10,6 +11,7 @@ import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useOpenInPreferredEditor } from "../../editorPreferences";
 import { Button } from "../ui/button";
+import { EffectivePermissionsSettings } from "./EffectivePermissionsSettings";
 
 export function PermissionRuleFileList({
   files,
@@ -139,10 +141,17 @@ export function PermissionRulesSettings() {
         <div>
           <h2 className="text-base font-semibold">Permissions</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Review saved provider rules for a thread's project. New rules can only be saved from an
-            approval card. Changes apply on the next provider turn.
+            Where each provider's chats take their permissions from, and the rules saved from
+            approval cards. New rules can only be saved from an approval card. Changes apply on the
+            next provider turn.
           </p>
         </div>
+        {environment?.serverConfig ? (
+          <EffectivePermissionsSettings
+            providers={environment.serverConfig.providers}
+            settings={environment.serverConfig.settings}
+          />
+        ) : null}
         {!environment ? (
           <p className="text-sm text-muted-foreground">
             Connect an environment to view its permission rules.
@@ -153,6 +162,7 @@ export function PermissionRulesSettings() {
           </p>
         ) : (
           <>
+            <h3 className="text-sm font-medium">Saved rules</h3>
             <label className="flex flex-col gap-2 text-sm">
               Project thread
               <select
@@ -191,7 +201,8 @@ export function PermissionRulesSettings() {
               }}
               onOpen={(path) => {
                 void open(path).then((answer) => {
-                  if (answer._tag === "Failure") setError(String(squashAtomCommandFailure(answer)));
+                  if (answer._tag === "Failure")
+                    setError(commandFailureMessage(squashAtomCommandFailure(answer)));
                 });
               }}
             />

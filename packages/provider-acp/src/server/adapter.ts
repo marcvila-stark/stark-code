@@ -967,6 +967,32 @@ export function acpToolCallDiffPatch(content: unknown): string | undefined {
   return v1Patches.length === 0 ? undefined : formatPatch(v1Patches, FILE_HEADERS_ONLY);
 }
 
+/**
+ * Every file an edit tool call without structured changes names, from its locations, its diffs
+ * and a path in its input. Empty when it names none: its item's title is then only a label.
+ */
+export function acpEditedPaths(toolCall: AcpToolCallState): ReadonlyArray<string> {
+  const paths = new Set<string>();
+  const add = (candidate: unknown) => {
+    if (typeof candidate === "string" && candidate.trim().length > 0) paths.add(candidate.trim());
+  };
+  const { locations, content } = toolCall.data;
+  if (Array.isArray(locations)) {
+    for (const location of locations) add(unknownRecord(location)?.path);
+  }
+  if (Array.isArray(content)) {
+    for (const entry of content) {
+      const diff = unknownRecord(entry);
+      if (diff?.type === "diff") add(diff.path);
+    }
+  }
+  if (paths.size === 0) {
+    const rawInput = unknownRecord(toolCall.data.rawInput);
+    for (const key of ["path", "filePath", "file_path"]) add(rawInput?.[key]);
+  }
+  return [...paths];
+}
+
 function pathFromToolCall(toolCall: AcpToolCallState): string | undefined {
   const locations = toolCall.data.locations;
   if (Array.isArray(locations)) {
@@ -3472,6 +3498,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   ...base,
                   type: "file_change",
                   fileName: path ?? toolCall.title ?? "File change",
+                  // An edit can touch more files than its first path, or name none at all.
+                  agentWrittenPaths: acpEditedPaths(toolCall),
                   ...(diffText === undefined ? {} : { diffStr: diffText }),
                 };
                 break;

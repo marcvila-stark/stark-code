@@ -43,6 +43,18 @@ export function scheduledTaskDefaultModel(
   });
 }
 
+/** The mode a task saved without one runs: the project's default, as the server resolves it. */
+export function scheduledTaskProjectRuntimeMode(
+  config: ServerConfig | null,
+  project: (LegacyProjectSettingsFields & { readonly id: ProjectId }) | null,
+): RuntimeMode {
+  return resolveProjectSettings(
+    config?.settings ?? DEFAULT_SERVER_SETTINGS,
+    project?.id ?? null,
+    project,
+  ).settings.defaultRuntimeMode;
+}
+
 export type ScheduleDraft = {
   readonly mode: "fixed_time" | "interval" | "webhook";
   readonly timeOfDay: string;
@@ -145,7 +157,8 @@ export type ScheduledTaskDraft = {
   readonly checkoutPath: string;
   readonly enabled: boolean;
   readonly startFromOrigin: boolean;
-  readonly runtimeMode: RuntimeMode;
+  /** Null sends no mode, so the server runs the project's default; a saved task keeps its own. */
+  readonly runtimeMode: RuntimeMode | null;
 };
 
 function draftSignature(draft: ScheduledTaskDraft): string {
@@ -196,7 +209,7 @@ export function createDraft(
     checkoutPath: "",
     enabled: true,
     startFromOrigin: true,
-    runtimeMode: "full-access",
+    runtimeMode: null,
   };
 }
 

@@ -24,7 +24,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpAttachmentInput } from "./attachment/input.ts";
 import { McpSchema, McpServer, Tool } from "effect/ai";
-import { FetchHttpClient } from "effect/http";
+import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
 import {
   OrchestratorCommandRejectedError,
@@ -315,6 +315,59 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
     ),
   ),
 );
+
+it.effect("answers html_preview without a browser instead of downloading one", () => {
+  const downloads: Array<string> = [];
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const result = yield* server
+      .callTool({ name: "html_preview", arguments: { html: "<p>Flow</p>" } })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+
+    expect(result.isError).toBe(false);
+    expect(result.content.map((block) => block.type)).toEqual(["text"]);
+    expect(result.structuredContent).toMatchObject({
+      previewBrowser: { state: "not-installed" },
+      message: expect.stringContaining("Settings → Agents & accounts → Setup doctor"),
+    });
+    expect(downloads).toEqual([]);
+  }).pipe(
+    Effect.provide(
+      McpHttpServer.layerHtmlToolkit.pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(PreviewBrowser.layer),
+        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "stark-mcp-html-preview-" })),
+        Layer.provide(NodeServices.layer),
+        Layer.provide(
+          Layer.succeed(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              Effect.sync(() => {
+                downloads.push(request.url);
+                return HttpClientResponse.fromWeb(request, new Response(null, { status: 500 }));
+              }),
+            ),
+          ),
+        ),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () =>
+              Effect.succeed({
+                id: threadId,
+                deletedAt: null,
+                archivedAt: null,
+                activeRunId: RunId.make("mcp-core-run"),
+                providerInstanceId: ProviderInstanceId.make("codex"),
+              } as OrchestrationV2ThreadShell),
+          }),
+        ),
+      ),
+    ),
+  );
+});
 
 it.effect("returns invalid parameter errors through the production registration", () =>
   Effect.gen(function* () {

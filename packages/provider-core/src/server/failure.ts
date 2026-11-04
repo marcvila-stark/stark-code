@@ -8,8 +8,8 @@ import type {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
-  ThreadId,
 } from "@starkfuture/contracts";
+import { OrchestrationV2WorkspaceBusyReason, ThreadId } from "@starkfuture/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Cause from "effect/Cause";
 
@@ -23,6 +23,60 @@ export class ContextHandoffBudgetError extends Schema.TaggedError<ContextHandoff
 ) {
   override get message() {
     return "Insufficient context allowance for the provider handoff. Compact the target conversation or use a larger-context model; the current request has not been truncated.";
+  }
+}
+
+/**
+ * Raised when a turn cannot start because another chat's turn, or an agent in
+ * a chat's terminal, holds the same folder. `makeProviderFailure` turns it
+ * into a failure that names and links that chat instead of a generic error.
+ */
+export class ProviderWorkspaceBusyError extends Schema.TaggedError<ProviderWorkspaceBusyError>()(
+  "ProviderWorkspaceBusyError",
+  {
+    threadId: ThreadId,
+    blockingThreadId: ThreadId,
+    blockingThreadTitle: Schema.NullOr(Schema.String),
+    reason: OrchestrationV2WorkspaceBusyReason,
+  },
+) {
+  override get message() {
+    const sameThread = this.blockingThreadId === this.threadId;
+    const title = this.blockingThreadTitle?.trim();
+    const chat = title ? `“${title}”` : "The other chat";
+    switch (this.reason) {
+      case "approval":
+        return `${chat} is waiting for your approval and keeps this folder until its turn ends. Approve, deny or stop it there, then try again.`;
+      case "user_input":
+        return `${chat} is waiting for your answer and keeps this folder until its turn ends. Answer or stop it there, then try again.`;
+      case "working":
+        return `${chat} is still working in this folder. Wait for it to finish or stop it, then try again.`;
+      case "terminal_agent":
+        return sameThread
+          ? "An agent is running in this chat's terminal. Exit it, then try again."
+          : `An agent is running in the terminal of ${title ? chat : "another chat"}. Exit it, then try again.`;
+    }
+  }
+}
+
+const isProviderWorkspaceBusyError = Schema.is(ProviderWorkspaceBusyError);
+
+/** Row title for a turn that could not start because another chat held its folder. */
+function workspaceBusyTitle(
+  blockedBy: NonNullable<OrchestrationV2ProviderFailure["blockedBy"]>,
+  threadId: ThreadId,
+): string {
+  switch (blockedBy.reason) {
+    case "approval":
+      return "Another chat in this folder is waiting for approval";
+    case "user_input":
+      return "Another chat in this folder is waiting for your answer";
+    case "working":
+      return "Another chat in this folder is still working";
+    case "terminal_agent":
+      return blockedBy.threadId === threadId
+        ? "An agent in this chat's terminal is using this folder"
+        : "An agent in another chat's terminal is using this folder";
   }
 }
 
@@ -46,6 +100,8 @@ function causeMessage(cause: unknown): string | undefined {
       switch ((cause as Record<string, unknown>)._tag) {
         case "ContextHandoffBudgetError":
           return new ContextHandoffBudgetError().message;
+        case "ProviderWorkspaceBusyError":
+          return stringField(cause, "message");
         case "ClaudeBackgroundWorkBlocksQueryReplacementError":
           return stringField(cause, "message");
         case "ContextHandoffDeliveryUncertainError":
@@ -73,6 +129,28 @@ function causeMessage(cause: unknown): string | undefined {
     }
   }
   return message;
+}
+
+/** The busy-folder refusal anywhere in a cause chain, as the failure's link. */
+function workspaceBusyCause(cause: unknown): OrchestrationV2ProviderFailure["blockedBy"] {
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 16 && cause != null && !seen.has(cause); depth++) {
+    seen.add(cause);
+    try {
+      if (Cause.isCause(cause)) {
+        cause = Cause.squash(cause);
+        continue;
+      }
+      if (isProviderWorkspaceBusyError(cause)) {
+        return { threadId: cause.blockingThreadId, reason: cause.reason };
+      }
+      if (typeof cause !== "object") return undefined;
+      cause = (cause as Record<string, unknown>).cause;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 function stringField(value: unknown, key: "message" | "code"): string | undefined {
@@ -158,11 +236,13 @@ export function makeProviderFailure(input: {
   const code =
     rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;
 
+  const blockedBy = workspaceBusyCause(input.cause);
   return {
     class: input.class ?? "unknown",
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
     retryable: input.retryable ?? null,
+    ...(blockedBy === undefined ? {} : { blockedBy }),
     ...(input.class === "usage_limit" &&
     input.resetAt != null &&
     Number.isFinite(Date.parse(input.resetAt))
@@ -198,7 +278,12 @@ export function makeProviderFailureTurnItem(input: {
     parentItemId: null,
     ordinal: input.itemOrdinal,
     status: "failed",
-    title: input.failure.class === "usage_limit" ? "Usage limit reached" : "Provider error",
+    title:
+      input.failure.blockedBy !== undefined
+        ? workspaceBusyTitle(input.failure.blockedBy, input.threadId)
+        : input.failure.class === "usage_limit"
+          ? "Usage limit reached"
+          : "Provider error",
     startedAt: input.retryStartedAt ?? input.occurredAt,
     completedAt: input.occurredAt,
     updatedAt: input.occurredAt,

@@ -9,6 +9,9 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@starkfuture/shared/HostProcess";
+import { PROVIDER_PRIVACY_ENV } from "@starkfuture/shared/providerPrivacy";
+import { STARK_PAGES_ENV } from "@starkfuture/shared/starkPages";
+import { CLAUDE_HELPER_MODEL_ENV } from "@starkfuture/shared/claudeModelPolicy";
 import { SpawnExecutableResolution } from "@starkfuture/shared/shell";
 import {
   ProviderReplayEntry,
@@ -30,6 +33,7 @@ import {
   isWindowsClaudeLauncherShimPath,
   resolveClaudeSdkExecutablePath,
 } from "../../provider/Drivers/ClaudeExecutable.ts";
+import { STARK_PAGES_CONNECTOR_DISALLOWED_TOOLS } from "./StarkPagesGuard.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import { ProviderAdapterDriverCreateError } from "@starkfuture/provider-core/server/adapterDriver";
@@ -303,13 +307,46 @@ function normalizeReplayFrame(value: unknown): unknown {
     return value;
   }
   if ("type" in value && value.type === "query.open" && "options" in value) {
-    const options = value.options as ClaudeAdapterV2.ClaudeAgentSdkQueryOptions;
-    if (typeof options.settings === "object" && options.settings !== null) {
-      // Host approval hooks are covered by policy tests; old query recordings
-      // predate the explicit switch that keeps them enabled.
-      const { disableAllHooks, ...settings } = options.settings;
-      if (disableAllHooks === false) value = { ...value, options: { ...options, settings } };
-    }
+    const { settings, disallowedTools, ...options } =
+      value.options as ClaudeAdapterV2.ClaudeAgentSdkQueryOptions;
+    // Recordings made while Stark forced hooks on carry disableAllHooks: false;
+    // Stark no longer sends it, and policy tests cover hooks.
+    const { disableAllHooks, env, ...otherSettings } =
+      typeof settings === "object" && settings !== null ? settings : {};
+    // Older recordings predate the fixed privacy/mirror/helper-model environment. Ignore
+    // only those exact app-owned values; keep user environment and every
+    // permission setting in the comparison. Launch-policy tests pin the values.
+    const appEnvironment: Readonly<Record<string, string>> = {
+      ...PROVIDER_PRIVACY_ENV,
+      ...STARK_PAGES_ENV,
+      ...CLAUDE_HELPER_MODEL_ENV,
+    };
+    const recordedEnv = Object.fromEntries(
+      Object.entries(env ?? {}).filter(([key, value]) => appEnvironment[key] !== value),
+    );
+    const retainedSettings = {
+      ...otherSettings,
+      ...(disableAllHooks === undefined || disableAllHooks === false ? {} : { disableAllHooks }),
+      ...(Object.keys(recordedEnv).length === 0 ? {} : { env: recordedEnv }),
+    };
+    const normalizedSettings =
+      typeof settings === "string"
+        ? settings
+        : Object.keys(retainedSettings).length === 0
+          ? undefined
+          : retainedSettings;
+    // The native Pages deny rules postdate the recordings; policy tests cover them.
+    const disallowed = (disallowedTools ?? []).filter(
+      (tool) => !STARK_PAGES_CONNECTOR_DISALLOWED_TOOLS.includes(tool),
+    );
+    value = {
+      ...value,
+      options: {
+        ...options,
+        ...(normalizedSettings === undefined ? {} : { settings: normalizedSettings }),
+        ...(disallowed.length === 0 ? {} : { disallowedTools: disallowed }),
+      },
+    };
   }
   return Object.fromEntries(
     Object.entries(value as object).map(([key, entry]) => [key, normalizeReplayFrame(entry)]),
@@ -439,7 +476,7 @@ function stableClaudeQueryOptions(
   const stable = {
     model: options.model,
     tools: options.tools,
-    permissionMode: options.permissionMode,
+    ...(options.permissionMode === undefined ? {} : { permissionMode: options.permissionMode }),
     ...(options.allowedTools === undefined ? {} : { allowedTools: options.allowedTools }),
     ...(options.disallowedTools === undefined ? {} : { disallowedTools: options.disallowedTools }),
     ...(options.settings === undefined ? {} : { settings: options.settings }),
@@ -2838,6 +2875,52 @@ export const ClaudeOrchestratorReplayHarness: OrchestratorV2ProviderReplayHarnes
   driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
   decodeTranscript: (transcript) =>
     decodeClaudeAgentSdkReplayTranscript(transcript).pipe(
+      // These pre-permission recordings copied Bypass into forked chats. A new
+      // fork now starts Manual; derive that exact outbound expectation while
+      // retaining the recorded source policy and every other option.
+      Effect.map((decoded) =>
+        decoded.version === "0.2.111" &&
+        /^(thread_fork_|thread_merge_back_)/u.test(decoded.scenario)
+          ? {
+              ...decoded,
+              entries: decoded.entries.flatMap((entry) => {
+                if (
+                  decoded.scenario === "thread_fork_native_fork_local_rollback" &&
+                  entry.type === "expect_outbound" &&
+                  entry.label === "prompt.offer:fork-second"
+                ) {
+                  return [
+                    {
+                      type: "expect_outbound" as const,
+                      label: "query.set_permission_mode:fork-second",
+                      frame: { type: "query.set_permission_mode", mode: "default" },
+                    },
+                    entry,
+                  ];
+                }
+                if (
+                  entry.type !== "expect_outbound" ||
+                  !entry.label?.startsWith("query.open:fork") ||
+                  typeof entry.frame !== "object" ||
+                  entry.frame === null ||
+                  !("type" in entry.frame) ||
+                  entry.frame.type !== "query.open"
+                )
+                  return entry;
+                const frame = entry.frame as ClaudeQueryOpenFrame;
+                if (frame.options.permissionMode !== "bypassPermissions") return entry;
+                const { allowDangerouslySkipPermissions: _skip, ...options } = frame.options;
+                return {
+                  ...entry,
+                  frame: {
+                    ...frame,
+                    options: { ...options, permissionMode: "default" as const },
+                  },
+                };
+              }),
+            }
+          : decoded,
+      ),
       Effect.mapError(
         (cause) =>
           new ClaudeReplayTranscriptDecodeError({

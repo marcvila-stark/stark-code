@@ -5936,7 +5936,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
             headRepositoryOwnerLogin: "binbandit",
           },
           repositoryCloneUrls: {
-            "binbandit/starkcode": {
+            "binbandit/stark-code": {
               url: forkDir,
               sshUrl: forkDir,
             },

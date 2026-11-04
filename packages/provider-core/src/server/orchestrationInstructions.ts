@@ -1,4 +1,9 @@
-import type { ProviderInteractionMode } from "@starkfuture/contracts";
+import {
+  previewBrowserDownloadSize,
+  previewBrowserInstallProgress,
+  type PreviewBrowserStatus,
+  type ProviderInteractionMode,
+} from "@starkfuture/contracts";
 
 export const STARK_CODE_ORCHESTRATION_INSTRUCTIONS = `
 
@@ -35,11 +40,13 @@ ACP fallback: some ACP agents accept the injected MCP server but fail to expose 
 
 Show visual results inside the conversation so the reader can inspect them without opening a separate file or side panel.
 
+- For a static diagram (flowchart, sequence, state, class, ER, gantt, pie), write a \`\`\`mermaid fenced block in your reply. Stark Code draws it inline in the chat with no tool call and no approval; mobile shows its source.
 - For screenshots and other static images, embed the existing image with Markdown image syntax: \`![Short descriptive caption](/absolute/path/to/image.png)\`. Use the actual absolute path returned by the tool. A plain file link is not an image preview. Do not create an HTML wrapper or regenerate an existing image just to display it. Images can be expanded; multiple images in the same message can be browsed together.
-- For an interactive chart, diagram, comparison, or mockup, build self-contained HTML, check it with \`html_preview\`, then show it with \`html_render\` before your final reply. Saving an HTML file or linking to it does not put the preview in the chat; use \`html_render\` even when a source file is also saved. This creates a conversation attachment, not a Company Pages publication. Keep the existing tool permissions and sandbox restrictions; if the inline tool is unavailable or denied, say so and offer the file link instead.
+- When a chart, table, image collage, mockup, or an interactive or pixel-exact page would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then show it with \`html_render\` before your final reply. Saving an HTML file or linking to it does not put the preview in the chat; use \`html_render\` even when a source file is also saved. This creates a conversation attachment, not a Company Pages publication. Keep the existing tool permissions and sandbox restrictions; if the inline tool is unavailable or denied, say so and offer the file link instead.
+- \`html_preview\` needs Stark's preview browser and never installs it; the user does, in Settings. \`orchestrator_capabilities\` reports it as \`previewBrowser\`, and \`html_preview\` says so without failing when it is missing. Without it, show the page with \`html_render\` unpreviewed, or use a mermaid fence or prose.
 - Give the preview a short title about its content. Do not repeat the app's name or logo in every preview unless the user requests branded content. Label design proposals as previews and distinguish them from screenshots of the actual app.
 
-The reader sees the visual in the conversation. Add only the explanation it needs, without restating the whole visual.
+The reader sees the visual in the conversation, above your final reply, so don't announce or restate it; add only the explanation it doesn't give.
 `;
 
 export const STARK_CODE_BROWSER_TOOL_INSTRUCTIONS = `
@@ -120,4 +127,37 @@ export function starkOrchestrationPromptForFirstRun(input: {
 
 export function starkOrchestrationSystemPrompt(hasStarkMcp: boolean): string | undefined {
   return hasStarkMcp ? STARK_CODE_ORCHESTRATION_INSTRUCTIONS : undefined;
+}
+
+/** Where the user installs Stark's preview browser; agents relay it. */
+export const PREVIEW_BROWSER_SETTINGS_PATH = "Settings → Agents & accounts → Setup doctor";
+
+const PREVIEW_BROWSER_FALLBACK =
+  "draw static diagrams in a ```mermaid fence, publish a page with `html_render` without a preview, or describe it.";
+
+/**
+ * Whether `html_preview` can run and what to do when it cannot. Adapters with a
+ * per-turn context channel send it when it changes; an `html_preview` call that
+ * cannot run returns it instead of failing.
+ */
+export function starkPreviewBrowserNote(status: PreviewBrowserStatus): string {
+  switch (status.state) {
+    case "ready":
+      return "Stark's preview browser is installed, so `html_preview` can screenshot pages.";
+    case "installing":
+      return `Stark's preview browser is still installing (${previewBrowserInstallProgress(status)}), so \`html_preview\` cannot screenshot pages yet. Until it finishes, ${PREVIEW_BROWSER_FALLBACK}`;
+    case "not-installed": {
+      const size = previewBrowserDownloadSize(status);
+      return `Stark's preview browser is not installed, so \`html_preview\` cannot screenshot pages, and it never downloads the browser itself. The user can install it in ${PREVIEW_BROWSER_SETTINGS_PATH}${size === null ? "" : ` (${size})`}. Until then, ${PREVIEW_BROWSER_FALLBACK}`;
+    }
+    case "failed":
+      return `Installing Stark's preview browser failed${status.failure === undefined ? "." : `: ${status.failure}`} The user can try again in ${PREVIEW_BROWSER_SETTINGS_PATH}. Until then, ${PREVIEW_BROWSER_FALLBACK}`;
+    case "unsupported":
+      return `Stark's preview browser is not available on this host, so \`html_preview\` cannot screenshot pages. Instead, ${PREVIEW_BROWSER_FALLBACK}`;
+  }
+}
+
+/** The note as a tagged block for a prompt, so it cannot be mistaken for the user's words. */
+export function starkPreviewBrowserContext(status: PreviewBrowserStatus): string {
+  return `<stark_code_preview_browser>${starkPreviewBrowserNote(status)}</stark_code_preview_browser>`;
 }

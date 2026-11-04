@@ -14,6 +14,30 @@ import { copySorted } from "./Array.ts";
 
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
 
+/**
+ * Drivers a new thread starts on when nothing decides for it: no configured
+ * default model, no remembered pick, or a remembered provider that can no
+ * longer run. Callers still require the provider to be ready; drivers not
+ * listed follow in catalog order.
+ */
+const AUTOMATIC_PROVIDER_DRIVER_PREFERENCE: ReadonlyArray<string> = ["claudeAgent"];
+
+/**
+ * Stable order for an automatic provider pick: preferred drivers first, the
+ * rest in the order given. Nothing is filtered out; callers `find` the first
+ * entry that is ready to run.
+ */
+export function orderByAutomaticProviderPreference<T>(
+  items: ReadonlyArray<T>,
+  driverOf: (item: T) => string,
+): T[] {
+  const rank = (item: T) => {
+    const index = AUTOMATIC_PROVIDER_DRIVER_PREFERENCE.indexOf(driverOf(item));
+    return index === -1 ? AUTOMATIC_PROVIDER_DRIVER_PREFERENCE.length : index;
+  };
+  return copySorted(items, (left, right) => rank(left) - rank(right));
+}
+
 /** Choose the command for a model change against the thread's current provider instance. */
 export function modelSelectionCommandType(
   currentInstanceId: ProviderInstanceId,

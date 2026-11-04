@@ -1,5 +1,8 @@
 import { useAtomValue } from "@effect/atom-react";
-import type { PendingThreadRequests } from "@starkfuture/client-runtime/state/thread-requests";
+import type {
+  PendingThreadRequests,
+  ThreadLostRequest,
+} from "@starkfuture/client-runtime/state/thread-requests";
 import type { EnvironmentThread } from "@starkfuture/client-runtime/state/shell";
 import type {
   EnvironmentId,
@@ -81,6 +84,7 @@ export function useSelectedThreadVisibleTurnItems(): OrchestrationV2ThreadProjec
 
 const EMPTY_WORKTREE_PATH_ATOM = Atom.make<string | null>(null);
 const EMPTY_PENDING_REQUESTS_ATOM = Atom.make<PendingThreadRequests | null>(null);
+const EMPTY_LOST_REQUESTS_ATOM = Atom.make<ReadonlyArray<ThreadLostRequest>>(Object.freeze([]));
 
 export function useSelectedThreadWorktreePath() {
   const { selectedThreadDetailRef } = useThreadSelection();
@@ -97,5 +101,15 @@ export function useSelectedThreadPendingRequests() {
     selectedThreadDetailRef === null
       ? EMPTY_PENDING_REQUESTS_ATOM
       : environmentThreadDetails.pendingRequestsAtom(selectedThreadDetailRef),
+  );
+}
+
+/** Decisions lost to a restart, shutdown or provider exit that the user still owes. */
+export function useSelectedThreadLostRequests() {
+  const { selectedThreadDetailRef } = useThreadSelection();
+  return useAtomValue(
+    selectedThreadDetailRef === null
+      ? EMPTY_LOST_REQUESTS_ATOM
+      : environmentThreadDetails.lostRequestsAtom(selectedThreadDetailRef),
   );
 }

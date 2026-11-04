@@ -663,7 +663,7 @@ const connectLogoutCommand = Command.make("logout", {
   ),
 );
 
-export const connectCommand = Command.make("connect", {
+const connectCommand = Command.make("connect", {
   ...projectLocationFlags,
   headless: headlessFlag,
 }).pipe(

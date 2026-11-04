@@ -51,7 +51,13 @@ function McpHealthBannerTarget({
     query.data?.live && !query.error
       ? relevantMcpFailures(query.data.servers, { runId, turnItems })
       : [];
-  const firstFailure = failures[0];
+  // Dismissing hides this set of failures; a connection that newly fails shows again.
+  const failureKey = failures
+    .map((server) => `${server.name}:${server.status}`)
+    .sort()
+    .join("\n");
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null);
+  const firstFailure = dismissedKey === failureKey ? undefined : failures[0];
   // Keep an explicitly opened sign-in panel alive if the warning resolves during OAuth.
   if (!firstFailure && !open) return null;
   return (
@@ -95,6 +101,14 @@ function McpHealthBannerTarget({
             }}
           >
             {failures.length > 1 ? `Review ${failures.length} connections` : "Review connection"}
+          </Button>
+          <Button
+            size="xs"
+            variant="ghost"
+            aria-label="Dismiss connection notice"
+            onClick={() => setDismissedKey(failureKey)}
+          >
+            Dismiss
           </Button>
         </div>
       ) : null}

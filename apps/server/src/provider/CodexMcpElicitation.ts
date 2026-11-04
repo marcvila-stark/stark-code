@@ -2,6 +2,8 @@ import type { ProviderApprovalDecision, ProviderApprovalOption } from "@starkfut
 import * as Schema from "effect/Schema";
 import type * as EffectCodexSchema from "effect-codex-app-server/schema";
 
+import { mayPublishToStarkPages } from "../orchestration-v2/Adapters/StarkPagesGuard.ts";
+
 const NullableMcpElicitationString = Schema.NullOr(Schema.String);
 const McpElicitationMetadata = Schema.Struct({
   app: Schema.optionalKey(NullableMcpElicitationString),
@@ -143,12 +145,24 @@ export function describeMcpElicitation(
     }
   }
 
+  // Publishing to Stark Pages, or a call that may publish, always takes a
+  // fresh decision. "Always" is not offered at all: Codex does not say what it
+  // saves, so the card could not show the exact rule (PLAN-002 §4).
+  // An elicitation that names no tool is judged by its message, so a Pages
+  // server asking to publish still counts.
+  const target = mcpToolApprovalTarget(payload);
+  const publish = mayPublishToStarkPages({
+    toolName: target?.tool ?? target?.title ?? payload.message,
+    toolInput: target?.arguments ?? null,
+    mcpServer: { name: payload.serverName },
+  });
   return {
     appName,
     options: [
       { decision: "cancel", label: "Cancel" },
       { decision: "decline", label: "Decline" },
-      ...(persistenceOptions.has("acceptForSession") &&
+      ...(!publish &&
+      persistenceOptions.has("acceptForSession") &&
       toMcpElicitationResponse(payload, "acceptForSession").action === "accept"
         ? [
             {
@@ -157,18 +171,39 @@ export function describeMcpElicitation(
             },
           ]
         : []),
-      ...(persistenceOptions.has("acceptAlways") &&
-      toMcpElicitationResponse(payload, "acceptAlways").action === "accept"
-        ? [
-            {
-              decision: "acceptAlways" as const,
-              label: persistenceOptions.get("acceptAlways") || "Always allow",
-            },
-          ]
-        : []),
       { decision: "accept", label: "Approve" },
     ],
   };
+}
+
+const McpToolApprovalMetadata = Schema.Struct({
+  codex_approval_kind: Schema.Literal("mcp_tool_call"),
+  tool_name: Schema.optionalKey(NullableMcpElicitationString),
+  tool_title: Schema.optionalKey(NullableMcpElicitationString),
+  tool_params: Schema.Json,
+});
+const isMcpToolApprovalMetadata = Schema.is(McpToolApprovalMetadata);
+
+/**
+ * The MCP tool call a Codex tool approval asks about, from the request's own
+ * metadata: its server, tool and exact arguments. Undefined for any other
+ * elicitation, so an approval never borrows the arguments of another call.
+ */
+export function mcpToolApprovalTarget(
+  payload: EffectCodexSchema.McpServerElicitationRequestParams,
+):
+  | {
+      readonly server: string;
+      readonly tool: string | undefined;
+      readonly title: string | undefined;
+      readonly arguments: Schema.Json;
+    }
+  | undefined {
+  if (payload.mode === "url" || !isMcpToolApprovalMetadata(payload._meta)) return undefined;
+  const meta = payload._meta;
+  const tool = meta.tool_name?.trim() || undefined;
+  const title = meta.tool_title?.trim() || undefined;
+  return { server: payload.serverName, tool, title, arguments: meta.tool_params };
 }
 
 /** Converts a Stark approval decision into the MCP elicitation wire response. */
@@ -201,12 +236,13 @@ export function toMcpElicitationResponse(
         : /once|accept|approve|allow/i.test(option.value) &&
           mcpElicitationPersistenceDecision(option.value) === null,
     );
+    // Only fields the approval itself answers are filled. A default is a
+    // value the user never saw, so a required field without an answer
+    // declines the request instead.
     if (chosenOption) {
       content[key] = chosenOption.value;
     } else if (field.type === "boolean" && isMcpElicitationPersistenceField(key, field)) {
       content[key] = decision === "acceptAlways";
-    } else if (field.default !== undefined && field.default !== null) {
-      content[key] = field.default;
     }
   }
 

@@ -80,7 +80,7 @@ it("marks only the visible selected child and keeps attention discoverable while
   panels.auxiliaryPanelByThreadKey[parentKey] = "side-work";
   const waiting = [{ ...children[0]!, hasPendingUserInput: true }, children[1]!];
   await render(waiting);
-  expect(container.querySelector('[title="Needs you"]')).not.toBeNull();
+  expect(container.querySelector('[role="img"][aria-label="Needs you"]')).not.toBeNull();
   await toggle();
   expect(container.querySelector('[aria-current="true"]')?.textContent).toBe("Do we need SNS?");
   panels.auxiliaryPanelByThreadKey[parentKey] = "pages";
@@ -103,7 +103,7 @@ it("keeps a failed child visible as an attention hint even before expanding", as
       },
     },
   ]);
-  expect(container.querySelector('[title="Needs attention"]')).not.toBeNull();
+  expect(container.querySelector('[role="img"][aria-label="Needs attention"]')).not.toBeNull();
   expect(container.querySelector("button[aria-expanded]")?.getAttribute("aria-expanded")).toBe(
     "false",
   );

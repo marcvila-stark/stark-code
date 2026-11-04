@@ -42,6 +42,7 @@ export function HtmlRenderDialog(props: {
                 title={props.title}
                 threadRef={props.threadRef}
                 className="block size-full"
+                onEscape={props.onClose}
               />
             </div>
           </div>

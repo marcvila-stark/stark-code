@@ -31,6 +31,14 @@ export const UPDATE_SET_CHANNEL_CHANNEL = "desktop:update-set-channel";
 export const UPDATE_DOWNLOAD_CHANNEL = "desktop:update-download";
 export const UPDATE_INSTALL_CHANNEL = "desktop:update-install";
 export const UPDATE_CHECK_CHANNEL = "desktop:update-check";
+export const UPDATE_CANCEL_DOWNLOAD_CHANNEL = "desktop:update-cancel-download";
+export const UPDATE_SET_POSTPONED_CHANNEL = "desktop:update-set-postponed";
+/** Main -> renderer: save drafts and confirm before an update restart. */
+export const UPDATE_RESTART_PREPARE_CHANNEL = "desktop:update-restart-prepare";
+/** Main -> renderer: the restart did not happen; lift the save barrier. */
+export const UPDATE_RESTART_RELEASE_CHANNEL = "desktop:update-restart-release";
+export const UPDATE_RESTART_ACK_CHANNEL = "desktop:update-restart-ack";
+export const UPDATE_RESTART_REGISTER_CHANNEL = "desktop:update-restart-register";
 export const CLI_COMMAND_GET_STATE_CHANNEL = "desktop:cli-command-get-state";
 export const CLI_COMMAND_INSTALL_CHANNEL = "desktop:cli-command-install";
 export const CLI_COMMAND_UNINSTALL_CHANNEL = "desktop:cli-command-uninstall";
@@ -134,3 +142,7 @@ export const DICTATION_START_CHANNEL = "desktop:dictation-start";
 export const DICTATION_STOP_CHANNEL = "desktop:dictation-stop";
 export const DICTATION_CANCEL_CHANNEL = "desktop:dictation-cancel";
 export const DICTATION_EVENT_CHANNEL = "desktop:dictation-event";
+
+export const BROWSER_CAPTURE_CHANNEL = "desktop:browser-capture";
+
+export const BROWSER_CAPTURE_PENDING_CHANNEL = "desktop:browser-capture-pending";

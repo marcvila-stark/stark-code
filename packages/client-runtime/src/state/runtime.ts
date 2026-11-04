@@ -741,6 +741,47 @@ export function createEnvironmentRpcQueryAtomFamily<
   });
 }
 
+/**
+ * A query for an RPC listed in `CLIENT_GUARDED_RPC_SCOPES`. Every fetch checks
+ * the destination's grant first, like a guarded command, and fails with
+ * `EnvironmentAuthorizationError` without it. Use the matching command
+ * permissions' `permissionAtom` to decide whether to show what it reads.
+ */
+export function createEnvironmentGuardedRpcQueryAtomFamily<
+  R,
+  ER,
+  TTag extends Extract<EnvironmentUnaryRpcTag, ClientGuardedRpcTag>,
+>(
+  runtime: Atom.AtomRuntime<EnvironmentRegistry.EnvironmentRegistry | R, ER>,
+  options: {
+    readonly label: string;
+    readonly tag: TTag;
+    readonly staleTimeMs?: number;
+    readonly idleTtlMs?: number;
+    readonly refreshTrigger?: (target: {
+      readonly environmentId: EnvironmentIdType;
+      readonly input: EnvironmentRpcInput<TTag>;
+    }) => Atom.Atom<unknown> | undefined;
+  },
+) {
+  return createEnvironmentQueryAtomFamily(runtime, {
+    label: options.label,
+    ...(options.staleTimeMs === undefined ? {} : { staleTimeMs: options.staleTimeMs }),
+    ...(options.idleTtlMs === undefined ? {} : { idleTtlMs: options.idleTtlMs }),
+    ...(options.refreshTrigger === undefined ? {} : { refreshTrigger: options.refreshTrigger }),
+    execute: (input: EnvironmentRpcInput<TTag>) =>
+      Effect.gen(function* () {
+        const registry = yield* AtomRegistry.AtomRegistry;
+        return yield* requestGuarded(options.tag, input).pipe(
+          Effect.provideService(RpcPermissionGuard, {
+            authorize: (id, method, payload) =>
+              createCommandPermissions(runtime, method).authorize(registry, id, payload),
+          }),
+        );
+      }),
+  });
+}
+
 export function createEnvironmentRpcSubscriptionAtomFamily<
   R,
   ER,

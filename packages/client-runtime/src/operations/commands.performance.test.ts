@@ -27,6 +27,7 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import * as RpcSession from "../rpc/session.ts";
+import { RpcPermissionGuard } from "../rpc/client.ts";
 import { v2Now, v2Projection, v2ThreadId } from "../state/orchestrationV2TestFixtures.ts";
 import { startThreadTurn } from "./commands.ts";
 
@@ -280,6 +281,10 @@ describe("routine command transport budget", () => {
       });
       expect(currentRpcJsonBytes).toBeLessThanOrEqual(MAX_CURRENT_SEND_RPC_JSON_BYTES);
       expect(currentRpcJsonBytes / formerRpcJsonBytes).toBeLessThanOrEqual(0.000_06);
-    }).pipe(Effect.provide(layerTestCrypto)),
+    }).pipe(
+      Effect.provide(layerTestCrypto),
+      // Measure transport after the shared command boundary has authorized it.
+      Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
+    ),
   );
 });

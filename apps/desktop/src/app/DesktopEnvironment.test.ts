@@ -73,7 +73,10 @@ describe("DesktopEnvironment", () => {
       assert.equal(environment.appDataDirectory, "/Users/alice/Library/Application Support");
       assert.equal(environment.baseDir, "/tmp/stark-code");
       assert.equal(environment.stateDir, "/tmp/stark-code/userdata");
-      assert.equal(environment.desktopSettingsPath, "/tmp/stark-code/userdata/desktop-settings.json");
+      assert.equal(
+        environment.desktopSettingsPath,
+        "/tmp/stark-code/userdata/desktop-settings.json",
+      );
       assert.equal(environment.clientSettingsPath, "/tmp/stark-code/userdata/client-settings.json");
       assert.equal(
         environment.savedEnvironmentRegistryPath,

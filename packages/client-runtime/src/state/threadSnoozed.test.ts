@@ -98,6 +98,12 @@ describe("effectiveSnoozed", () => {
     ).toBe(false);
   });
 
+  it("wakes early for a decision lost to a restart, like the server", () => {
+    const shell = { ...makeShell({ snoozedUntil: FUTURE_WAKE }), hasLostRuntimeRequest: true };
+    expect(effectiveSnoozed(shell, { now: NOW })).toBe(false);
+    expect(effectiveSnoozed({ ...shell, hasLostRuntimeRequest: false }, { now: NOW })).toBe(true);
+  });
+
   it("wakes early on a failure that happened after the snooze", () => {
     // makeShell stamps session.updatedAt at 11:00, after SNOOZED_AT (9:00).
     expect(

@@ -17,11 +17,15 @@ const PREVIEW_PANEL_MIN_WIDTH = 360;
  */
 const PREVIEW_PANEL_MAX_WIDTH_FRACTION = 0.7;
 /**
- * Floor for the column beside the panel: below this the chat column's
- * composer overflows, so the panel yields instead.
+ * Reserve enough room for a readable reply and approval controls. If the
+ * workspace cannot fit both minimums, its owner presents the panel as a sheet.
  */
-const SIBLING_COLUMN_MIN_WIDTH = 360;
-const PREVIEW_PANEL_DEFAULT_WIDTH = 540;
+const SIBLING_COLUMN_MIN_WIDTH = 560;
+const PREVIEW_PANEL_DEFAULT_WIDTH = 460;
+
+export function canFitInlinePreviewPanel(containerWidth: number): boolean {
+  return containerWidth >= PREVIEW_PANEL_MIN_WIDTH + SIBLING_COLUMN_MIN_WIDTH;
+}
 
 export function usePreviewPanelInlineSize(
   hostRef?: RefObject<HTMLElement | null>,
@@ -91,7 +95,7 @@ export function getPreviewPanelMaxWidth(viewportWidth: number, containerWidth?: 
   const containerCap =
     containerWidth === undefined ? Infinity : Math.floor(containerWidth) - SIBLING_COLUMN_MIN_WIDTH;
   // Never below the panel's own minimum: when the row cannot fit both
-  // columns' minimums the sibling yields, and useResizableWidth's clamp must
+  // columns' minimums the owner switches to a sheet, and useResizableWidth's clamp must
   // not see max < min (it would resolve the inversion to min and, via
   // drag-end persistence, overwrite the user's stored width).
   return Math.max(PREVIEW_PANEL_MIN_WIDTH, Math.min(fractionCap, containerCap));

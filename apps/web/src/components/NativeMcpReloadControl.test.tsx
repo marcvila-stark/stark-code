@@ -53,9 +53,7 @@ it("offers an explicit Claude plugin reload command without running it or forcin
 });
 it("explains Codex's individual reconnect limitation and offers only its inspection command", async () => {
   await render("codex");
-  expect(document.body.textContent).toContain(
-    "no live MCP reload command in this terminal",
-  );
+  expect(document.body.textContent).toContain("no live MCP reload command in this terminal");
   expect(document.body.textContent).not.toContain("/reload-plugins");
   expect(document.body.textContent).not.toContain("/mcp reconnect");
   await click("Copy /mcp");

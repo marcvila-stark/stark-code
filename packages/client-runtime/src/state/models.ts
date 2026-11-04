@@ -63,6 +63,18 @@ export interface ThreadRuntimeSummary {
   readonly updatedAt: string;
 }
 
+/**
+ * Whether the latest run ended before its work finished: the user stopped it,
+ * or a restart or other interruption cut it. Unread markers say
+ * "Interrupted" for these instead of "Done", so a partial reply never reads
+ * as a finished one.
+ */
+export function threadRunEndedUnfinished(
+  run: Pick<ThreadRunSummary, "status"> | null | undefined,
+): boolean {
+  return run?.status === "cancelled" || run?.status === "interrupted";
+}
+
 export function threadRuntimeIsActive(runtime: ThreadRuntimeSummary | null | undefined): boolean {
   return runtime !== null && runtime !== undefined && threadRunStatusIsActive(runtime.status);
 }
@@ -110,6 +122,8 @@ export interface EnvironmentThreadShell {
   readonly latestUserAuthoredMessageAt?: string | null;
   readonly hasPendingApprovals: boolean;
   readonly hasPendingUserInput: boolean;
+  /** An approval or question lost to a restart, shutdown or provider exit is still owed. */
+  readonly hasLostRuntimeRequest?: boolean;
   readonly hasActionableProposedPlan: boolean;
   readonly pendingBackgroundTasks: ReadonlyArray<
     NonNullable<OrchestrationV2ThreadShell["pendingBackgroundTasks"]>[number]
@@ -261,6 +275,7 @@ export function presentThreadShell(
       thread.pendingRuntimeRequest.kind !== "user_input" &&
       thread.pendingRuntimeRequest.kind !== "auth_refresh",
     hasPendingUserInput: thread.pendingRuntimeRequest?.kind === "user_input",
+    hasLostRuntimeRequest: (thread.lostRuntimeRequest ?? null) !== null,
     hasActionableProposedPlan: thread.hasActionableProposedPlan,
     pendingBackgroundTasks: thread.pendingBackgroundTasks ?? [],
     providerInstanceHistory: thread.providerInstanceHistory ?? [],

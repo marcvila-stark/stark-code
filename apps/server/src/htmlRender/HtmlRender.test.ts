@@ -1,7 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off - plain local servers stand in for LAN services.
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
-import { ThreadId } from "@starkfuture/contracts";
+import {
+  EnvironmentId,
+  ProviderInstanceId,
+  ThreadId,
+  type PreviewBrowserStatus,
+} from "@starkfuture/contracts";
 import * as HostProcess from "@starkfuture/shared/HostProcess";
 import {
   HTML_RENDER_MEASURE_FONTS,
@@ -23,6 +28,7 @@ import * as NodeURL from "node:url";
 
 import { resolveAttachmentPathById } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ClaudeAdapterV2 from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as HtmlRender from "./HtmlRender.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 
@@ -35,19 +41,17 @@ const layerHtmlRender = (
   installed: Effect.Effect<Option.Option<string>> = Effect.succeed(
     Option.fromUndefinedOr(executable),
   ),
+  status: PreviewBrowserStatus = { state: "not-installed", totalBytes: 99_221_129 },
 ) =>
   HtmlRender.layer.pipe(
     Layer.provide(
-      Layer.succeed(
-        PreviewBrowser.PreviewBrowser,
-        PreviewBrowser.PreviewBrowser.of({
-          executable:
-            executable === undefined
-              ? Effect.die("This test has no preview browser.")
-              : Effect.succeed(executable),
-          installed,
-        }),
-      ),
+      Layer.mock(PreviewBrowser.PreviewBrowser)({
+        // Agent tools must never reach the installing path.
+        executable: Effect.die("HTML previews must not install the browser."),
+        install: Effect.die("HTML previews must not install the browser."),
+        installed,
+        status: Effect.succeed(status),
+      }),
     ),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "stark-html-render-" })),
     Layer.provideMerge(NodeServices.layer),
@@ -172,6 +176,48 @@ describe("HtmlRender", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  // Stark reads these images itself, outside any provider's read rules, so the
+  // byte check is the boundary: a link to a secret under an image name stays out.
+  it.effect("keeps a symlink named like an image out of the page when it leads to other data", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "stark-html-images-" });
+      const env = path.join(directory, ".env");
+      yield* fileSystem.writeFileString(env, "API_KEY=abc123");
+      const disguised = path.join(directory, "avatar.png");
+      yield* fileSystem.symlink(env, disguised);
+
+      const error = yield* htmlRender.prepare(`<img src="${disguised}">`).pipe(Effect.flip);
+
+      expect(error._tag === "HtmlRenderImagesNotFoundError" && error.paths).toEqual([disguised]);
+      expect(JSON.stringify(error)).not.toContain("abc123");
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it("stays out of the Stark tools Claude may run without asking", () => {
+    const overrides = ClaudeAdapterV2.claudeMcpQueryOverrides({
+      mcpSession: {
+        environmentId: EnvironmentId.make("environment-html-render"),
+        threadId: ThreadId.make("thread-html-render"),
+        providerSessionId: "mcp-session-html-render",
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer html-render",
+        browserToolsAvailable: true,
+      },
+      readOnlySandbox: false,
+      // A legacy wildcard must not carry them in either.
+      allowedTools: ["mcp__stark-code__*"],
+    });
+    const preApproved = [
+      ...ClaudeAdapterV2.CLAUDE_READ_ONLY_STARK_MCP_ALLOWED_TOOLS,
+      ...(overrides.allowedTools ?? []),
+    ];
+    expect(preApproved.filter((tool) => /html_(render|preview)|\*/.test(tool))).toEqual([]);
+  });
+
   it.effect("publishes the prepared page as an html thread attachment", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -234,6 +280,27 @@ describe("HtmlRender", () => {
         ),
       );
     }),
+  );
+
+  it.effect.each([
+    {
+      status: { state: "not-installed", totalBytes: 99_221_129 },
+      says: "Settings → Agents & accounts → Setup doctor (about 99 MB)",
+    },
+    {
+      status: { state: "installing", totalBytes: 99_221_129, downloadedBytes: 63_000_000 },
+      says: "still installing (63 of 99 MB downloaded)",
+    },
+  ] as const)("previews without installing a browser that is $status.state", ({ status, says }) =>
+    Effect.gen(function* () {
+      const htmlRender = yield* HtmlRender.HtmlRender;
+
+      const error = yield* htmlRender.preview({ html: "<p>Flow</p>" }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({ _tag: "PreviewBrowserNotReadyError", status });
+      expect(error.message).toContain(says);
+      expect(error.message).toContain("```mermaid");
+    }).pipe(Effect.provide(layerHtmlRender(undefined, undefined, status))),
   );
 
   it.live(

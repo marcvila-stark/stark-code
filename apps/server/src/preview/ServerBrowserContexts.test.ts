@@ -83,6 +83,7 @@ describe("ServerBrowserContexts", () => {
     expect(browser.newContext).toHaveBeenCalledWith({
       viewport: { width: 1280, height: 800 },
       deviceScaleFactor: 2,
+      serviceWorkers: "block",
     });
     await pool.close();
     expect(browser.close).toHaveBeenCalledTimes(1);

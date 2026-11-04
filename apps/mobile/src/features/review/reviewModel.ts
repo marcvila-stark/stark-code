@@ -1,6 +1,9 @@
 import { parsePatchFiles } from "@pierre/diffs/utils/parsePatchFiles";
 import type { ChangeTypes, FileDiffMetadata } from "@pierre/diffs/types";
-import type { ThreadCheckpointSummary } from "@starkfuture/client-runtime/state/thread-checkpoints";
+import {
+  groupCheckpointFilesByOrigin,
+  type ThreadCheckpointSummary,
+} from "@starkfuture/client-runtime/state/thread-checkpoints";
 import type { ReviewDiffPreviewSource } from "@starkfuture/contracts";
 import * as Arr from "effect/Array";
 import { pipe } from "effect/Function";
@@ -103,7 +106,16 @@ function checkpointSubtitle(checkpoint: ThreadCheckpointSummary): string {
   if (checkpoint.status !== "ready") {
     return `Diff ${checkpoint.status}`;
   }
-  return `${fileCount} file${fileCount === 1 ? "" : "s"} changed`;
+  const groups = groupCheckpointFilesByOrigin(checkpoint.files);
+  if (groups.unknown.length === 0 && groups.outside.length === 0) {
+    return `${fileCount} file${fileCount === 1 ? "" : "s"} changed`;
+  }
+  // The checkpoint holds the whole folder; say how much of it the agent's edit tools wrote.
+  return [
+    ...(groups.agent.length > 0 ? [`${groups.agent.length} by the agent`] : []),
+    ...(groups.unknown.length > 0 ? [`${groups.unknown.length} source unknown`] : []),
+    ...(groups.outside.length > 0 ? [`${groups.outside.length} from outside the chat`] : []),
+  ].join(" · ");
 }
 
 function compareCheckpointTurnCountDescending(

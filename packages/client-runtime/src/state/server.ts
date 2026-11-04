@@ -25,6 +25,7 @@ import { AsyncResult, Atom } from "effect/reactivity";
 
 import {
   createAtomCommandScheduler,
+  createEnvironmentGuardedRpcQueryAtomFamily,
   createEnvironmentRpcCommand,
   createEnvironmentQueryAtomFamily,
   createEnvironmentRpcQueryAtomFamily,
@@ -980,6 +981,21 @@ export function createServerEnvironmentAtoms<R, E>(
     scheduler: configScheduler,
     concurrency: configConcurrency,
   });
+  /** Live scheduled-task list: snapshot on subscribe, fresh list after every server-side change. */
+  const scheduledTasksLive = createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+    label: "environment-data:server:scheduled-tasks:live",
+    tag: WS_METHODS.scheduledTasksSubscribe,
+  });
+  /**
+   * A task's newest runs. The server re-emits the task list after every run
+   * change, so the history refetches while that list is read. Only call it
+   * where `supportsScheduledTaskRuns` holds; older servers do not answer it.
+   */
+  const scheduledTaskRuns = createEnvironmentGuardedRpcQueryAtomFamily(runtime, {
+    label: "environment-data:server:scheduled-task:runs",
+    tag: WS_METHODS.scheduledTasksListRuns,
+    refreshTrigger: ({ environmentId }) => scheduledTasksLive({ environmentId, input: {} }),
+  });
 
   return {
     configValueAtom,
@@ -991,6 +1007,17 @@ export function createServerEnvironmentAtoms<R, E>(
     storageCleanupReport: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:storage-cleanup-report",
       tag: WS_METHODS.serverGetStorageCleanupReport,
+      idleTtlMs: 0,
+    }),
+    /** Installs the headless preview browser; only ever on the user's explicit request. */
+    installPreviewBrowser: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:install-preview-browser",
+      tag: WS_METHODS.serverInstallPreviewBrowser,
+      concurrency: { mode: "singleFlight", key: ({ environmentId }) => environmentId },
+    }),
+    previewBrowserStatus: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:preview-browser-status",
+      tag: WS_METHODS.serverGetPreviewBrowserStatus,
       idleTtlMs: 0,
     }),
     updateStateAtom,
@@ -1107,6 +1134,10 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:provider:forget-permission-rule",
       tag: WS_METHODS.providerForgetPermissionRule,
     }),
+    readEffectivePermissions: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:provider:effective-permissions",
+      tag: WS_METHODS.providerReadEffectivePermissions,
+    }),
     checkpointRestorePreview: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "server:checkpoint-restore-preview",
       tag: WS_METHODS.checkpointRollbackPreview,
@@ -1150,11 +1181,8 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:scheduled-task:webhook-delivery",
       tag: WS_METHODS.scheduledTasksGetWebhookDelivery,
     }),
-    /** Live scheduled-task list: snapshot on subscribe, fresh list after every server-side change. */
-    scheduledTasksLive: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
-      label: "environment-data:server:scheduled-tasks:live",
-      tag: WS_METHODS.scheduledTasksSubscribe,
-    }),
+    scheduledTasksLive,
+    scheduledTaskRuns,
     // A cold transcript scan is measured in seconds, so keep the result around
     // long enough that switching windows or re-rendering does not rescan.
     // Slow sources answer from cache first: that summary stays on screen, with

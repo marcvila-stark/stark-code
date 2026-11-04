@@ -295,6 +295,22 @@
       "types": "./src/state/threadRequests.ts",
       "default": "./src/state/threadRequests.ts"
     },
+    "./state/runtime-request-response": {
+      "types": "./src/state/runtimeRequestResponse.ts",
+      "default": "./src/state/runtimeRequestResponse.ts"
+    },
+    "./approvals/proposed-file-changes": {
+      "types": "./src/approvals/proposedFileChanges.ts",
+      "default": "./src/approvals/proposedFileChanges.ts"
+    },
+    "./approvals/tool-approval": {
+      "types": "./src/approvals/toolApproval.ts",
+      "default": "./src/approvals/toolApproval.ts"
+    },
+    "./approvals/permission-presentation": {
+      "types": "./src/approvals/permissionPresentation.ts",
+      "default": "./src/approvals/permissionPresentation.ts"
+    },
     "./state/thread-workflows": {
       "types": "./src/state/threadWorkflows.ts",
       "default": "./src/state/threadWorkflows.ts"
@@ -422,6 +438,18 @@
     "./state/response-visuals": {
       "types": "./src/state/responseVisuals.ts",
       "default": "./src/state/responseVisuals.ts"
+    },
+    "./state/review-chain": {
+      "types": "./src/state/reviewChain.ts",
+      "default": "./src/state/reviewChain.ts"
+    },
+    "./state/thread-workers": {
+      "types": "./src/state/threadWorkers.ts",
+      "default": "./src/state/threadWorkers.ts"
+    },
+    "./scheduled-task-runs": {
+      "types": "./src/scheduledTaskRuns.ts",
+      "default": "./src/scheduledTaskRuns.ts"
     }
   },
   "scripts": {

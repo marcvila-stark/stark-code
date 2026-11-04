@@ -1,4 +1,5 @@
 import { type RuntimeRequestId, type ScopedThreadRef } from "@starkfuture/contracts";
+import type { RuntimeRequestResponseState } from "@starkfuture/client-runtime/state/runtime-request-response";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { type PendingUserInput } from "../../session-logic";
 import {
@@ -10,6 +11,7 @@ import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collaps
 import { cn } from "~/lib/utils";
 import { ComposerBanner } from "./ComposerBanner";
 import ChatMarkdown from "../ChatMarkdown";
+import { RuntimeRequestResponseNotice } from "./RuntimeRequestResponseNotice";
 
 interface PendingUserInputPanelProps {
   pendingUserInputs: PendingUserInput[];
@@ -17,6 +19,10 @@ interface PendingUserInputPanelProps {
   cwd: string | undefined;
   threadRef: ScopedThreadRef;
   disabled?: boolean;
+  /** Whether the shown question can take an answer now; its caption sits above the options. */
+  responseState?: RuntimeRequestResponseState | null | undefined;
+  /** Sends an unconfirmed answer again under its original command. */
+  onRetryResponse?: ((requestId: RuntimeRequestId) => void) | undefined;
   respondingRequestIds: RuntimeRequestId[];
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
@@ -30,6 +36,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   cwd,
   threadRef,
   disabled = false,
+  responseState = null,
+  onRetryResponse,
   respondingRequestIds,
   answers,
   questionIndex,
@@ -48,6 +56,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       cwd={cwd}
       threadRef={threadRef}
       disabled={disabled}
+      responseState={responseState}
+      onRetryResponse={onRetryResponse}
       isResponding={respondingRequestIds.includes(activePrompt.requestId)}
       answers={answers}
       questionIndex={questionIndex}
@@ -63,6 +73,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   cwd,
   threadRef,
   disabled,
+  responseState,
+  onRetryResponse,
   isResponding,
   answers,
   questionIndex,
@@ -74,6 +86,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   cwd: string | undefined;
   threadRef: ScopedThreadRef;
   disabled: boolean;
+  responseState: RuntimeRequestResponseState | null;
+  onRetryResponse: ((requestId: RuntimeRequestId) => void) | undefined;
   isResponding: boolean;
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
@@ -255,6 +269,12 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       <CollapsiblePanel>
         <ComposerBanner.Scroll>
           <ComposerBanner.Body className="pe-1 pb-1 wrap-anywhere">
+            {responseState ? (
+              <RuntimeRequestResponseNotice
+                state={responseState}
+                onRetry={onRetryResponse ? () => onRetryResponse(prompt.requestId) : undefined}
+              />
+            ) : null}
             <ChatMarkdown
               text={activeQuestion.question}
               cwd={cwd}

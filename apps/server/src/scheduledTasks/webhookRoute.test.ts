@@ -27,6 +27,7 @@ import {
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { CLOUD_MINT_PUBLIC_KEY, RELAY_ISSUER_SECRET } from "../cloud/config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as MaintenanceGate from "../maintenance/MaintenanceGate.ts";
 import * as RelayDeliveryProof from "./RelayDeliveryProof.ts";
 import { WEBHOOK_MAX_BODY_BYTES } from "./webhookRoute.ts";
 import * as WebhookRoute from "./webhookRoute.ts";
@@ -76,10 +77,17 @@ const handlerFor = (
     request: WebhookTriggerRequest,
   ) => Effect.Effect<WebhookTriggerResult, ScheduledTaskError>,
   secrets: ReadonlyMap<string, string> = linkedSecrets,
+  admitsWebhooks: () => boolean = () => true,
 ) =>
   HttpRouter.toWebHandler(
     HttpApiBuilder.layer(WebhookTestApi).pipe(
       Layer.provide(WebhookRoute.layer),
+      Layer.provide(
+        Layer.succeed(MaintenanceGate.MaintenanceGate, {
+          ...MaintenanceGate.MaintenanceGate.defaultValue(),
+          admits: (source) => Effect.sync(() => source !== "webhook" || admitsWebhooks()),
+        }),
+      ),
       Layer.provide(RelayDeliveryProof.layer),
       Layer.provide(Layer.mock(ScheduledTaskService)({ triggerWebhook: trigger })),
       Layer.provide(
@@ -279,6 +287,37 @@ describe("webhook route", () => {
       expect(parents).toEqual(["0af7651916cd43dd8448eb211c80319c", undefined, undefined]);
     }),
   );
+
+  it("answers 503 with Retry-After during an update, then accepts the retry once", async () => {
+    let calls = 0;
+    let updating = true;
+    const { handler, dispose } = handlerFor(
+      () => {
+        calls += 1;
+        return Effect.succeed({
+          _tag: "accepted",
+          deliveryId: ScheduledTaskWebhookDeliveryId.make("delivery:after-update"),
+          outcome: "accepted",
+        });
+      },
+      linkedSecrets,
+      () => !updating,
+    );
+    try {
+      const refused = await handler(post("/api/hooks/scheduled-task%3Ahook/tok", "{}"));
+      expect(refused.status).toBe(503);
+      expect(refused.headers.get("retry-after")).toBe("60");
+      expect(refused.headers.get("x-stark-hook-outcome")).toBe("maintenance");
+      expect(calls).toBe(0);
+
+      updating = false;
+      const accepted = await handler(post("/api/hooks/scheduled-task%3Ahook/tok", "{}"));
+      expect(accepted.status).toBe(202);
+      expect(calls).toBe(1);
+    } finally {
+      await dispose();
+    }
+  });
 
   it("rejects oversized bodies and malformed paths before reaching the service", async () => {
     let calls = 0;

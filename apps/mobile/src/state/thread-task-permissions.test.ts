@@ -1,4 +1,13 @@
-import { AuthOrchestrationOperateScope, RuntimeRequestId } from "@starkfuture/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  CommandId,
+  OrchestrationV2DispatchCommandError,
+  type OrchestrationV2RuntimeRequest,
+  RuntimeRequestId,
+} from "@starkfuture/contracts";
+import { EnvironmentRpcUnavailableError } from "@starkfuture/client-runtime/rpc";
+import * as Cause from "effect/Cause";
+import * as Option from "effect/Option";
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import type { PendingThreadRequests } from "@starkfuture/client-runtime/state/thread-requests";
 import { AsyncResult, type Atom } from "effect/reactivity";
@@ -9,10 +18,17 @@ const state = vi.hoisted(() => ({
   connectionState: "connected",
   draft: { text: "Keep my draft", attachments: [] as DraftComposerImageAttachment[] },
   pendingRequests: { approvals: [], userInputs: [] } as PendingThreadRequests,
+  detail: {
+    status: "live" as string,
+    runtimeRequests: [] as ReadonlyArray<Partial<OrchestrationV2RuntimeRequest>>,
+  },
+  alert: vi.fn(),
   enqueue: vi.fn(async () => undefined),
   clearDraft: vi.fn(),
   approve: vi.fn(),
   answer: vi.fn(),
+  askAgain: vi.fn(),
+  dismissLost: vi.fn(),
   feedback: vi.fn(),
   updateSettings: vi.fn(),
   question: {
@@ -54,7 +70,7 @@ vi.mock("./preferences", async () => {
   const { Atom, AsyncResult } = await import("effect/reactivity");
   return { mobilePreferencesAtom: Atom.make(AsyncResult.success({})) };
 });
-vi.mock("react-native", () => ({ Alert: { alert: vi.fn() } }));
+vi.mock("react-native", () => ({ Alert: { alert: state.alert } }));
 vi.mock("@effect/atom-react", async () => {
   const { appAtomRegistry } = await import("./atom-registry");
   return { useAtomValue: <A>(atom: Atom.Atom<A>) => appAtomRegistry.get(atom) };
@@ -81,6 +97,11 @@ vi.mock("./use-thread-detail", () => ({
   useSelectedThreadProjection: () => null,
   useSelectedThreadVisibleTurnItems: () => [],
   useSelectedThreadPendingRequests: () => state.pendingRequests,
+  useSelectedThreadLostRequests: () => [],
+  useSelectedThreadDetailState: () => ({
+    status: state.detail.status,
+    data: Option.some({ runtimeRequests: state.detail.runtimeRequests }),
+  }),
 }));
 vi.mock("./use-atom-command", () => ({ useAtomCommand: <A>(command: A) => command }));
 vi.mock("./threads", async () => {
@@ -90,6 +111,8 @@ vi.mock("./threads", async () => {
     threadEnvironment: {
       respondToApproval: state.approve,
       respondToUserInput: state.answer,
+      askAgainLostRequests: state.askAgain,
+      dismissLostRequests: state.dismissLost,
       uploadFeedback: state.feedback,
     },
   };
@@ -152,6 +175,7 @@ beforeEach(() => {
   state.grantedEnvironments = new Set(["primary"]);
   state.connectionState = "connected";
   state.draft = { text: "Keep my draft", attachments: [] };
+  state.detail = { status: "live", runtimeRequests: [] };
   state.pendingRequests = {
     approvals: [
       {
@@ -166,6 +190,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   state.approve.mockResolvedValue(AsyncResult.success(undefined));
   state.answer.mockResolvedValue(AsyncResult.success(undefined));
+  state.askAgain.mockResolvedValue(AsyncResult.success(undefined));
+  state.dismissLost.mockResolvedValue(AsyncResult.success(undefined));
   state.feedback.mockResolvedValue(AsyncResult.success({ feedbackId: "feedback" }));
 });
 
@@ -226,6 +252,26 @@ describe("mobile task permissions", () => {
     });
   });
 
+  it("asks again for, or dismisses, only the named lost decisions on a granted environment", async () => {
+    const requests = useSelectedThreadRequests();
+    const lost = RuntimeRequestId.make("lost");
+    await requests.onAskAgainLostRequests([lost]);
+    await requests.onDismissLostRequests([lost]);
+    expect(state.askAgain).not.toHaveBeenCalled();
+    expect(state.dismissLost).not.toHaveBeenCalled();
+    state.grantedEnvironments.add("secondary");
+    await requests.onAskAgainLostRequests([lost]);
+    expect(state.askAgain).toHaveBeenCalledWith({
+      environmentId: "secondary",
+      input: { threadId: "thread", requestIds: ["lost"] },
+    });
+    await requests.onDismissLostRequests([lost, RuntimeRequestId.make("older")]);
+    expect(state.dismissLost).toHaveBeenCalledWith({
+      environmentId: "secondary",
+      input: { threadId: "thread", requestIds: ["lost", "older"] },
+    });
+  });
+
   it("keeps answer drafts editable after revocation while blocking their submission", async () => {
     state.pendingRequests = {
       approvals: [],
@@ -256,5 +302,70 @@ describe("mobile task permissions", () => {
       environmentId: "secondary",
       input: { threadId: "thread", requestId: "input", answers: { language: "TypeScript" } },
     });
+  });
+});
+
+describe("mobile answer failures", () => {
+  const rejection = new OrchestrationV2DispatchCommandError({
+    commandId: CommandId.make("command"),
+    commandType: "runtime-request.respond",
+    message: "Runtime request approval is resolved.",
+  });
+  const answer = async () => {
+    state.grantedEnvironments.add("secondary");
+    await useSelectedThreadRequests().onRespondToApproval(
+      RuntimeRequestId.make("approval"),
+      "accept",
+    );
+  };
+
+  it("explains a rejected answer from the live thread instead of the raw server text", async () => {
+    state.detail = {
+      status: "live",
+      runtimeRequests: [{ id: RuntimeRequestId.make("approval"), status: "resolved" }],
+    };
+    state.approve.mockResolvedValue(AsyncResult.failure(Cause.fail(rejection)));
+    await answer();
+    expect(state.alert).toHaveBeenCalledWith(
+      "Already answered",
+      "This request was already answered.",
+    );
+  });
+
+  it("keeps the server's reason while the thread is still syncing", async () => {
+    state.detail = {
+      status: "synchronizing",
+      runtimeRequests: [{ id: RuntimeRequestId.make("approval"), status: "resolved" }],
+    };
+    state.approve.mockResolvedValue(AsyncResult.failure(Cause.fail(rejection)));
+    await answer();
+    expect(state.alert).toHaveBeenCalledWith(
+      "Your answer was not accepted",
+      "Runtime request approval is resolved.",
+    );
+  });
+
+  it("says an answer tapped without a connection was not sent", async () => {
+    state.approve.mockResolvedValue(
+      AsyncResult.failure(
+        Cause.fail(
+          new EnvironmentRpcUnavailableError({
+            environmentId: "secondary",
+            message: "Secondary is not connected.",
+          }),
+        ),
+      ),
+    );
+    await answer();
+    expect(state.alert).toHaveBeenCalledWith(
+      "Not connected",
+      "Your answer was not sent. Try again once the connection is back.",
+    );
+  });
+
+  it("stays quiet when the answer is accepted", async () => {
+    await answer();
+    expect(state.approve).toHaveBeenCalledTimes(1);
+    expect(state.alert).not.toHaveBeenCalled();
   });
 });

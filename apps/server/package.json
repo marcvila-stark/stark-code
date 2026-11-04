@@ -3,6 +3,11 @@
   "version": "0.0.45",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/starkfuture/stark-code.git",
+    "directory": "apps/server"
+  },
   "bin": {
     "stark-code": "./dist/bin.mjs"
   },

@@ -1,6 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off - Tests use Node's glob matcher to verify electron-builder exclusions.
 import * as NodeCrypto from "node:crypto";
+import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
+import * as NodeZlib from "node:zlib";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { extractFile } from "@electron/asar";
@@ -11,9 +13,12 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+// plist is CommonJS; Node cannot load its named exports from an ES module.
+import Plist from "plist";
 
 import {
   BundleNotSelfContainedError,
@@ -61,7 +66,7 @@ import {
   resolveResourceMonitorRustTargets,
   resolveWindowsServerAsarIgnoreGlobs,
   resourceMonitorExecutableName,
-  resolveGitHubPublishConfig,
+  resourceMonitorReleaseEnvironment,
   resolveMockUpdateServerPort,
   resolveMockUpdateServerUrl,
   resolvePackageManagerUserAgent,
@@ -96,8 +101,58 @@ import {
   WSL_RUNTIME_EXTRA_RESOURCES,
   WslRuntimeArchiveMissingError,
   wslRuntimeArchiveStem,
+  ConflictingMacSigningCredentialsError,
+  IncompleteMacSigningCredentialsError,
+  InvalidMacSigningIdentityNameError,
+  InvalidMacSigningModeError,
+  InvalidMacSigningTeamIdError,
+  MAC_ENTITLEMENTS_FILE_NAME,
+  MacNotarizationCommandError,
+  MacReleaseVerificationError,
+  MacSigningIdentityMismatchError,
+  MacSigningIdentityNotFoundError,
+  MacSigningModeRequiresSignedBuildError,
+  MissingMacNotarizationCredentialsError,
+  MissingMacNotarizationKeyFileError,
+  MissingMacSigningIdentityError,
+  NOTARIZED_DEVELOPER_ID_SOURCE,
+  RELEASE_PROOF_FILE_NAME,
+  DESKTOP_UPDATE_KIND_HOOK,
+  DesktopUpdateFeedConfigError,
+  NO_DESKTOP_UPDATE_FEED,
+  PackagedDesktopUpdateFeedError,
+  checkDesktopUpdateFeedSigning,
+  createBakedUpdatePolicy,
+  describeDesktopReleaseFeed,
+  removePublishDetectionEnv,
+  resolveDesktopPublishConfig,
+  resolveDesktopUpdateFeedPlan,
+  verifyMacDesignatedRequirement,
+  verifyPackagedUpdateFeed,
+  classifyMacSigningCertificate,
+  createDesktopReleaseProof,
+  finalizeMacDmg,
+  findMacAppVerificationFailures,
+  isGatekeeperNotarized,
+  isMacPasskeySigningRequested,
+  isStaplerValidation,
+  macPackagedAppDirectoryName,
+  parseGatekeeperAssessment,
+  parseMacCodeSignature,
+  parseMacSigningIdentities,
+  parseNotarySubmission,
+  preflightMacSigning,
+  removeUnusedSigningCredentials,
+  resolveMacSigningPlan,
+  selectMacSigningIdentity,
+  verifyMacSignedApp,
+  writeDesktopReleaseProof,
+  type DesktopUpdateFeedPlan,
+  type MacSigningPlan,
 } from "./build-desktop-artifact.ts";
+import { afterPack, withUpdateFeedKind } from "./bake-desktop-update-kind.ts";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import type { UpdateOwnership } from "./lib/update-feed-ownership.ts";
 import * as HostProcess from "@starkfuture/shared/HostProcess";
 import { symlinksSupported } from "@starkfuture/shared/testing/symlinks";
 
@@ -144,7 +199,7 @@ const makeLinuxCliArchiveFixture = Effect.fn("test.makeLinuxCliArchiveFixture")(
   return archivePath;
 });
 
-function mockProcess(exitCode: number, stdout = "") {
+function mockProcess(exitCode: number, stdout = "", stderr = "") {
   const encodedStdout = new TextEncoder().encode(stdout);
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(1),
@@ -154,12 +209,67 @@ function mockProcess(exitCode: number, stdout = "") {
     unref: Effect.succeed(Effect.void),
     stdin: Sink.drain,
     stdout: stdout ? Stream.make(encodedStdout) : Stream.empty,
-    stderr: Stream.empty,
+    stderr: stderr ? Stream.make(new TextEncoder().encode(stderr)) : Stream.empty,
     all: Stream.empty,
     getInputFd: () => Sink.drain,
     getOutputFd: () => Stream.empty,
   });
 }
+
+function macToolSpawnerLayer(
+  commands: Array<ReadonlyArray<string>>,
+  respond: (
+    command: ReadonlyArray<string>,
+  ) => Effect.Effect<
+    { readonly exitCode?: number; readonly stdout?: string; readonly stderr?: string },
+    PlatformError.PlatformError
+  >,
+) {
+  return Layer.succeed(
+    ChildProcessSpawner.ChildProcessSpawner,
+    ChildProcessSpawner.make((command) => {
+      const childProcess = command as unknown as {
+        readonly command: string;
+        readonly args: ReadonlyArray<string>;
+      };
+      const invocation = [childProcess.command, ...childProcess.args];
+      commands.push(invocation);
+      return respond(invocation).pipe(
+        Effect.map((result) => mockProcess(result.exitCode ?? 0, result.stdout, result.stderr)),
+      );
+    }),
+  );
+}
+
+const DEVELOPER_ID_CODESIGN_DISPLAY = `Executable=/stage/dist/mac-arm64/Stark Code (Alpha).app/Contents/MacOS/Stark Code (Alpha)
+Identifier=com.starkfuture.starkcode
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=27+7 location=embedded
+Signature size=9045
+Authority=Developer ID Application: Stark Future GmbH (ABCDE12345)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=29 Oct 2026 at 10:15:03
+Info.plist entries=31
+TeamIdentifier=ABCDE12345
+Runtime Version=15.0.0
+Sealed Resources version=2 rules=13 files=1840
+Internal requirements count=1 size=224`;
+
+const DEVELOPMENT_CODESIGN_DISPLAY = `Executable=/stage/dist/mac-arm64/Stark Code (Alpha).app/Contents/MacOS/Stark Code (Alpha)
+Identifier=com.starkfuture.starkcode
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=27+7 location=embedded
+Signature size=4789
+Authority=Apple Development: Jane Doe (ABCDE12345)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+Signed Time=29 Oct 2026 at 10:15:03
+Info.plist entries=31
+TeamIdentifier=ABCDE12345
+Runtime Version=15.0.0
+Sealed Resources version=2 rules=13 files=1840
+Internal requirements count=1 size=212`;
 
 function iconResizeSpawnerLayer(
   commands: Array<{ readonly command: string; readonly args: ReadonlyArray<string> }>,
@@ -269,6 +379,15 @@ const makeWindowsPayloadFixture = Effect.fn("test.makeWindowsPayloadFixture")(fu
   } as const;
 });
 
+const FEED_OWNERSHIP: UpdateOwnership = {
+  bundleId: "com.starkfuture.starkcode",
+  appleTeamId: "ABCDE12345",
+  updateFeedOrigins: ["https://updates.stark.test"],
+  updateChannels: ["latest"],
+};
+const STARK_FEED = { kind: "stark", url: "https://updates.stark.test/stark-code/mac/" } as const;
+const MOCK_FEED = { kind: "mock", url: "http://localhost:3123/" } as const;
+
 it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   it("resolves the dedicated nightly updater channel from nightly versions", () => {
     assert.equal(resolveDesktopUpdateChannel("0.0.17-nightly.20260413.42"), "nightly");
@@ -299,95 +418,357 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     assert.equal(resolveDesktopWebAssetBrand("0.0.17-nightly.20260413.42"), "nightly");
   });
 
-  it.effect("resolves GitHub desktop publish config from Effect config", () =>
+  it.effect("resolves the update feed only from explicit configuration", () =>
     Effect.gen(function* () {
-      const latestConfig = yield* resolveGitHubPublishConfig("latest").pipe(
-        Effect.provide(
-          ConfigProvider.layer(
-            ConfigProvider.fromEnv({
-              env: {
-                STARK_CODE_DESKTOP_UPDATE_REPOSITORY: "example/stark-code",
-              },
-            }),
-          ),
-        ),
+      const resolve = (
+        input: Partial<Parameters<typeof resolveDesktopUpdateFeedPlan>[0]>,
+        ownership: UpdateOwnership = FEED_OWNERSHIP,
+      ) =>
+        resolveDesktopUpdateFeedPlan(
+          {
+            mode: undefined,
+            url: undefined,
+            repository: undefined,
+            mockUpdates: false,
+            mockUpdateServerPort: undefined,
+            signed: false,
+            ...input,
+          },
+          ownership,
+        );
+      const refusal = (input: Partial<Parameters<typeof resolveDesktopUpdateFeedPlan>[0]>) =>
+        resolve(input).pipe(Effect.flip);
+
+      assert.deepStrictEqual(yield* resolve({}), { kind: "none" });
+      assert.deepStrictEqual(yield* resolve({ signed: true, mode: " none " }), { kind: "none" });
+      assert.deepStrictEqual(
+        yield* resolve({ signed: true, mode: "stark", url: STARK_FEED.url }),
+        STARK_FEED,
       );
-      const nightlyConfig = yield* resolveGitHubPublishConfig("nightly").pipe(
-        Effect.provide(
-          ConfigProvider.layer(
-            ConfigProvider.fromEnv({
-              env: {
-                GITHUB_REPOSITORY: "example/stark-code",
-              },
-            }),
-          ),
-        ),
+      assert.deepStrictEqual(yield* resolve({ mode: "mock" }), {
+        kind: "mock",
+        url: "http://localhost:3000/",
+      });
+      assert.deepStrictEqual(yield* resolve({ mockUpdates: true, mockUpdateServerPort: 3123 }), {
+        kind: "mock",
+        url: "http://localhost:3123/",
+      });
+
+      // A rehearsal bakes its own profile and fault into a mock build only.
+      assert.deepStrictEqual(
+        yield* resolve({
+          mode: "mock",
+          mockUpdateServerPort: 3123,
+          rehearsalProfile: "/tmp/rehearsal/profile",
+          rehearsalFault: "migration-fail",
+        }),
+        {
+          kind: "mock",
+          url: "http://localhost:3123/",
+          rehearsal: { profile: "/tmp/rehearsal/profile", fault: "migration-fail" },
+        },
+      );
+      assert.deepStrictEqual(
+        createBakedUpdatePolicy(
+          {
+            kind: "mock",
+            url: "http://localhost:3123/",
+            rehearsal: { profile: "/tmp/rehearsal/profile", fault: null },
+          },
+          "0.0.46-alpha.2",
+          FEED_OWNERSHIP,
+        ).rehearsal,
+        { profile: "/tmp/rehearsal/profile", fault: null },
       );
 
-      assert.deepStrictEqual(latestConfig, {
-        provider: "github",
-        owner: "example",
-        repo: "starkcode",
-        releaseType: "release",
-      });
-      assert.deepStrictEqual(nightlyConfig, {
-        provider: "github",
-        owner: "example",
-        repo: "starkcode",
-        releaseType: "prerelease",
-        channel: "nightly",
-      });
+      // Malformed or contradictory input is a typed error, never a silent default.
+      const reasons: Array<[Partial<Parameters<typeof resolveDesktopUpdateFeedPlan>[0]>, string]> =
+        [
+          [{ signed: true }, "mode-required"],
+          [{ mode: "github" }, "invalid-mode"],
+          [{ mode: "STARK" }, "invalid-mode"],
+          [{ repository: "pingdotgg/t3code" }, "repository-removed"],
+          [{ repository: "starkfuture/stark-code", mode: "none" }, "repository-removed"],
+          [{ mode: "stark" }, "url-required"],
+          [{ mode: "none", url: STARK_FEED.url }, "url-not-allowed"],
+          [{ mode: "mock", url: STARK_FEED.url }, "url-not-allowed"],
+          [
+            { mockUpdates: true, mode: "stark", url: STARK_FEED.url },
+            "conflicts-with-mock-updates",
+          ],
+          [{ mockUpdates: true, mode: "none" }, "conflicts-with-mock-updates"],
+          [{ rehearsalProfile: "/tmp/profile" }, "rehearsal-not-mock"],
+          [
+            { mode: "stark", url: STARK_FEED.url, rehearsalFault: "migration-fail" },
+            "rehearsal-not-mock",
+          ],
+          [{ mode: "mock", rehearsalProfile: "relative/profile" }, "rehearsal-profile-invalid"],
+          [{ mode: "mock", rehearsalFault: "wipe-disk" }, "rehearsal-fault-invalid"],
+        ];
+      for (const [input, reason] of reasons) {
+        assert.equal((yield* refusal(input)).reason, reason, JSON.stringify(input));
+      }
+      const urlProblems: Array<[string, string]> = [
+        ["http://updates.stark.test/stark-code/", "not-https"],
+        ["http://localhost:3123/", "not-https"],
+        ["https://github.com/pingdotgg/t3code/releases/", "origin-not-allowed"],
+        ["https://user:secret@updates.stark.test/stark-code/", "credentials"],
+        ["https://updates.stark.test/stark-code/?channel=beta", "query-or-fragment"],
+        ["https://updates.stark.test/stark-code", "not-a-directory"],
+        ["https://localhost/stark-code/", "loopback"],
+      ];
+      for (const [url, problem] of urlProblems) {
+        const error = yield* refusal({ mode: "stark", url });
+        assert.equal(error.reason, "url-invalid", url);
+        assert.equal(error.urlProblem, problem, url);
+        assert.notInclude(error.message, "secret");
+      }
+
+      // stark.brand.json allowlists no origin until hosting is approved, so
+      // every Stark feed fails closed today.
+      const today = yield* resolveDesktopUpdateFeedPlan({
+        mode: "stark",
+        url: STARK_FEED.url,
+        repository: undefined,
+        mockUpdates: false,
+        mockUpdateServerPort: undefined,
+        signed: true,
+      }).pipe(Effect.flip);
+      assert.equal(today.urlProblem, "origin-not-allowed");
+      assert.include(today.message, "updateFeedOrigins");
     }),
   );
 
-  it.effect("omits update feeds for pull request preview builds", () =>
+  it.effect("writes publish: null for every build without a feed, preview and PR builds", () =>
     Effect.gen(function* () {
-      const preview = yield* createBuildConfig(
+      const builds = [
+        ["mac", "dmg", "0.0.46"],
+        ["mac", "dmg", "0.0.46-beta.1"],
+        ["mac", "dmg", "0.0.33-pr.8182.1"],
+        ["mac", "dmg", "0.0.41-preview.20260912.1589"],
+        ["linux", "AppImage", "0.0.46"],
+        ["win", "nsis", "0.0.46"],
+      ] as const;
+      for (const [platform, target, version] of builds) {
+        const config = yield* createBuildConfig(
+          platform,
+          target,
+          version,
+          false,
+          NO_DESKTOP_UPDATE_FEED,
+          undefined,
+        );
+        // null, never an omitted key: electron-builder derives a feed for undefined.
+        assert.property(config, "publish");
+        assert.isNull(config.publish, `${platform} ${version}`);
+        assert.isNull(
+          (config[platform] as Record<string, unknown>).publish,
+          `${platform} ${version}`,
+        );
+        assert.notProperty(config, "afterPack");
+      }
+
+      const stark = yield* createBuildConfig(
         "mac",
         "dmg",
-        "0.0.33-pr.8182.1",
-        false,
-        false,
-        undefined,
+        "0.0.47-beta.1",
+        true,
+        STARK_FEED,
         undefined,
       );
-      const release = yield* createBuildConfig(
-        "mac",
-        "dmg",
-        "0.0.33",
-        false,
-        false,
-        undefined,
-        undefined,
+      const starkPublish = [{ provider: "generic", url: STARK_FEED.url, channel: "latest" }];
+      assert.deepStrictEqual(stark.publish, starkPublish);
+      assert.deepStrictEqual((stark.mac as Record<string, unknown>).publish, starkPublish);
+      assert.isTrue(String(stark.afterPack).endsWith(DESKTOP_UPDATE_KIND_HOOK));
+      const fs = yield* FileSystem.FileSystem;
+      assert.isTrue(
+        yield* fs.exists(NodePath.join(import.meta.dirname, "..", DESKTOP_UPDATE_KIND_HOOK)),
       );
 
-      const previewChannel = yield* createBuildConfig(
-        "mac",
-        "dmg",
-        "0.0.41-preview.20260912.1589",
-        false,
-        false,
-        undefined,
-        undefined,
-      );
+      const refusals: Array<["mac" | "linux" | "win", string, string]> = [
+        ["mac", "0.0.33-pr.8182.1", "preview-version"],
+        ["mac", "0.0.41-preview.20260912.1589", "preview-version"],
+        ["mac", "0.0.47-nightly.20261030.1", "channel-not-enabled"],
+        ["linux", "0.0.47", "not-mac"],
+        ["win", "0.0.47", "not-mac"],
+      ];
+      for (const [platform, version, reason] of refusals) {
+        const error = yield* resolveDesktopPublishConfig(platform, version, STARK_FEED).pipe(
+          Effect.flip,
+        );
+        assert.equal(error.reason, reason, `${platform} ${version}`);
+      }
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
 
-      assert.notProperty(preview, "publish");
-      assert.notProperty(previewChannel, "publish");
-      assert.deepStrictEqual(release.publish, [
-        {
-          provider: "github",
-          owner: "example",
-          repo: "starkcode",
-          releaseType: "release",
-        },
-      ]);
-    }).pipe(
-      Effect.provide(
-        ConfigProvider.layer(
-          ConfigProvider.fromEnv({ env: { GITHUB_REPOSITORY: "example/stark-code" } }),
-        ),
-      ),
-    ),
+  it.effect(
+    "leaves the installed electron-builder no feed to derive from a hostile environment",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // The installed library, not a copy of its rules: an upgrade that
+          // changes how it derives a publisher fails here.
+          const desktopRequire = NodeModule.createRequire(
+            NodePath.join(import.meta.dirname, "../apps/desktop/package.json"),
+          );
+          const builderRequire = NodeModule.createRequire(
+            desktopRequire.resolve("electron-builder"),
+          );
+          const { getAppUpdatePublishConfiguration } = builderRequire(
+            "app-builder-lib/out/publish/PublishManager.js",
+          ) as {
+            getAppUpdatePublishConfiguration(
+              packager: unknown,
+              targetSpecificOptions: null,
+              arch: number,
+              errorIfCannot: boolean,
+            ): Promise<Record<string, unknown> | null>;
+          };
+          const { getRepositoryInfo } = builderRequire(
+            "app-builder-lib/out/util/repositoryInfo.js",
+          ) as {
+            getRepositoryInfo(
+              projectDir: string,
+              metadata: Record<string, unknown> | null,
+              devMetadata: Record<string, unknown> | null,
+            ): Promise<unknown>;
+          };
+          const fs = yield* FileSystem.FileSystem;
+          const stage = yield* fs.makeTempDirectoryScoped({ prefix: "stark-publish-probe-" });
+
+          const hostileEnv: Record<string, string> = {
+            GH_TOKEN: "token",
+            GITHUB_TOKEN: "token",
+            GITLAB_TOKEN: "token",
+            KEYGEN_TOKEN: "token",
+            BITBUCKET_TOKEN: "token",
+            TRAVIS_REPO_SLUG: "pingdotgg/t3code",
+            APPVEYOR_REPO_NAME: "pingdotgg/t3code",
+            CIRCLE_PROJECT_USERNAME: "pingdotgg",
+            CIRCLE_PROJECT_REPONAME: "t3code",
+          };
+          const withEnv = <A>(env: Record<string, string>, run: () => Promise<A>) =>
+            Effect.promise(async () => {
+              const saved = Object.fromEntries(
+                Object.keys(hostileEnv).map((key) => [key, process.env[key]] as const),
+              );
+              for (const key of Object.keys(hostileEnv)) delete process.env[key];
+              Object.assign(process.env, env);
+              try {
+                return await run();
+              } finally {
+                for (const [key, value] of Object.entries(saved)) {
+                  if (value === undefined) delete process.env[key];
+                  else process.env[key] = value;
+                }
+              }
+            });
+          // A package.json `repository` naming upstream, as one careless commit could add.
+          const upstreamRepository = yield* Effect.promise(() =>
+            getRepositoryInfo(stage, { repository: "https://github.com/pingdotgg/t3code" }, null),
+          );
+          const resolveAppUpdate = (
+            config: Record<string, unknown>,
+            platform: "mac" | "linux" | "win",
+            env: Record<string, string> = hostileEnv,
+          ) =>
+            withEnv(env, async () => {
+              const info = {
+                repositoryInfo: Promise.resolve(upstreamRepository),
+                appInfo: { channel: null },
+                config,
+              };
+              return getAppUpdatePublishConfiguration(
+                {
+                  platform: { name: platform },
+                  platformSpecificBuildOptions: config[platform] ?? {},
+                  config,
+                  info,
+                  appInfo: { updaterCacheDirName: "starkcode-updater", channel: null },
+                  expandMacro: (value: string) => value,
+                },
+                null,
+                1,
+                false,
+              );
+            });
+
+          // Controls: what an omitted or empty publish produced before.
+          assert.include(yield* resolveAppUpdate({}, "mac"), {
+            provider: "github",
+            owner: "pingdotgg",
+            repo: "t3code",
+          });
+          assert.include(yield* resolveAppUpdate({ publish: [] }, "mac", {}), {
+            provider: "github",
+            owner: "pingdotgg",
+            repo: "t3code",
+          });
+
+          for (const [platform, target, version] of [
+            ["mac", "dmg", "0.0.46"],
+            ["mac", "dmg", "0.0.33-pr.8182.1"],
+            ["mac", "dmg", "0.0.41-preview.20260912.1589"],
+            ["linux", "AppImage", "0.0.46"],
+            ["win", "nsis", "0.0.46"],
+          ] as const) {
+            const config = yield* createBuildConfig(
+              platform,
+              target,
+              version,
+              false,
+              NO_DESKTOP_UPDATE_FEED,
+              undefined,
+            );
+            assert.isNull(yield* resolveAppUpdate(config, platform), `${platform} ${version}`);
+          }
+          const stark = yield* createBuildConfig(
+            "mac",
+            "dmg",
+            "0.0.47",
+            true,
+            STARK_FEED,
+            undefined,
+          );
+          assert.deepStrictEqual(yield* resolveAppUpdate(stark, "mac"), {
+            provider: "generic",
+            url: STARK_FEED.url,
+            channel: "latest",
+            updaterCacheDirName: "starkcode-updater",
+          });
+
+          // The packaging environment never carries the variables that select a publisher.
+          const scrubbed = removePublishDetectionEnv({ ...hostileEnv, PATH: "/usr/bin" });
+          assert.deepStrictEqual(scrubbed, { PATH: "/usr/bin" });
+          assert.isNull(
+            yield* withEnv(
+              Object.fromEntries(
+                Object.entries(scrubbed).filter(
+                  (entry): entry is [string, string] => entry[1] !== undefined,
+                ),
+              ),
+              () =>
+                getAppUpdatePublishConfiguration(
+                  {
+                    platform: { name: "mac" },
+                    platformSpecificBuildOptions: {},
+                    config: {},
+                    info: {
+                      repositoryInfo: getRepositoryInfo(stage, { name: "starkcode" }, null),
+                      appInfo: { channel: null },
+                      config: {},
+                    },
+                    appInfo: { updaterCacheDirName: "starkcode-updater", channel: null },
+                    expandMacro: (value: string) => value,
+                  },
+                  null,
+                  1,
+                  false,
+                ),
+            ),
+          );
+        }),
+      ).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
 
   it("stages only the desktop main-process externals", () => {
@@ -615,6 +996,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       "!apps/desktop/prod-resources/browser-secret/**/*",
       "!apps/desktop/prod-resources/dictation",
       "!apps/desktop/prod-resources/dictation/**/*",
+      "!apps/desktop/prod-resources/resource-monitor",
+      "!apps/desktop/prod-resources/resource-monitor/**/*",
       "!apps/desktop/prod-resources/windows-server",
       "!apps/desktop/prod-resources/windows-server/**/*",
       "!apps/desktop/prod-resources/wsl-runtime.tar.gz",
@@ -639,8 +1022,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "dmg",
         "1.2.3",
         false,
-        false,
-        undefined,
+        NO_DESKTOP_UPDATE_FEED,
         undefined,
       );
       const linux = yield* createBuildConfig(
@@ -648,8 +1030,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "AppImage",
         "1.2.3",
         false,
-        false,
-        undefined,
+        NO_DESKTOP_UPDATE_FEED,
         undefined,
       );
       const win = yield* createBuildConfig(
@@ -657,8 +1038,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "nsis",
         "1.2.3",
         false,
-        false,
-        undefined,
+        NO_DESKTOP_UPDATE_FEED,
         undefined,
         true,
       );
@@ -667,8 +1047,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "nsis",
         "1.2.3",
         false,
-        false,
-        undefined,
+        NO_DESKTOP_UPDATE_FEED,
         undefined,
         false,
       );
@@ -994,6 +1373,34 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       }),
     ),
   );
+
+  it("remaps release resource monitor paths without changing the build identity or flags", () => {
+    const env = {
+      HOME: "/Users/builder",
+      CARGO_HOME: "/Volumes/Build Cache/cargo",
+      RUSTUP_HOME: "/Volumes/Build Cache/rustup",
+      RUSTFLAGS: "-C opt-level=2",
+    };
+    const actual = resourceMonitorReleaseEnvironment("/work/Stark Code", env);
+    assert.equal(actual.HOME, env.HOME);
+    assert.equal(actual.CARGO_HOME, env.CARGO_HOME);
+    assert.equal(actual.RUSTFLAGS, env.RUSTFLAGS);
+    assert.deepEqual(actual.CARGO_ENCODED_RUSTFLAGS?.split("\u001f"), [
+      "-C",
+      "opt-level=2",
+      "--remap-path-prefix=/Users/builder=/build/home",
+      "--remap-path-prefix=/Volumes/Build Cache/cargo=/build/cargo",
+      "--remap-path-prefix=/Volumes/Build Cache/rustup=/build/rustup",
+      "--remap-path-prefix=/work/Stark Code=/build/stark-code",
+    ]);
+    const encoded = resourceMonitorReleaseEnvironment("/repo", {
+      ...env,
+      CARGO_ENCODED_RUSTFLAGS: "--cfg\u001fstark_release",
+    }).CARGO_ENCODED_RUSTFLAGS!;
+    assert.isTrue(encoded.startsWith("--cfg\u001fstark_release\u001f"));
+    assert.isFalse(encoded.includes("opt-level=2"));
+    assert.include(DESKTOP_FILE_EXCLUSIONS, "!apps/desktop/prod-resources/resource-monitor/**/*");
+  });
 
   it.effect("stages a cached resource monitor without invoking Cargo", () =>
     Effect.scoped(
@@ -2167,14 +2574,21 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
 
   it.effect("adds passkey entitlements and both renderer protocols to signed macOS builds", () =>
     Effect.gen(function* () {
-      const config = yield* createBuildConfig("mac", "dmg", "1.2.3", true, false, undefined, {
+      const config = yield* createBuildConfig("mac", "dmg", "1.2.3", true, NO_DESKTOP_UPDATE_FEED, {
+        mode: "developer-id",
         entitlementsPath: "/tmp/entitlements.mac.plist",
+        entitlementsInheritPath: "/tmp/stage/apps/desktop/resources/entitlements.mac.plist",
         provisioningProfilePath: "/tmp/starkcode.provisionprofile",
       });
 
       const mac = config.mac as Record<string, unknown>;
       assert.equal(config.appId, "com.starkfuture.starkcode");
       assert.equal(mac.entitlements, "/tmp/entitlements.mac.plist");
+      // Helper processes keep the plain hardened-runtime entitlements.
+      assert.equal(
+        mac.entitlementsInherit,
+        "/tmp/stage/apps/desktop/resources/entitlements.mac.plist",
+      );
       assert.equal(mac.provisioningProfile, "/tmp/starkcode.provisionprofile");
       assert.match(String(mac.sign), /[\\/]scripts[\\/]sign-macos\.ts$/);
       assert.deepStrictEqual(mac.protocols, [
@@ -2191,8 +2605,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "dmg",
         "1.2.3-nightly.20260815.1",
         false,
-        false,
-        undefined,
+        NO_DESKTOP_UPDATE_FEED,
         undefined,
       );
 
@@ -2210,8 +2623,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "nsis",
         "1.2.3",
         false,
-        false,
-        undefined,
+        NO_DESKTOP_UPDATE_FEED,
         undefined,
       );
 
@@ -2225,6 +2637,10 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
 
   it("stages the resource monitor as an external executable resource", () => {
     assert.deepStrictEqual(DESKTOP_EXTRA_RESOURCES, [
+      {
+        from: "apps/desktop/resources/browser-capture-host.cjs",
+        to: "browser-capture-host.cjs",
+      },
       {
         from: "apps/desktop/prod-resources",
         to: ".",
@@ -2277,7 +2693,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   it("parses Windows bsdtar member listings with CRLF line endings", () => {
     assert.deepStrictEqual(
       parseWslRuntimeArchiveMembers(
-        "./stark-1.2.3-linux-x64/stark\r\nt3-1.2.3-linux-x64/client/\r\n",
+        "./stark-1.2.3-linux-x64/stark-code\r\nstark-1.2.3-linux-x64/client/\r\n",
       ),
       ["stark-1.2.3-linux-x64/stark-code", "stark-1.2.3-linux-x64/client"],
     );
@@ -2371,8 +2787,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   });
 
   it("falls back to the default mock update port when the configured port is blank", () => {
-    assert.equal(resolveMockUpdateServerUrl(undefined), "http://localhost:3000");
-    assert.equal(resolveMockUpdateServerUrl(4123), "http://localhost:4123");
+    assert.equal(resolveMockUpdateServerUrl(undefined), "http://localhost:3000/");
+    assert.equal(resolveMockUpdateServerUrl(4123), "http://localhost:4123/");
   });
 
   it("derives the electron-builder package manager user agent from packageManager", () => {
@@ -2520,8 +2936,1416 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.equal(resolved.keepStage, false);
       assert.equal(resolved.signed, false);
       assert.equal(resolved.verbose, false);
-      assert.equal(resolved.mockUpdates, false);
+      assert.equal(resolved.updateFeed.kind, "none");
     }),
+  );
+
+  it.effect("keeps the mock feed to rehearsal builds written below release-mock/", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const resolveMock = (
+        overrides: Partial<Parameters<typeof resolveBuildOptions>[0]>,
+        env: Record<string, string> = {},
+      ) =>
+        resolveBuildOptions({
+          platform: Option.some("mac"),
+          target: Option.none(),
+          arch: Option.some("arm64"),
+          buildVersion: Option.none(),
+          outputDir: Option.none(),
+          skipBuild: Option.none(),
+          keepStage: Option.none(),
+          signed: Option.none(),
+          verbose: Option.none(),
+          mockUpdates: Option.some(true),
+          mockUpdateServerPort: Option.some(3123),
+          wslRuntime: Option.none(),
+          ...overrides,
+        }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))));
+      const refusal = (
+        overrides: Partial<Parameters<typeof resolveBuildOptions>[0]>,
+        env: Record<string, string> = {},
+      ) =>
+        resolveMock(overrides, env).pipe(
+          Effect.flip,
+          Effect.map((error) => {
+            assert.instanceOf(error, DesktopUpdateFeedConfigError);
+            return error as DesktopUpdateFeedConfigError;
+          }),
+        );
+
+      const mock = yield* resolveMock({});
+      assert.deepStrictEqual(mock.updateFeed, { kind: "mock", url: "http://localhost:3123/" });
+      assert.equal(path.basename(mock.outputDir), "release-mock");
+      const nested = yield* resolveMock({ outputDir: Option.some("release-mock/n") });
+      assert.equal(path.basename(path.dirname(nested.outputDir)), "release-mock");
+      const fromEnv = yield* resolveMock(
+        { mockUpdates: Option.none() },
+        { STARK_CODE_DESKTOP_UPDATE_FEED: "mock" },
+      );
+      assert.equal(fromEnv.updateFeed.kind, "mock");
+
+      for (const outputDir of ["release", "release-mock-copy", "release-mock/../release"]) {
+        const error = yield* refusal({ outputDir: Option.some(outputDir) });
+        assert.equal(error.reason, "mock-output-dir", outputDir);
+      }
+      const absolute = yield* refusal({
+        outputDir: Option.some(path.join(path.dirname(mock.outputDir), "..", "elsewhere")),
+      });
+      assert.equal(absolute.reason, "mock-output-dir");
+      assert.equal(
+        (yield* refusal(
+          {},
+          {
+            STARK_CODE_DESKTOP_UPDATE_FEED: "stark",
+            STARK_CODE_DESKTOP_UPDATE_URL: STARK_FEED.url,
+          },
+        )).reason,
+        "conflicts-with-mock-updates",
+      );
+      const removed = yield* refusal(
+        {},
+        { STARK_CODE_DESKTOP_UPDATE_REPOSITORY: "example/stark-code" },
+      );
+      assert.equal(removed.reason, "repository-removed");
+      assert.include(removed.message, "STARK_CODE_DESKTOP_UPDATE_URL");
+      assert.equal(
+        (yield* refusal({ mockUpdates: Option.none(), signed: Option.some(true) })).reason,
+        "mode-required",
+      );
+
+      const mockBeta = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "0.0.46-beta.1",
+        false,
+        mock.updateFeed,
+        undefined,
+      );
+      const mockPublish = [
+        { provider: "generic", url: "http://localhost:3123/", channel: "latest" },
+      ];
+      assert.deepStrictEqual(mockBeta.publish, mockPublish);
+      assert.deepStrictEqual((mockBeta.mac as Record<string, unknown>).publish, mockPublish);
+      assert.isTrue(String(mockBeta.afterPack).endsWith(DESKTOP_UPDATE_KIND_HOOK));
+      const nightly = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "0.0.46-nightly.20261029.7",
+        false,
+        mock.updateFeed,
+        undefined,
+      ).pipe(Effect.flip);
+      assert.instanceOf(nightly, DesktopUpdateFeedConfigError);
+      assert.equal((nightly as DesktopUpdateFeedConfigError).reason, "channel-not-enabled");
+      assert.deepStrictEqual(createBakedUpdatePolicy(mock.updateFeed, "0.0.46-beta.1"), {
+        kind: "mock",
+        url: "http://localhost:3123/",
+        channels: ["latest"],
+        appleTeamId: "6QNLKCM5Y5",
+      });
+      assert.deepStrictEqual(createBakedUpdatePolicy(NO_DESKTOP_UPDATE_FEED, "0.0.46"), {
+        kind: "none",
+        url: null,
+        channels: [],
+        appleTeamId: "6QNLKCM5Y5",
+      });
+    }),
+  );
+
+  it.effect("pins a Stark feed to Developer ID builds of the checked-in team", () =>
+    Effect.gen(function* () {
+      const developerId: MacSigningPlan = {
+        mode: "developer-id",
+        identitySource: "keychain",
+        keychainIdentity: "Stark Future GmbH (ABCDE12345)",
+        notarization: "keychain-profile",
+        expectedTeamId: "ABCDE12345",
+      };
+      const development: MacSigningPlan = {
+        mode: "development",
+        identitySource: "keychain",
+        keychainIdentity: "2222222222222222222222222222222222222222",
+        notarization: undefined,
+        expectedTeamId: undefined,
+      };
+      const check = (
+        feed: DesktopUpdateFeedPlan,
+        plan: MacSigningPlan | undefined,
+        env: Record<string, string> = { APPLE_TEAM_ID: "ABCDE12345" },
+        platform: "mac" | "linux" | "win" = "mac",
+        ownership: UpdateOwnership = FEED_OWNERSHIP,
+      ) => checkDesktopUpdateFeedSigning({ feed, platform, plan, env }, ownership);
+      const reasonOf = (effect: ReturnType<typeof check>) =>
+        effect.pipe(
+          Effect.flip,
+          Effect.map((error) => error.reason),
+        );
+
+      yield* check(STARK_FEED, developerId);
+      yield* check(STARK_FEED, developerId, { APPLE_TEAM_ID: "abcde12345" });
+      yield* check(NO_DESKTOP_UPDATE_FEED, undefined, {}, "linux");
+      yield* check(MOCK_FEED, development);
+      yield* check(MOCK_FEED, undefined);
+
+      assert.equal(yield* reasonOf(check(MOCK_FEED, developerId)), "mock-developer-id");
+      assert.equal(yield* reasonOf(check(MOCK_FEED, undefined, {}, "linux")), "not-mac");
+      assert.equal(yield* reasonOf(check(STARK_FEED, development)), "stark-needs-developer-id");
+      assert.equal(yield* reasonOf(check(STARK_FEED, undefined)), "stark-needs-developer-id");
+      assert.equal(yield* reasonOf(check(STARK_FEED, developerId, {})), "team-id-missing");
+      assert.equal(
+        yield* reasonOf(check(STARK_FEED, developerId, { APPLE_TEAM_ID: "ZZZZZ99999" })),
+        "team-id-mismatch",
+      );
+      assert.equal(
+        yield* reasonOf(
+          check(STARK_FEED, developerId, { APPLE_TEAM_ID: "ABCDE12345" }, "mac", {
+            ...FEED_OWNERSHIP,
+            appleTeamId: null,
+          }),
+        ),
+        "team-id-not-configured",
+      );
+      // APPLE_TEAM_ID must name the team stark.brand.json checks in.
+      assert.equal(
+        yield* reasonOf(
+          checkDesktopUpdateFeedSigning({
+            feed: STARK_FEED,
+            platform: "mac",
+            plan: developerId,
+            env: { APPLE_TEAM_ID: "ABCDE12345" },
+          }),
+        ),
+        "team-id-mismatch",
+      );
+      yield* checkDesktopUpdateFeedSigning({
+        feed: STARK_FEED,
+        platform: "mac",
+        plan: developerId,
+        env: { APPLE_TEAM_ID: "6QNLKCM5Y5" },
+      });
+    }),
+  );
+
+  it.effect("checks the packaged app-update.yml with the code the app runs", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dist = yield* fs.makeTempDirectoryScoped({ prefix: "stark-packaged-feed-" });
+        const appRelative = path.join(
+          "mac-arm64",
+          "Stark Code (Alpha).app",
+          "Contents",
+          "Resources",
+          "app-update.yml",
+        );
+        const appUpdateYml = path.join(dist, appRelative);
+        yield* fs.makeDirectory(path.dirname(appUpdateYml), { recursive: true });
+        const none = createBakedUpdatePolicy(NO_DESKTOP_UPDATE_FEED, "0.0.47", FEED_OWNERSHIP);
+        const stark = createBakedUpdatePolicy(STARK_FEED, "0.0.47", FEED_OWNERSHIP);
+        const verify = (policy: typeof none) =>
+          verifyPackagedUpdateFeed({ stageDistDir: dist, policy }, FEED_OWNERSHIP);
+        const refusal = (policy: typeof none) =>
+          verify(policy).pipe(
+            Effect.flip,
+            Effect.map((error) => {
+              assert.instanceOf(error, PackagedDesktopUpdateFeedError);
+              return error as PackagedDesktopUpdateFeedError;
+            }),
+          );
+
+        assert.deepStrictEqual(yield* verify(none), { file: null, sha256: null });
+        assert.equal((yield* refusal(stark)).reason, "app-update-missing");
+
+        // What electron-builder writes for a token plus an upstream slug.
+        yield* fs.writeFileString(
+          appUpdateYml,
+          "owner: pingdotgg\nrepo: t3code\nprovider: github\nupdaterCacheDirName: starkcode-updater\n",
+        );
+        const unexpected = yield* refusal(none);
+        assert.equal(unexpected.reason, "unexpected-app-update");
+        assert.equal(unexpected.file, appRelative);
+        const upstream = yield* refusal(stark);
+        assert.equal(upstream.reason, "app-update-mismatch");
+        assert.equal(upstream.problem, "yml-unexpected-key");
+        // A token without a repository leaves a provider-less file.
+        yield* fs.writeFileString(appUpdateYml, "updaterCacheDirName: starkcode-updater\n");
+        assert.equal((yield* refusal(stark)).problem, "yml-missing-key");
+        // Exactly the baked feed, kind included.
+        const baked = `provider: generic\nurl: ${STARK_FEED.url}\nchannel: latest\nupdaterCacheDirName: starkcode-updater\nkind: stark\n`;
+        yield* fs.writeFileString(appUpdateYml, baked);
+        assert.deepStrictEqual(yield* verify(stark), {
+          file: appRelative,
+          sha256: NodeCrypto.createHash("sha256").update(baked).digest("hex"),
+        });
+        yield* fs.writeFileString(appUpdateYml, baked.replace("kind: stark", "kind: mock"));
+        assert.equal((yield* refusal(stark)).problem, "kind-mismatch");
+
+        // Unpacked Linux and Windows apps are checked too.
+        yield* fs.remove(appUpdateYml);
+        const linuxYml = path.join(dist, "linux-unpacked", "resources", "app-update.yml");
+        yield* fs.makeDirectory(path.dirname(linuxYml), { recursive: true });
+        yield* fs.writeFileString(linuxYml, "provider: github\nowner: pingdotgg\nrepo: t3code\n");
+        assert.equal(
+          (yield* refusal(none)).file,
+          path.join("linux-unpacked", "resources", "app-update.yml"),
+        );
+      }),
+    ),
+  );
+
+  it.effect("requires a Stark feed build's designated requirement to pin the team", () =>
+    Effect.gen(function* () {
+      const developerIdRequirement = `Executable=/stage/Stark Code (Alpha).app/Contents/MacOS/Stark Code (Alpha)
+designated => anchor apple generic and identifier "com.starkfuture.starkcode" and (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ABCDE12345)`;
+      const developmentRequirement = `designated => identifier "com.starkfuture.starkcode" and anchor apple generic and certificate leaf[subject.CN] = "Apple Development: Jane Doe (QWERTY1234)" and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */`;
+      const commands: Array<ReadonlyArray<string>> = [];
+      const verify = (output: string, feed: DesktopUpdateFeedPlan) =>
+        verifyMacDesignatedRequirement({ appPath: "/stage/App.app", feed }, FEED_OWNERSHIP).pipe(
+          Effect.provide(macToolSpawnerLayer(commands, () => Effect.succeed({ stdout: output }))),
+        );
+      const reasonOf = (output: string, feed: DesktopUpdateFeedPlan) =>
+        verify(output, feed).pipe(
+          Effect.flip,
+          Effect.map((error) => {
+            assert.instanceOf(error, PackagedDesktopUpdateFeedError);
+            return (error as PackagedDesktopUpdateFeedError).reason;
+          }),
+        );
+
+      assert.equal((yield* verify(developerIdRequirement, STARK_FEED)).teamId, "ABCDE12345");
+      assert.deepStrictEqual(commands[0], [
+        "/usr/bin/codesign",
+        "--display",
+        "-r-",
+        "/stage/App.app",
+      ]);
+      assert.equal(yield* reasonOf(developmentRequirement, STARK_FEED), "requirement-not-pinned");
+      assert.equal(
+        yield* reasonOf(developerIdRequirement.replace("ABCDE12345", "ZZZZZ99999"), STARK_FEED),
+        "requirement-not-pinned",
+      );
+      assert.equal(
+        (yield* verify(developmentRequirement, MOCK_FEED)).identifier,
+        "com.starkfuture.starkcode",
+      );
+      assert.equal(
+        yield* reasonOf('# designated => cdhash H"0123abcd"', MOCK_FEED),
+        "requirement-identifier",
+      );
+    }),
+  );
+
+  it.effect("bakes the feed kind into app-update.yml before signing", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        assert.equal(
+          withUpdateFeedKind("provider: generic\nurl: x\n", "mock"),
+          "provider: generic\nurl: x\nkind: mock\n",
+        );
+        assert.equal(
+          withUpdateFeedKind("provider: generic\r\nkind: stark\r\n", "mock"),
+          "provider: generic\nkind: mock\n",
+        );
+
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "stark-update-kind-hook-" });
+        const file = path.join(dir, "app-update.yml");
+        const written = "provider: generic\nurl: http://localhost:3123/\nchannel: latest\n";
+        const context = (metadata: Record<string, unknown>, platform = "darwin") => ({
+          appOutDir: dir,
+          electronPlatformName: platform,
+          packager: { getResourcesDir: () => dir, info: { metadata } },
+        });
+
+        // Nothing to mark yet: the hook leaves the missing file to the verifier.
+        yield* Effect.promise(() => afterPack(context({ starkcodeUpdate: { kind: "mock" } })));
+        assert.isFalse(yield* fs.exists(file));
+
+        yield* fs.writeFileString(file, written);
+        for (const metadata of [{}, { starkcodeUpdate: { kind: "none" } }]) {
+          yield* Effect.promise(() => afterPack(context(metadata)));
+        }
+        yield* Effect.promise(() =>
+          afterPack(context({ starkcodeUpdate: { kind: "mock" } }, "linux")),
+        );
+        assert.equal(yield* fs.readFileString(file), written);
+
+        yield* Effect.promise(() => afterPack(context({ starkcodeUpdate: { kind: "mock" } })));
+        assert.equal(yield* fs.readFileString(file), `${written}kind: mock\n`);
+      }),
+    ),
+  );
+
+  it.effect("accepts each complete macOS signing credential combination", () =>
+    Effect.gen(function* () {
+      const developmentIdentity = "2222222222222222222222222222222222222222";
+      assert.deepStrictEqual(
+        yield* resolveMacSigningPlan({
+          signed: false,
+          env: { CSC_NAME: developmentIdentity, APPLE_KEYCHAIN_PROFILE: "stark-notary" },
+        }),
+        {
+          mode: "unsigned",
+          identitySource: undefined,
+          keychainIdentity: undefined,
+          notarization: undefined,
+          expectedTeamId: undefined,
+        },
+      );
+      assert.deepStrictEqual(
+        yield* resolveMacSigningPlan({
+          signed: true,
+          env: {
+            CSC_LINK: "/secrets/developer-id.p12",
+            CSC_KEY_PASSWORD: "p12-secret",
+            APPLE_API_KEY: "/secrets/AuthKey_KEY1234567.p8",
+            APPLE_API_KEY_ID: "KEY1234567",
+            APPLE_API_ISSUER: "issuer-secret",
+          },
+        }),
+        {
+          mode: "developer-id",
+          identitySource: "certificate-file",
+          keychainIdentity: undefined,
+          notarization: "api-key",
+          expectedTeamId: undefined,
+        },
+      );
+      assert.deepStrictEqual(
+        yield* resolveMacSigningPlan({
+          signed: true,
+          env: {
+            CSC_NAME: " Stark Future GmbH (ABCDE12345) ",
+            APPLE_ID: "release@example.com",
+            APPLE_APP_SPECIFIC_PASSWORD: "app-secret",
+            APPLE_TEAM_ID: "abcde12345",
+          },
+        }),
+        {
+          mode: "developer-id",
+          identitySource: "keychain",
+          keychainIdentity: "Stark Future GmbH (ABCDE12345)",
+          notarization: "apple-id",
+          expectedTeamId: "ABCDE12345",
+        },
+      );
+      // Blank values are unset, as they are for electron-builder.
+      assert.deepStrictEqual(
+        yield* resolveMacSigningPlan({
+          signed: true,
+          env: {
+            CSC_LINK: "  ",
+            CSC_NAME: "Stark Future GmbH (ABCDE12345)",
+            APPLE_KEYCHAIN_PROFILE: "stark-notary",
+            APPLE_KEYCHAIN: "/Users/maintainer/Library/Keychains/login.keychain-db",
+          },
+        }),
+        {
+          mode: "developer-id",
+          identitySource: "keychain",
+          keychainIdentity: "Stark Future GmbH (ABCDE12345)",
+          notarization: "keychain-profile",
+          expectedTeamId: undefined,
+        },
+      );
+      // A development rehearsal never notarizes, whatever Apple credentials
+      // the shell carries.
+      assert.deepStrictEqual(
+        yield* resolveMacSigningPlan({
+          signed: true,
+          env: {
+            STARK_CODE_MACOS_SIGNING_MODE: "development",
+            CSC_NAME: developmentIdentity,
+            APPLE_ID: "release@example.com",
+          },
+        }),
+        {
+          mode: "development",
+          identitySource: "keychain",
+          keychainIdentity: developmentIdentity,
+          notarization: undefined,
+          expectedTeamId: undefined,
+        },
+      );
+    }),
+  );
+
+  it.effect("names missing or conflicting macOS signing variables, never their values", () =>
+    Effect.gen(function* () {
+      const secrets = [
+        "/secrets/developer-id.p12",
+        "p12-secret",
+        "app-secret",
+        "issuer-secret",
+        "/secrets/AuthKey_KEY1234567.p8",
+      ];
+      const rejection = (env: Readonly<Record<string, string>>, signed = true) =>
+        resolveMacSigningPlan({ signed, env }).pipe(
+          Effect.flip,
+          Effect.tap((error) =>
+            Effect.sync(() => {
+              for (const secret of secrets) {
+                assert.notInclude(error.message, secret);
+                assert.notInclude(JSON.stringify(error), secret);
+              }
+            }),
+          ),
+        );
+      const keychain = { CSC_NAME: "Stark Future GmbH (ABCDE12345)" };
+      const profile = { APPLE_KEYCHAIN_PROFILE: "stark-notary" };
+
+      assert.instanceOf(yield* rejection(profile), MissingMacSigningIdentityError);
+
+      const missingPassword = yield* rejection({
+        CSC_LINK: "/secrets/developer-id.p12",
+        ...profile,
+      });
+      assert.instanceOf(missingPassword, IncompleteMacSigningCredentialsError);
+      assert.deepStrictEqual(missingPassword.missing, ["CSC_KEY_PASSWORD"]);
+      assert.include(missingPassword.message, "CSC_KEY_PASSWORD");
+
+      const twoIdentities = yield* rejection({
+        CSC_LINK: "/secrets/developer-id.p12",
+        CSC_KEY_PASSWORD: "p12-secret",
+        ...keychain,
+        ...profile,
+      });
+      assert.instanceOf(twoIdentities, ConflictingMacSigningCredentialsError);
+      assert.deepStrictEqual(twoIdentities.credentialSets, ["certificate-file", "keychain"]);
+
+      const notNotarized = yield* rejection(keychain);
+      assert.instanceOf(notNotarized, MissingMacNotarizationCredentialsError);
+      assert.include(notNotarized.message, "STARK_CODE_MACOS_SIGNING_MODE=development");
+
+      const partialApiKey = yield* rejection({
+        ...keychain,
+        APPLE_API_KEY: "/secrets/AuthKey_KEY1234567.p8",
+        APPLE_API_ISSUER: "issuer-secret",
+      });
+      assert.instanceOf(partialApiKey, IncompleteMacSigningCredentialsError);
+      assert.equal(partialApiKey.credentialSet, "api-key");
+      assert.deepStrictEqual(partialApiKey.missing, ["APPLE_API_KEY_ID"]);
+
+      const appleIdWithoutTeam = yield* rejection({
+        ...keychain,
+        APPLE_ID: "release@example.com",
+        APPLE_APP_SPECIFIC_PASSWORD: "app-secret",
+      });
+      assert.instanceOf(appleIdWithoutTeam, IncompleteMacSigningCredentialsError);
+      assert.deepStrictEqual(appleIdWithoutTeam.missing, ["APPLE_TEAM_ID"]);
+
+      const keychainWithoutProfile = yield* rejection({
+        ...keychain,
+        APPLE_KEYCHAIN: "/Users/maintainer/Library/Keychains/login.keychain-db",
+      });
+      assert.instanceOf(keychainWithoutProfile, IncompleteMacSigningCredentialsError);
+      assert.deepStrictEqual(keychainWithoutProfile.missing, ["APPLE_KEYCHAIN_PROFILE"]);
+
+      const twoNotarizations = yield* rejection({
+        ...keychain,
+        ...profile,
+        APPLE_ID: "release@example.com",
+        APPLE_APP_SPECIFIC_PASSWORD: "app-secret",
+        APPLE_TEAM_ID: "ABCDE12345",
+      });
+      assert.instanceOf(twoNotarizations, ConflictingMacSigningCredentialsError);
+      assert.deepStrictEqual(twoNotarizations.credentialSets, ["apple-id", "keychain-profile"]);
+
+      // electron-builder refuses a certificate-type prefix in CSC_NAME.
+      assert.instanceOf(
+        yield* rejection({
+          CSC_NAME: "Developer ID Application: Stark Future GmbH (ABCDE12345)",
+          ...profile,
+        }),
+        InvalidMacSigningIdentityNameError,
+      );
+      assert.instanceOf(
+        yield* rejection({ ...keychain, ...profile, APPLE_TEAM_ID: "SHORT" }),
+        InvalidMacSigningTeamIdError,
+      );
+      assert.instanceOf(
+        yield* rejection({ STARK_CODE_MACOS_SIGNING_MODE: "adhoc", ...keychain, ...profile }),
+        InvalidMacSigningModeError,
+      );
+      // A mode without --signed would otherwise build unsigned without a word.
+      assert.instanceOf(
+        yield* rejection({ STARK_CODE_MACOS_SIGNING_MODE: "developer-id" }, false),
+        MacSigningModeRequiresSignedBuildError,
+      );
+    }),
+  );
+
+  it("keeps signing credentials away from builds that must not use them", () => {
+    const env = {
+      PATH: "/usr/bin",
+      CSC_LINK: "/secrets/developer-id.p12",
+      CSC_KEY_PASSWORD: "p12-secret",
+      CSC_NAME: "Stark Future GmbH (ABCDE12345)",
+      APPLE_ID: "release@example.com",
+      APPLE_APP_SPECIFIC_PASSWORD: "app-secret",
+      APPLE_TEAM_ID: "ABCDE12345",
+      APPLE_API_KEY: "/secrets/AuthKey_KEY1234567.p8",
+      APPLE_API_KEY_ID: "KEY1234567",
+      APPLE_API_ISSUER: "issuer-secret",
+      APPLE_KEYCHAIN: "/Users/maintainer/Library/Keychains/login.keychain-db",
+      APPLE_KEYCHAIN_PROFILE: "stark-notary",
+    };
+
+    assert.deepStrictEqual(
+      removeUnusedSigningCredentials(env, { signed: false, macSigningMode: "unsigned" }),
+      { PATH: "/usr/bin", CSC_IDENTITY_AUTO_DISCOVERY: "false" },
+    );
+    assert.deepStrictEqual(
+      removeUnusedSigningCredentials(env, { signed: true, macSigningMode: "development" }),
+      {
+        PATH: "/usr/bin",
+        CSC_LINK: "/secrets/developer-id.p12",
+        CSC_KEY_PASSWORD: "p12-secret",
+        CSC_NAME: "Stark Future GmbH (ABCDE12345)",
+      },
+    );
+    assert.deepStrictEqual(
+      removeUnusedSigningCredentials(env, { signed: true, macSigningMode: "developer-id" }),
+      env,
+    );
+    // Signed Linux and Windows builds have no macOS plan.
+    assert.deepStrictEqual(
+      removeUnusedSigningCredentials(env, { signed: true, macSigningMode: undefined }),
+      env,
+    );
+  });
+
+  it("opts into macOS passkey signing only with a provisioning profile", () => {
+    assert.isFalse(
+      isMacPasskeySigningRequested({
+        STARK_CODE_APPLE_TEAM_ID: "ABCDE12345",
+        STARK_CODE_CLERK_PUBLISHABLE_KEY: `pk_test_${btoa("example.clerk.accounts.dev$")}`,
+      }),
+    );
+    assert.isFalse(isMacPasskeySigningRequested({ STARK_CODE_MACOS_PROVISIONING_PROFILE: " " }));
+    assert.isTrue(
+      isMacPasskeySigningRequested({
+        STARK_CODE_MACOS_PROVISIONING_PROFILE: "/profiles/starkcode.provisionprofile",
+      }),
+    );
+  });
+
+  it.effect("grants signed macOS builds the hardened-runtime exceptions and microphone only", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const entitlements: unknown = Plist.parse(
+        yield* fs.readFileString(
+          NodePath.join(
+            import.meta.dirname,
+            "../apps/desktop/resources",
+            MAC_ENTITLEMENTS_FILE_NAME,
+          ),
+        ),
+      );
+
+      assert.deepStrictEqual(entitlements, {
+        "com.apple.security.cs.allow-jit": true,
+        "com.apple.security.cs.allow-unsigned-executable-memory": true,
+        "com.apple.security.cs.disable-library-validation": true,
+        "com.apple.security.device.audio-input": true,
+      });
+    }),
+  );
+
+  it.effect("signs each macOS mode with hardened runtime and its own notarization", () =>
+    Effect.gen(function* () {
+      const entitlementsPath = "/stage/apps/desktop/resources/entitlements.mac.plist";
+      const developerId = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "0.0.46-beta.1",
+        true,
+        NO_DESKTOP_UPDATE_FEED,
+        {
+          mode: "developer-id",
+          entitlementsPath,
+          entitlementsInheritPath: entitlementsPath,
+        },
+      );
+      const development = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "0.0.46-beta.1",
+        true,
+        NO_DESKTOP_UPDATE_FEED,
+        {
+          mode: "development",
+          entitlementsPath,
+          entitlementsInheritPath: entitlementsPath,
+        },
+      );
+      const unsigned = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "0.0.46-beta.1",
+        false,
+        NO_DESKTOP_UPDATE_FEED,
+        undefined,
+      );
+
+      assert.include(developerId.mac as Record<string, unknown>, {
+        hardenedRuntime: true,
+        type: "distribution",
+        notarize: true,
+        entitlements: entitlementsPath,
+        entitlementsInherit: entitlementsPath,
+      });
+      assert.notProperty(developerId.mac as Record<string, unknown>, "provisioningProfile");
+      assert.propertyVal(developerId.dmg as Record<string, unknown>, "sign", true);
+
+      assert.include(development.mac as Record<string, unknown>, {
+        hardenedRuntime: true,
+        type: "development",
+        notarize: false,
+        entitlements: entitlementsPath,
+      });
+      assert.notProperty(development.dmg as Record<string, unknown>, "sign");
+
+      for (const key of ["hardenedRuntime", "notarize", "type", "entitlements"]) {
+        assert.notProperty(unsigned.mac as Record<string, unknown>, key);
+      }
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
+
+  it("predicts which keychain certificate electron-builder signs each mode with", () => {
+    const identities = parseMacSigningIdentities(
+      `Policy: X.509 Basic
+  Matching identities
+  1) 1111111111111111111111111111111111111111 "Developer ID Application: Stark Future GmbH (ABCDE12345)"
+  2) 3333333333333333333333333333333333333333 "Developer ID Installer: Stark Future GmbH (ABCDE12345)"
+     2 identities found`,
+      `  1) 1111111111111111111111111111111111111111 "Developer ID Application: Stark Future GmbH (ABCDE12345)"
+  2) 2222222222222222222222222222222222222222 "Apple Development: Jane Doe (ABCDE12345)"
+     2 valid identities found`,
+    );
+    assert.deepStrictEqual(identities, [
+      '1111111111111111111111111111111111111111 "Developer ID Application: Stark Future GmbH (ABCDE12345)"',
+      '3333333333333333333333333333333333333333 "Developer ID Installer: Stark Future GmbH (ABCDE12345)"',
+      '2222222222222222222222222222222222222222 "Apple Development: Jane Doe (ABCDE12345)"',
+    ]);
+
+    // The SHA-1 of an Apple Development certificate reaches it through
+    // electron-builder's non-Apple fallback.
+    assert.deepStrictEqual(
+      selectMacSigningIdentity(
+        identities,
+        "development",
+        "2222222222222222222222222222222222222222",
+      ),
+      {
+        hash: "2222222222222222222222222222222222222222",
+        name: "Apple Development: Jane Doe (ABCDE12345)",
+      },
+    );
+    // A name both certificates share signs a development build with Developer ID.
+    const sharedName = selectMacSigningIdentity(identities, "development", "(ABCDE12345)");
+    assert.equal(sharedName?.name, "Developer ID Application: Stark Future GmbH (ABCDE12345)");
+    assert.equal(classifyMacSigningCertificate(sharedName?.name ?? ""), "developer-id");
+    assert.equal(
+      selectMacSigningIdentity(identities, "developer-id", "Stark Future GmbH (ABCDE12345)")?.hash,
+      "1111111111111111111111111111111111111111",
+    );
+    // With no Developer ID match, a Developer ID build falls back to a development certificate.
+    const fallback = selectMacSigningIdentity(identities, "developer-id", "Jane Doe");
+    assert.equal(classifyMacSigningCertificate(fallback?.name ?? ""), "development");
+    assert.isUndefined(selectMacSigningIdentity(identities, "developer-id", "Someone Else"));
+  });
+
+  it("selects the same keychain identity as the installed electron-builder", async () => {
+    // Load electron-builder's own identity search the way the desktop build
+    // resolves it, so a builder upgrade that changes the search fails here.
+    const desktopRequire = NodeModule.createRequire(
+      NodePath.join(import.meta.dirname, "../apps/desktop/package.json"),
+    );
+    const builderRequire = NodeModule.createRequire(desktopRequire.resolve("electron-builder"));
+    const macCodeSign = builderRequire("app-builder-lib/out/codeSign/macCodeSign.js") as {
+      findIdentityRawResult: Promise<ReadonlyArray<string>> | null;
+    };
+    const { MacTargetHelper } = builderRequire("app-builder-lib/out/mac/MacTargetHelper.js") as {
+      readonly MacTargetHelper: {
+        getCertificateTypes(isMas: boolean, isDevelopment: boolean): ReadonlyArray<string>;
+        new (packager: { readonly forceCodeSigning: boolean }): {
+          findSigningIdentity(
+            isMas: boolean,
+            isDevelopment: boolean,
+            qualifier: string,
+            keychainFile: null,
+            config: { readonly type: string; readonly sign: string },
+          ): Promise<{ readonly name: string; readonly hash: string } | null>;
+        };
+      };
+    };
+
+    // The non-MAS lists: development never names "Apple Development".
+    assert.deepStrictEqual(MacTargetHelper.getCertificateTypes(false, true), [
+      "Mac Developer",
+      "Developer ID Application",
+    ]);
+    assert.deepStrictEqual(MacTargetHelper.getCertificateTypes(false, false), [
+      "Developer ID Application",
+    ]);
+
+    const identities = parseMacSigningIdentities(
+      `  1) 1111111111111111111111111111111111111111 "Developer ID Application: Stark Future GmbH (ABCDE12345)"
+  2) 3333333333333333333333333333333333333333 "Developer ID Installer: Stark Future GmbH (ABCDE12345)"
+     2 identities found`,
+      `  1) 1111111111111111111111111111111111111111 "Developer ID Application: Stark Future GmbH (ABCDE12345)"
+  2) 2222222222222222222222222222222222222222 "Apple Development: Jane Doe (ABCDE12345)"
+  3) 4444444444444444444444444444444444444444 "Apple Distribution: Stark Future GmbH (ABCDE12345)"
+  4) 5555555555555555555555555555555555555555 "Mac Developer: Jane Doe (ABCDE12345)"
+     4 valid identities found`,
+    );
+    const helper = new MacTargetHelper({ forceCodeSigning: false });
+    // electron-builder caches the keychain listing here; seeding it keeps
+    // `security` from running.
+    const cachedIdentities = macCodeSign.findIdentityRawResult;
+    macCodeSign.findIdentityRawResult = Promise.resolve(identities);
+    try {
+      for (const mode of ["development", "developer-id"] as const) {
+        for (const qualifier of [
+          "2222222222222222222222222222222222222222",
+          "4444444444444444444444444444444444444444",
+          "5555555555555555555555555555555555555555",
+          "(ABCDE12345)",
+          "Stark Future GmbH (ABCDE12345)",
+          "Jane Doe",
+          "Someone Else",
+        ]) {
+          const builderIdentity = await helper.findSigningIdentity(
+            false,
+            mode === "development",
+            qualifier,
+            null,
+            {
+              // The build config's `type` for each mode; a custom `sign`
+              // keeps electron-builder from reporting a missing identity.
+              type: mode === "development" ? "development" : "distribution",
+              sign: "scripts/sign-macos.ts",
+            },
+          );
+          assert.deepStrictEqual(
+            selectMacSigningIdentity(identities, mode, qualifier),
+            builderIdentity === null
+              ? undefined
+              : { hash: builderIdentity.hash, name: builderIdentity.name },
+            `${mode} with CSC_NAME=${qualifier}`,
+          );
+        }
+      }
+      // The development certificate's SHA-1 is what selects it for a rehearsal.
+      const rehearsal = await helper.findSigningIdentity(
+        false,
+        true,
+        "2222222222222222222222222222222222222222",
+        null,
+        { type: "development", sign: "scripts/sign-macos.ts" },
+      );
+      assert.equal(rehearsal?.name, "Apple Development: Jane Doe (ABCDE12345)");
+    } finally {
+      macCodeSign.findIdentityRawResult = cachedIdentities;
+    }
+  });
+
+  it.effect("stops a signed build whose keychain identity is the wrong kind", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const keychain = macToolSpawnerLayer([], (command) =>
+          Effect.succeed({
+            stdout: command.includes("codesigning")
+              ? `  1) 1111111111111111111111111111111111111111 "Developer ID Application: Stark Future GmbH (ABCDE12345)"
+  2) 2222222222222222222222222222222222222222 "Apple Development: Jane Doe (ABCDE12345)"
+     2 valid identities found`
+              : "",
+          }),
+        );
+        const plan = (mode: "development" | "developer-id", keychainIdentity: string) => ({
+          mode,
+          identitySource: "keychain" as const,
+          keychainIdentity,
+          notarization: mode === "developer-id" ? ("keychain-profile" as const) : undefined,
+          expectedTeamId: undefined,
+        });
+
+        const development = yield* preflightMacSigning({
+          plan: plan("development", "2222222222222222222222222222222222222222"),
+          env: {},
+        }).pipe(Effect.provide(keychain));
+        assert.equal(development?.name, "Apple Development: Jane Doe (ABCDE12345)");
+
+        const mismatch = yield* preflightMacSigning({
+          plan: plan("development", "(ABCDE12345)"),
+          env: {},
+        }).pipe(Effect.provide(keychain), Effect.flip);
+        assert.instanceOf(mismatch, MacSigningIdentityMismatchError);
+        assert.include(mismatch.message, "a Developer ID Application certificate");
+        assert.include(mismatch.message, "SHA-1 of an Apple Development certificate");
+
+        assert.instanceOf(
+          yield* preflightMacSigning({ plan: plan("developer-id", "Nobody"), env: {} }).pipe(
+            Effect.provide(keychain),
+            Effect.flip,
+          ),
+          MacSigningIdentityNotFoundError,
+        );
+
+        const missingKey = path.join(
+          yield* fs.makeTempDirectoryScoped({ prefix: "stark-notary-key-test-" }),
+          "AuthKey_KEY1234567.p8",
+        );
+        assert.instanceOf(
+          yield* preflightMacSigning({
+            plan: { ...plan("developer-id", "Stark Future GmbH"), notarization: "api-key" },
+            env: { APPLE_API_KEY: missingKey },
+          }).pipe(Effect.provide(keychain), Effect.flip),
+          MissingMacNotarizationKeyFileError,
+        );
+      }),
+    ),
+  );
+
+  it("parses codesign, Gatekeeper, stapler and notarytool output", () => {
+    assert.deepStrictEqual(parseMacCodeSignature(DEVELOPER_ID_CODESIGN_DISPLAY), {
+      authorities: [
+        "Developer ID Application: Stark Future GmbH (ABCDE12345)",
+        "Developer ID Certification Authority",
+        "Apple Root CA",
+      ],
+      teamIdentifier: "ABCDE12345",
+      hardenedRuntime: true,
+      timestamped: true,
+    });
+    assert.deepStrictEqual(
+      parseMacCodeSignature(`Executable=/stage/Stark Code (Alpha).app/Contents/MacOS/Stark Code (Alpha)
+Identifier=Electron
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20400 size=512 flags=0x20002(adhoc,linker-signed) hashes=10+7 location=embedded
+Signature=adhoc
+TeamIdentifier=not set
+Sealed Resources=none`),
+      { authorities: [], teamIdentifier: undefined, hardenedRuntime: false, timestamped: false },
+    );
+    // A signature without a secure timestamp only carries "Signed Time".
+    assert.isFalse(parseMacCodeSignature(DEVELOPMENT_CODESIGN_DISPLAY).timestamped);
+
+    const notarized = parseGatekeeperAssessment(`/stage/Stark Code (Alpha).app: accepted
+source=Notarized Developer ID
+origin=Developer ID Application: Stark Future GmbH (ABCDE12345)`);
+    assert.deepStrictEqual(notarized, { accepted: true, source: NOTARIZED_DEVELOPER_ID_SOURCE });
+    assert.isTrue(isGatekeeperNotarized(notarized));
+    const unnotarized = parseGatekeeperAssessment(`/stage/Stark Code (Alpha).app: rejected
+source=Unnotarized Developer ID`);
+    assert.deepStrictEqual(unnotarized, { accepted: false, source: "Unnotarized Developer ID" });
+    assert.isFalse(isGatekeeperNotarized(unnotarized));
+
+    assert.isTrue(
+      isStaplerValidation({
+        exitCode: 0,
+        stdout: "Processing: /stage/app.dmg\nThe validate action worked!\n",
+      }),
+    );
+    assert.isFalse(
+      isStaplerValidation({
+        exitCode: 65,
+        stdout: "Processing: /stage/app.dmg\napp.dmg does not have a ticket stapled to it.\n",
+      }),
+    );
+
+    assert.deepStrictEqual(
+      parseNotarySubmission(
+        'Conducting pre-submission checks...\n{"id":"6c1d1e4a","status":"Accepted","message":"Processing complete"}\n',
+      ),
+      { id: "6c1d1e4a", status: "Accepted" },
+    );
+    assert.deepStrictEqual(parseNotarySubmission("Error: HTTP status code: 401"), {
+      id: undefined,
+      status: undefined,
+    });
+  });
+
+  it("holds a development rehearsal to a hardened development signature only", () => {
+    const developmentSignature = parseMacCodeSignature(DEVELOPMENT_CODESIGN_DISPLAY);
+    const developerIdSignature = parseMacCodeSignature(DEVELOPER_ID_CODESIGN_DISPLAY);
+    const check = (input: Partial<Parameters<typeof findMacAppVerificationFailures>[0]>) =>
+      findMacAppVerificationFailures({
+        mode: "development",
+        expectedIdentityName: undefined,
+        expectedTeamId: undefined,
+        signatureValid: true,
+        signature: developmentSignature,
+        stapled: undefined,
+        gatekeeper: undefined,
+        ...input,
+      });
+
+    assert.deepStrictEqual(
+      check({ expectedIdentityName: "Apple Development: Jane Doe (ABCDE12345)" }),
+      [],
+    );
+    // electron-builder chose Developer ID for a development build.
+    assert.deepStrictEqual(
+      check({
+        expectedIdentityName: "Apple Development: Jane Doe (ABCDE12345)",
+        signature: developerIdSignature,
+      }),
+      ["unexpected-certificate", "unexpected-identity"],
+    );
+    assert.deepStrictEqual(
+      check({
+        signatureValid: false,
+        signature: { ...developmentSignature, hardenedRuntime: false },
+      }),
+      ["signature-invalid", "hardened-runtime-missing"],
+    );
+
+    const notarized = { accepted: true, source: NOTARIZED_DEVELOPER_ID_SOURCE };
+    assert.deepStrictEqual(
+      check({
+        mode: "developer-id",
+        expectedTeamId: "ABCDE12345",
+        signature: developerIdSignature,
+        stapled: true,
+        gatekeeper: notarized,
+      }),
+      [],
+    );
+    // The development signature cannot pass as a release.
+    assert.deepStrictEqual(
+      check({
+        mode: "developer-id",
+        expectedTeamId: "ZYXWV98765",
+        stapled: false,
+        gatekeeper: { accepted: false, source: "Unnotarized Developer ID" },
+      }),
+      [
+        "unexpected-certificate",
+        "team-mismatch",
+        "timestamp-missing",
+        "not-stapled",
+        "gatekeeper-rejected",
+      ],
+    );
+  });
+
+  it.effect("runs stapler and Gatekeeper checks only for developer-id apps", () =>
+    Effect.gen(function* () {
+      const appPath = `/stage/dist/${macPackagedAppDirectoryName("arm64")}/Stark Code (Alpha).app`;
+      const developmentCommands: Array<ReadonlyArray<string>> = [];
+      const development = yield* verifyMacSignedApp({
+        appPath,
+        mode: "development",
+        expectedIdentityName: "Apple Development: Jane Doe (ABCDE12345)",
+        expectedTeamId: undefined,
+      }).pipe(
+        Effect.provide(
+          macToolSpawnerLayer(developmentCommands, (command) =>
+            Effect.succeed(
+              command.includes("--display") ? { stderr: DEVELOPMENT_CODESIGN_DISPLAY } : {},
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(development, {
+        authority: "Apple Development: Jane Doe (ABCDE12345)",
+        teamId: "ABCDE12345",
+        hardenedRuntime: true,
+        timestamped: false,
+        appStapled: false,
+        gatekeeper: null,
+      });
+      assert.deepStrictEqual(
+        developmentCommands.map((command) => command.slice(0, 2).join(" ")),
+        ["/usr/bin/codesign --verify", "/usr/bin/codesign --display"],
+      );
+
+      const releaseCommands: Array<ReadonlyArray<string>> = [];
+      const rejected = yield* verifyMacSignedApp({
+        appPath,
+        mode: "developer-id",
+        expectedIdentityName: undefined,
+        expectedTeamId: "ABCDE12345",
+      }).pipe(
+        Effect.provide(
+          macToolSpawnerLayer(releaseCommands, (command) =>
+            Effect.succeed(
+              command.includes("--display")
+                ? { stderr: DEVELOPER_ID_CODESIGN_DISPLAY }
+                : command.includes("stapler")
+                  ? { stdout: "The validate action worked!\n" }
+                  : command[0] === "/usr/sbin/spctl"
+                    ? {
+                        exitCode: 3,
+                        stderr: `${appPath}: rejected\nsource=Unnotarized Developer ID\n`,
+                      }
+                    : {},
+            ),
+          ),
+        ),
+        Effect.flip,
+      );
+      assert.instanceOf(rejected, MacReleaseVerificationError);
+      assert.deepStrictEqual(rejected.failures, ["gatekeeper-rejected"]);
+      assert.include(rejected.message, NOTARIZED_DEVELOPER_ID_SOURCE);
+      assert.deepStrictEqual(
+        releaseCommands.map((command) => command.slice(0, 2).join(" ")),
+        [
+          "/usr/bin/codesign --verify",
+          "/usr/bin/codesign --display",
+          "/usr/bin/xcrun stapler",
+          "/usr/sbin/spctl --assess",
+        ],
+      );
+    }),
+  );
+
+  it.effect("staples the DMG before rebuilding its block map and manifest digest", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const stageDistDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "stark-dmg-finalize-test-",
+        });
+        const dmgName = "Stark-Code-0.0.46-beta.1-arm64.dmg";
+        const dmgPath = path.join(stageDistDir, dmgName);
+        const manifestPath = path.join(stageDistDir, "latest-mac.yml");
+        yield* fs.writeFileString(dmgPath, "dmg as electron-builder hashed it");
+        yield* fs.writeFileString(`${dmgPath}.blockmap`, "stale block map");
+        yield* fs.writeFileString(
+          manifestPath,
+          `version: 0.0.46-beta.1
+files:
+  - url: Stark-Code-0.0.46-beta.1-arm64.zip
+    sha512: zipdigest
+    size: 100
+  - url: ${dmgName}
+    sha512: staledigest
+    size: 33
+path: Stark-Code-0.0.46-beta.1-arm64.zip
+sha512: zipdigest
+releaseDate: '2026-10-29T10:00:00.000Z'
+`,
+        );
+
+        const commands: Array<ReadonlyArray<string>> = [];
+        yield* finalizeMacDmg({
+          dmgPath,
+          stageDistDir,
+          notarization: "keychain-profile",
+          env: { APPLE_KEYCHAIN_PROFILE: "stark-notary" },
+          verbose: false,
+        }).pipe(
+          Effect.provide(
+            macToolSpawnerLayer(commands, (command) => {
+              if (command.includes("notarytool")) {
+                return Effect.succeed({ stdout: '{"id":"6c1d1e4a","status":"Accepted"}' });
+              }
+              if (command.includes("staple")) {
+                return Effect.as(
+                  fs.writeFileString(dmgPath, " with a stapled ticket", { flag: "a" }),
+                  {},
+                );
+              }
+              if (command.includes("validate")) {
+                return Effect.succeed({ stdout: "The validate action worked!\n" });
+              }
+              return Effect.succeed({
+                stderr: `${dmgPath}: accepted\nsource=Notarized Developer ID\n`,
+              });
+            }),
+          ),
+        );
+
+        assert.deepStrictEqual(commands, [
+          [
+            "/usr/bin/xcrun",
+            "notarytool",
+            "submit",
+            dmgPath,
+            "--wait",
+            "--output-format",
+            "json",
+            "--keychain-profile",
+            "stark-notary",
+          ],
+          ["/usr/bin/xcrun", "stapler", "staple", dmgPath],
+          ["/usr/bin/xcrun", "stapler", "validate", dmgPath],
+          [
+            "/usr/sbin/spctl",
+            "--assess",
+            "--type",
+            "open",
+            "--context",
+            "context:primary-signature",
+            "--verbose=2",
+            dmgPath,
+          ],
+        ]);
+        const finalDmg = yield* fs.readFile(dmgPath);
+        const finalDigest = NodeCrypto.createHash("sha512").update(finalDmg).digest("base64");
+        assert.equal(
+          yield* fs.readFileString(manifestPath),
+          `version: 0.0.46-beta.1
+files:
+  - url: Stark-Code-0.0.46-beta.1-arm64.zip
+    sha512: zipdigest
+    size: 100
+  - url: ${dmgName}
+    sha512: ${finalDigest}
+    size: ${finalDmg.byteLength}
+path: Stark-Code-0.0.46-beta.1-arm64.zip
+sha512: zipdigest
+releaseDate: '2026-10-29T10:00:00.000Z'
+`,
+        );
+        const blockMap = JSON.parse(
+          NodeZlib.gunzipSync(yield* fs.readFile(`${dmgPath}.blockmap`)).toString("utf8"),
+        ) as { readonly files: ReadonlyArray<{ readonly sizes: ReadonlyArray<number> }> };
+        assert.equal(
+          blockMap.files[0]?.sizes.reduce((total, size) => total + size, 0),
+          finalDmg.byteLength,
+        );
+      }),
+    ),
+  );
+
+  it.effect("leaves the DMG and its metadata alone when notarization is rejected", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const stageDistDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "stark-dmg-rejected-test-",
+        });
+        const dmgPath = path.join(stageDistDir, "Stark-Code-0.0.46-beta.1-arm64.dmg");
+        yield* fs.writeFileString(dmgPath, "unnotarized dmg");
+        const commands: Array<ReadonlyArray<string>> = [];
+
+        const error = yield* finalizeMacDmg({
+          dmgPath,
+          stageDistDir,
+          notarization: "apple-id",
+          env: {
+            APPLE_ID: "release@example.com",
+            APPLE_APP_SPECIFIC_PASSWORD: "app-secret",
+            APPLE_TEAM_ID: "ABCDE12345",
+          },
+          verbose: false,
+        }).pipe(
+          Effect.provide(
+            macToolSpawnerLayer(commands, () =>
+              Effect.succeed({ stdout: '{"id":"9f00c2b7","status":"Invalid"}' }),
+            ),
+          ),
+          Effect.flip,
+        );
+
+        assert.instanceOf(error, MacReleaseVerificationError);
+        assert.deepStrictEqual(error.failures, ["notarization-rejected"]);
+        assert.include(error.message, "xcrun notarytool log 9f00c2b7");
+        assert.notInclude(error.message, "app-secret");
+        assert.lengthOf(commands, 1);
+        assert.equal(yield* fs.readFileString(dmgPath), "unnotarized dmg");
+
+        // A spawn failure quotes the command line, which carries the password.
+        const spawnFailure = yield* finalizeMacDmg({
+          dmgPath,
+          stageDistDir,
+          notarization: "apple-id",
+          env: {
+            APPLE_ID: "release@example.com",
+            APPLE_APP_SPECIFIC_PASSWORD: "app-secret",
+            APPLE_TEAM_ID: "ABCDE12345",
+          },
+          verbose: false,
+        }).pipe(
+          Effect.provide(
+            macToolSpawnerLayer([], (command) =>
+              Effect.fail(
+                PlatformError.systemError({
+                  _tag: "NotFound",
+                  module: "ChildProcess",
+                  method: "spawn",
+                  pathOrDescriptor: command.join(" "),
+                }),
+              ),
+            ),
+          ),
+          Effect.flip,
+        );
+        assert.instanceOf(spawnFailure, MacNotarizationCommandError);
+        assert.include(spawnFailure.message, "NotFound");
+        assert.notInclude(spawnFailure.message, "app-secret");
+        assert.notInclude(JSON.stringify(spawnFailure), "app-secret");
+      }),
+    ),
+  );
+
+  it.effect("records final artifact digests in a release proof without credentials", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const outputDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "stark-release-proof-test-",
+        });
+        const dmgPath = path.join(outputDir, "Stark-Code-0.0.46-beta.1-arm64.dmg");
+        yield* fs.writeFileString(dmgPath, "final stapled dmg");
+        const plan = {
+          mode: "developer-id" as const,
+          identitySource: "keychain" as const,
+          keychainIdentity: "Stark Future GmbH (ABCDE12345)",
+          notarization: "keychain-profile" as const,
+          expectedTeamId: "ABCDE12345",
+        };
+        const app = {
+          authority: "Developer ID Application: Stark Future GmbH (ABCDE12345)",
+          teamId: "ABCDE12345",
+          hardenedRuntime: true,
+          timestamped: true,
+          appStapled: true,
+          gatekeeper: NOTARIZED_DEVELOPER_ID_SOURCE,
+        };
+        const requirement =
+          'anchor apple generic and identifier "com.starkfuture.starkcode" and (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ABCDE12345)';
+        const noFeed = describeDesktopReleaseFeed(
+          createBakedUpdatePolicy(NO_DESKTOP_UPDATE_FEED, "0.0.46-beta.1", FEED_OWNERSHIP),
+          { file: null, sha256: null },
+        );
+
+        const proofPath = yield* writeDesktopReleaseProof({
+          outputDir,
+          artifactPaths: [dmgPath],
+          version: "0.0.46-beta.1",
+          arch: "arm64",
+          commit: "abcdef123456",
+          feed: noFeed,
+          plan,
+          app,
+          requirement,
+          dmgStapled: true,
+          ownership: FEED_OWNERSHIP,
+        });
+
+        assert.equal(path.basename(proofPath), RELEASE_PROOF_FILE_NAME);
+        const proof = JSON.parse(yield* fs.readFileString(proofPath)) as ReturnType<
+          typeof createDesktopReleaseProof
+        >;
+        assert.deepStrictEqual(proof.artifacts, [
+          {
+            file: "Stark-Code-0.0.46-beta.1-arm64.dmg",
+            bytes: "final stapled dmg".length,
+            sha256: NodeCrypto.createHash("sha256").update("final stapled dmg").digest("hex"),
+          },
+        ]);
+        assert.deepStrictEqual(proof.mac, {
+          signingMode: "developer-id",
+          identitySource: "keychain",
+          notarization: "keychain-profile",
+          authority: "Developer ID Application: Stark Future GmbH (ABCDE12345)",
+          teamId: "ABCDE12345",
+          hardenedRuntime: true,
+          timestamped: true,
+          appStapled: true,
+          dmgStapled: true,
+          gatekeeper: NOTARIZED_DEVELOPER_ID_SOURCE,
+          designatedRequirement: requirement,
+          teamPinned: true,
+          distributable: true,
+        });
+        assert.deepStrictEqual(proof.feed, {
+          kind: "none",
+          url: null,
+          channel: null,
+          policy: { kind: "none", url: null, channels: [], appleTeamId: "ABCDE12345" },
+          appUpdateYml: { file: null, sha256: null },
+        });
+        assert.equal(proof.channel, "latest");
+        assert.isFalse(Number.isNaN(Date.parse(proof.builtAt)));
+
+        type ProofInput = Parameters<typeof createDesktopReleaseProof>[0];
+        const proofInput: ProofInput = {
+          version: "0.0.46-beta.1",
+          arch: "arm64",
+          commit: "abcdef123456",
+          builtAt: proof.builtAt,
+          artifacts: [],
+          dmgStapled: false,
+          plan,
+          app,
+          requirement,
+          feed: noFeed,
+          ownership: FEED_OWNERSHIP,
+        };
+        const starkFeed = describeDesktopReleaseFeed(
+          createBakedUpdatePolicy(STARK_FEED, "0.0.46-beta.1", FEED_OWNERSHIP),
+          {
+            file: "mac-arm64/Stark Code (Alpha).app/Contents/Resources/app-update.yml",
+            sha256: "0".repeat(64),
+          },
+        );
+        assert.isTrue(
+          createDesktopReleaseProof({ ...proofInput, feed: starkFeed }).mac.distributable,
+        );
+        // The checked-in team is 6QNLKCM5Y5, not the fixture's.
+        const { ownership: _fixtureOwnership, ...checkedInOwnership } = proofInput;
+        // Rehearsals, mock feeds, other teams and unpinned requirements are never fit for another Mac.
+        const notDistributable: Array<[string, ProofInput]> = [
+          [
+            "mock feed",
+            {
+              ...proofInput,
+              feed: describeDesktopReleaseFeed(
+                createBakedUpdatePolicy(MOCK_FEED, "0.0.46-beta.1", FEED_OWNERSHIP),
+                { file: "x", sha256: "0".repeat(64) },
+              ),
+            },
+          ],
+          [
+            "development signature",
+            {
+              ...proofInput,
+              plan: { ...plan, mode: "development", notarization: undefined },
+              app: { ...app, appStapled: false, gatekeeper: null },
+            },
+          ],
+          ["another team", { ...proofInput, app: { ...app, teamId: "ZZZZZ99999" } }],
+          [
+            "unpinned requirement",
+            { ...proofInput, requirement: requirement.replace("ABCDE12345", "ZZZZZ99999") },
+          ],
+          ["no requirement", { ...proofInput, requirement: undefined }],
+          ["checked-in ownership", checkedInOwnership],
+        ];
+        for (const [label, input] of notDistributable) {
+          assert.isFalse(createDesktopReleaseProof(input).mac.distributable, label);
+        }
+        const unsigned = createDesktopReleaseProof({
+          ...proofInput,
+          plan: {
+            mode: "unsigned",
+            identitySource: undefined,
+            keychainIdentity: undefined,
+            notarization: undefined,
+            expectedTeamId: undefined,
+          },
+          app: undefined,
+          requirement: undefined,
+        });
+        assert.equal(unsigned.mac.signingMode, "unsigned");
+        assert.isFalse(unsigned.mac.distributable);
+        assert.notInclude(JSON.stringify(unsigned), "keychainIdentity");
+      }),
+    ),
   );
 });
 

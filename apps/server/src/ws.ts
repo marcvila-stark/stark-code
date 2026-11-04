@@ -29,6 +29,7 @@ import {
   authScopeResponse,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
+  AuthSettingsWriteScope,
   AuthOrchestrationOperateScope,
   type AuthEnvironmentScope,
   type ScheduledTaskListResult,
@@ -43,6 +44,8 @@ import {
   type FileManagerRevealKind,
   type OrchestrationClientOrigin,
   type OrchestrationV2Command,
+  type OrchestrationV2ThreadLaunchInput,
+  type ScheduledTaskUpsertInput,
   type GitActionProgressEvent,
   type GitManagerServiceError,
   type MessageId,
@@ -116,6 +119,7 @@ import {
 import { RpcSerialization, RpcServer } from "effect/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
+import { describeCheckpointDiffFailure } from "./checkpointing/Errors.ts";
 import * as CheckpointFileRestore from "./checkpointing/CheckpointFileRestore.ts";
 import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
@@ -129,6 +133,7 @@ import * as McpServerRequests from "./provider/McpServerRequests.ts";
 import * as PermissionRulesService from "./provider/PermissionRulesService.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+import { DispatchSettingsWrite } from "./orchestration-v2/DispatchSettingsWrite.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
@@ -185,6 +190,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as StorageCleanup from "./storageCleanup.ts";
+import * as PreviewBrowser from "./preview/PreviewBrowser.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -1304,6 +1310,67 @@ const layerTerminalWsRpc = TerminalWsRpcGroup.toLayer(
   }),
 );
 
+/**
+ * Saves a scheduled task under the session's settings-write grant: the service
+ * checks the mode the task will store, named or resolved from the project
+ * default, against it (O12).
+ */
+export const upsertScheduledTaskForSession = (
+  session: Pick<EnvironmentAuth.AuthenticatedSession, "scopes">,
+  input: ScheduledTaskUpsertInput,
+) =>
+  Effect.gen(function* () {
+    const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+    return yield* scheduledTasks.upsert(input);
+  }).pipe(
+    Effect.provideService(DispatchSettingsWrite, session.scopes.includes(AuthSettingsWriteScope)),
+  );
+
+/** Maps an `orchestration.launchThread` request to a launch under the session's settings-write grant; the RPC handler enqueues it. */
+export const launchThreadForSession = (
+  session: Pick<EnvironmentAuth.AuthenticatedSession, "scopes">,
+  input: OrchestrationV2ThreadLaunchInput,
+) =>
+  ThreadMessageIntake.launchThread({
+    commandId: input.commandId,
+    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+    ...(input.reuseExistingThread === undefined
+      ? {}
+      : { reuseExistingThread: input.reuseExistingThread }),
+    projectId: input.projectId,
+    ...(input.sideChatParentThreadId === undefined
+      ? {}
+      : { sideChatParentThreadId: input.sideChatParentThreadId }),
+    ...(input.localSession === undefined ? {} : { localSession: input.localSession }),
+    title: input.title,
+    ...(input.generateTitle === undefined ? {} : { generateTitle: input.generateTitle }),
+    modelSelection: input.modelSelection,
+    runtimeMode: input.runtimeMode,
+    interactionMode: input.interactionMode,
+    ...(input.permissionSource === undefined ? {} : { permissionSource: input.permissionSource }),
+    workspaceStrategy: input.workspaceStrategy,
+    ...(input.initialMessage === undefined
+      ? {}
+      : {
+          initialMessage: {
+            ...(input.initialMessage.messageId === undefined
+              ? {}
+              : { messageId: input.initialMessage.messageId }),
+            text: input.initialMessage.text,
+            attachments: input.initialMessage.attachments,
+            ...(input.initialMessage.context === undefined
+              ? {}
+              : { context: input.initialMessage.context }),
+          },
+        }),
+    createdBy: "user",
+    creationSource: input.creationSource ?? "web",
+  }).pipe(
+    // The orchestrator checks the new chat's permissions against this
+    // session's grant, as it does for dispatched commands.
+    Effect.provideService(DispatchSettingsWrite, session.scopes.includes(AuthSettingsWriteScope)),
+  );
+
 const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientOrigin: OrchestrationClientOrigin,
@@ -1415,6 +1482,7 @@ const layerWsRpc = (
       const config = yield* ServerConfig.ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const storageCleanup = yield* StorageCleanup.StorageCleanup;
+      const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
@@ -1621,6 +1689,8 @@ const layerWsRpc = (
                   modelSelection: { instanceId: input.instanceId, model },
                   runtimeMode: "approval-required",
                   interactionMode: "default",
+                  // Imported sessions always run an explicit preset.
+                  permissionSource: "override",
                   workspaceStrategy: { type: "root" },
                   importedNativeThread: {
                     ref: {
@@ -1864,6 +1934,7 @@ const layerWsRpc = (
             threadSnapshotPagination: true,
             threadFind: true,
             threadFindProgressive: true,
+            threadHistorySearch: true,
             ...Option.match(scratchWorkspaceRoot, {
               onNone: () => ({}),
               onSome: (root) => ({ scratchWorkspaceRoot: root }),
@@ -1980,7 +2051,15 @@ const layerWsRpc = (
                             "creationSource" in command ? command.creationSource : "web",
                         }),
                       )
-                  ).pipe(Effect.provide(intakeContext)),
+                  ).pipe(
+                    Effect.provide(intakeContext),
+                    // The orchestrator re-checks widening and persistent answers
+                    // against this session's grant under the thread's lock.
+                    Effect.provideService(
+                      DispatchSettingsWrite,
+                      currentSession.scopes.includes(AuthSettingsWriteScope),
+                    ),
+                  ),
                 )
                 .pipe(
                   Effect.tap(() => recordClientCommandAnalytics(command)),
@@ -2017,7 +2096,7 @@ const layerWsRpc = (
             Effect.mapError(
               (cause) =>
                 new OrchestrationGetTurnDiffError({
-                  message: "Failed to load turn diff",
+                  message: describeCheckpointDiffFailure(cause),
                   cause,
                 }),
             ),
@@ -2030,7 +2109,7 @@ const layerWsRpc = (
             Effect.mapError(
               (cause) =>
                 new OrchestrationGetFullThreadDiffError({
-                  message: "Failed to load full thread diff",
+                  message: describeCheckpointDiffFailure(cause),
                   cause,
                 }),
             ),
@@ -2053,6 +2132,16 @@ const layerWsRpc = (
               (cause) =>
                 new OrchestrationSearchThreadsError({
                   message: "Failed to search threads",
+                  cause,
+                }),
+            ),
+          ),
+        [ORCHESTRATION_V2_WS_METHODS.searchThreadHistory]: (input) =>
+          threadSearch.searchHistory(input).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationSearchThreadsError({
+                  message: "Failed to search thread history",
                   cause,
                 }),
             ),
@@ -2096,44 +2185,7 @@ const layerWsRpc = (
             Effect.andThen(
               startup
                 .enqueueCommand(
-                  ThreadMessageIntake.launchThread({
-                    commandId: input.commandId,
-                    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
-                    ...(input.reuseExistingThread === undefined
-                      ? {}
-                      : { reuseExistingThread: input.reuseExistingThread }),
-                    projectId: input.projectId,
-                    ...(input.sideChatParentThreadId === undefined
-                      ? {}
-                      : { sideChatParentThreadId: input.sideChatParentThreadId }),
-                    title: input.title,
-                    ...(input.generateTitle === undefined
-                      ? {}
-                      : { generateTitle: input.generateTitle }),
-                    modelSelection: input.modelSelection,
-                    runtimeMode: input.runtimeMode,
-                    interactionMode: input.interactionMode,
-                    workspaceStrategy: input.workspaceStrategy,
-                    ...(input.localSession === undefined
-                      ? {}
-                      : { localSession: input.localSession }),
-                    ...(input.initialMessage === undefined
-                      ? {}
-                      : {
-                          initialMessage: {
-                            ...(input.initialMessage.messageId === undefined
-                              ? {}
-                              : { messageId: input.initialMessage.messageId }),
-                            text: input.initialMessage.text,
-                            attachments: input.initialMessage.attachments,
-                            ...(input.initialMessage.context === undefined
-                              ? {}
-                              : { context: input.initialMessage.context }),
-                          },
-                        }),
-                    createdBy: "user",
-                    creationSource: input.creationSource ?? "web",
-                  }).pipe(Effect.provide(intakeContext)),
+                  launchThreadForSession(currentSession, input).pipe(Effect.provide(intakeContext)),
                 )
                 .pipe(
                   Effect.tap(() =>
@@ -2199,7 +2251,10 @@ const layerWsRpc = (
           scheduledTasks.list().pipe(Effect.map(withVisibleWebhookUrls)),
         [WS_METHODS.scheduledTasksSubscribe]: (_input) =>
           scheduledTasks.subscribeList().pipe(Stream.map(withVisibleWebhookUrls)),
-        [WS_METHODS.scheduledTasksUpsert]: (input) => scheduledTasks.upsert(input),
+        [WS_METHODS.scheduledTasksUpsert]: (input) =>
+          upsertScheduledTaskForSession(currentSession, input).pipe(
+            Effect.provideService(ScheduledTasks.ScheduledTaskService, scheduledTasks),
+          ),
         [WS_METHODS.scheduledTasksSetEnabled]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.setEnabled(input)),
@@ -2227,6 +2282,10 @@ const layerWsRpc = (
         [WS_METHODS.scheduledTasksGetWebhookDelivery]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.getWebhookDelivery(input)),
+          ),
+        [WS_METHODS.scheduledTasksListRuns]: (input) =>
+          Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
+            Effect.andThen(scheduledTasks.listRuns(input)),
           ),
         [WS_METHODS.serverProbe]: (_input) => Effect.succeed({}),
         [WS_METHODS.serverGetConfig]: (_input) => loadServerConfig({ usageLimitsCommand: false }),
@@ -2331,7 +2390,7 @@ const layerWsRpc = (
           ),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           Effect.gen(function* () {
-            // Only explicit catalog refreshes bypass Stark's caches. Workspace
+            // Explicit catalog refreshes bypass Stark's catalog caches. Workspace
             // discovery and background status checks retain their timers.
             if (input.refreshModels) {
               yield* modelManifest.forceRefresh;
@@ -2367,7 +2426,9 @@ const layerWsRpc = (
                   fresh: input.fresh === true,
                 })
               : input.instanceId !== undefined
-                ? providerRegistry.refreshInstance(input.instanceId)
+                ? providerRegistry.refreshInstance(input.instanceId, {
+                    fresh: input.fresh === true,
+                  })
                 : providerRegistry.refresh();
             if (input.refreshModels) {
               const instances = yield* providerInstances.listInstances;
@@ -2406,6 +2467,8 @@ const layerWsRpc = (
           providerSessionInspector.readCatalog(input),
         [WS_METHODS.providerReadPermissionRules]: (input) => permissionRules.read(input),
         [WS_METHODS.providerForgetPermissionRule]: (input) => permissionRules.forget(input),
+        [WS_METHODS.providerReadEffectivePermissions]: (input) =>
+          permissionRules.readEffectivePermissions(input),
         [WS_METHODS.providerReadContextUsage]: (input) =>
           providerSessionInspector.readContext(input),
         [WS_METHODS.mcpServersList]: (input) => mcpServerRequests.list(input, mcpControlClient),
@@ -2560,6 +2623,8 @@ const layerWsRpc = (
           }),
         [WS_METHODS.serverRunStorageCleanup]: () => storageCleanup.runNow,
         [WS_METHODS.serverGetStorageCleanupReport]: () => storageCleanup.reports,
+        [WS_METHODS.serverInstallPreviewBrowser]: () => previewBrowser.install,
+        [WS_METHODS.serverGetPreviewBrowserStatus]: () => previewBrowser.changes,
         [WS_METHODS.serverGetSettings]: (_input) =>
           serverSettings.getSettings.pipe(Effect.map(ServerSettings.redactServerSettingsForClient)),
         [WS_METHODS.serverUpdateSettings]: ({ patch, providerInstanceMutation }) =>
@@ -3116,13 +3181,9 @@ const layerWsRpc = (
                 })),
               );
               const providerStatuses = Stream.zipLatestWith(
-                // The registry stream carries changes only. Seed it with the current
-                // providers so a source refresh that lands before any provider change
-                // still pairs up and reaches the client.
-                Stream.concat(
-                  Stream.fromEffect(providerRegistry.getProviders),
-                  providerRegistry.streamChanges,
-                ),
+                // Subscription and current-state replay are atomic: a switch between
+                // the config snapshot and stream attachment must still reach the client.
+                providerRegistry.streamSnapshots,
                 usageLimitSources.streamChanges.pipe(
                   // Quota updates already have their own stream. Republish the model
                   // catalog only when the set of providers offered the command changes.

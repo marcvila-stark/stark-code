@@ -16,7 +16,7 @@ describe("ComposerPendingApprovalActions", () => {
     );
 
     expect(markup).toContain(">Decline<");
-    expect(markup).toContain(">Approve<");
+    expect(markup).toContain(">Allow once<");
     expect(markup).not.toContain(">Cancel<");
     expect(markup).not.toContain("Always allow this session");
   });

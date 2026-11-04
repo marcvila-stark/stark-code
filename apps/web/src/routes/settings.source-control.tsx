@@ -6,7 +6,5 @@ export const Route = createFileRoute("/settings/source-control")({
   validateSearch: (raw: Record<string, unknown>) => ({
     ...(raw.view === "accounts" ? { view: "accounts" as const } : {}),
   }),
-  component: () => (
-    <SourceControlSettingsPanel view={Route.useSearch().view ?? "advanced"} />
-  ),
+  component: () => <SourceControlSettingsPanel view={Route.useSearch().view ?? "advanced"} />,
 });

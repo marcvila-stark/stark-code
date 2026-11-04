@@ -38,6 +38,8 @@ const evidence: FinishEvidence = {
   ],
   files: [],
   unconfirmedFileChanges: 0,
+  declinedFileChanges: 0,
+  declinedCount: 0,
   failedCount: 0,
   unknownCount: 1,
   zeroExitChecks: 1,
@@ -122,4 +124,29 @@ it("closes old details when switching replies and renders nothing without record
   await render(null);
   expect(container.textContent).toBe("");
   expect(document.querySelector('[role="dialog"]')).toBeNull();
+});
+
+it("keeps an undelivered answer visible and explains it in reply details", async () => {
+  await render({ ...evidence, approvalDelivery: { notDelivered: 1, uncertain: 1 } });
+  expect(container.textContent).toContain("Answer not delivered");
+  const popup = await open();
+  expect(popup.textContent).toContain("1 approval answer was not delivered: nothing ran.");
+  expect(popup.textContent).toContain("Delivery of 1 approval answer is uncertain");
+});
+
+it("shows declined commands and edits as decided outcomes when details are opened", async () => {
+  await render({
+    ...evidence,
+    unknownCount: 0,
+    declinedCount: 1,
+    declinedFileChanges: 1,
+    commands: [{ ...evidence.commands[0]!, outcome: "declined", exitCode: null }],
+  });
+  expect(container.textContent).toBe("Details");
+  const popup = await open();
+  expect(popup.textContent).toContain("1 command declined");
+  expect(popup.textContent).toContain("Declined: did not run");
+  expect(popup.textContent).toContain("1 declined file change was not written.");
+  expect(popup.textContent).not.toContain("Failed or interrupted");
+  expect(popup.textContent).not.toContain("no recorded completion");
 });

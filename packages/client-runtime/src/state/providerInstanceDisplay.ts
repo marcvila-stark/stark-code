@@ -7,6 +7,7 @@
  */
 import {
   defaultInstanceIdForDriver,
+  isProviderDriverKind,
   PROVIDER_DISPLAY_NAMES,
   type ProviderDriverKind,
   type ServerProvider,
@@ -46,6 +47,17 @@ export function resolveProviderInstanceDisplayName(
     if (humanized.length > 0) return humanized;
   }
   return trimmedSnapshotName || kindLabel;
+}
+
+/**
+ * Brand name for a driver kind, or for a default instance id that reuses one
+ * ("claudeAgent" becomes "Claude"). Use it where a row only has the thread's
+ * runtime driver or instance id; an id with no known brand stays as is.
+ */
+export function providerKindDisplayName(kindOrInstanceId: string): string {
+  return isProviderDriverKind(kindOrInstanceId)
+    ? (PROVIDER_DISPLAY_NAMES[kindOrInstanceId] ?? kindOrInstanceId)
+    : kindOrInstanceId;
 }
 
 /**

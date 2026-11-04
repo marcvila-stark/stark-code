@@ -1,4 +1,4 @@
-import { OrchestratorMcpFailure } from "@starkfuture/contracts";
+import { OrchestratorMcpFailure, PreviewBrowserStatus } from "@starkfuture/contracts";
 import {
   HTML_RENDER_COLUMN_WIDTH,
   HTML_RENDER_LAYOUT_GUIDE,
@@ -23,7 +23,7 @@ const PAGE_RULES =
   'Write one self-contained document with inline <style> and <script>. Local images written as absolute file paths (src="/abs/shot.png", CSS url(/abs/bg.webp), or a JS string) are inlined automatically. Network access is blocked: embed libraries, fonts and images rather than referencing a CDN. Forms, nested pages and workers are disabled.';
 
 export const HtmlPreviewTool = Tool.make("html_preview", {
-  description: `Render an HTML page in Stark's headless browser and get back a PNG screenshot, contentHeight (the height the page needs at this width), and its console output: log, info, warning, error, and uncaught exceptions, with stack traces pointing into page.html. console.log is a fine way to report your own checks. Use it to check and iterate on a page before html_render. The first preview on a machine can report that Stark is still installing its preview browser; call again a minute later. ${PAGE_RULES} The page gets the theme variables and layout described in html_render.`,
+  description: `Render an HTML page in Stark's headless browser and get back a PNG screenshot, contentHeight (the height the page needs at this width), and its console output: log, info, warning, error, and uncaught exceptions, with stack traces pointing into page.html. console.log is a fine way to report your own checks. Use it to check and iterate on a page before html_render. It needs Stark's preview browser and never installs it: without it the result has no screenshot, only previewBrowser and a message saying what to do instead. ${PAGE_RULES} The page gets the theme variables and layout described in html_render.`,
   parameters: Schema.Struct({
     html: Html,
     width: Schema.optional(
@@ -37,24 +37,28 @@ export const HtmlPreviewTool = Tool.make("html_preview", {
       }),
     ),
   }),
-  success: Schema.Struct({
-    width: Schema.Int,
-    contentHeight: Schema.Int,
-    capturedHeight: Schema.Int,
-    consoleMessages: Schema.Array(
-      Schema.Struct({
-        level: Schema.Literals(["log", "info", "warning", "error"]),
-        text: Schema.String,
-      }),
-    ),
-    missingImages: Schema.optional(Schema.Array(Schema.String)),
-    screenshot: Schema.Struct({
-      mimeType: Schema.Literal("image/png"),
-      data: Schema.String,
+  success: Schema.Union([
+    Schema.Struct({
       width: Schema.Int,
-      height: Schema.Int,
+      contentHeight: Schema.Int,
+      capturedHeight: Schema.Int,
+      consoleMessages: Schema.Array(
+        Schema.Struct({
+          level: Schema.Literals(["log", "info", "warning", "error"]),
+          text: Schema.String,
+        }),
+      ),
+      missingImages: Schema.optional(Schema.Array(Schema.String)),
+      screenshot: Schema.Struct({
+        mimeType: Schema.Literal("image/png"),
+        data: Schema.String,
+        width: Schema.Int,
+        height: Schema.Int,
+      }),
     }),
-  }),
+    // Not a failure: the agent learns the browser is missing and carries on without it.
+    Schema.Struct({ previewBrowser: PreviewBrowserStatus, message: Schema.String }),
+  ]),
   failure: OrchestratorMcpFailure,
   dependencies: [
     McpInvocationContext.McpInvocationContext,

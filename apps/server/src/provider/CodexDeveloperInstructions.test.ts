@@ -113,3 +113,19 @@ function toolInstructions(
 ) {
   return buildCodexAdditionalContext(runtime, available).stark_code_tools?.value ?? "";
 }
+
+describe("Stark preview browser turn context", () => {
+  const runtime = { model: "gpt-5.3-codex", reasoningEffort: "high" };
+
+  it("tells Codex before it picks a tool that html_preview has no browser", () => {
+    const context = buildCodexAdditionalContext(runtime, true, {
+      state: "not-installed",
+      totalBytes: 99_221_129,
+    });
+
+    NodeAssert.equal(context.stark_code_preview_browser?.kind, "application");
+    NodeAssert.match(context.stark_code_preview_browser?.value ?? "", /not installed/);
+    NodeAssert.match(context.stark_code_preview_browser?.value ?? "", /```mermaid/);
+    NodeAssert.equal(buildCodexAdditionalContext(runtime).stark_code_preview_browser, undefined);
+  });
+});

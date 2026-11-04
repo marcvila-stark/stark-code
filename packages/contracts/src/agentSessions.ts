@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 /** Coding agent home directories the scanner knows how to read. */
@@ -94,8 +100,21 @@ export class AgentSessionImportProjectChangedError extends Schema.TaggedError<Ag
 }
 
 export const AgentSessionImportResult = Schema.Struct({
+  /** Sessions that now have a thread, including ones an earlier import created. */
   importedCount: NonNegativeInt,
   skippedCount: NonNegativeInt,
+  /**
+   * The part of `importedCount` that an earlier import had already brought in;
+   * the difference is what this import added. Missing on older servers, which
+   * cannot tell the two apart.
+   */
+  alreadyImportedCount: Schema.optionalKey(NonNegativeInt),
+  /**
+   * Sessions Stark Code itself ran for one of its threads. They are already in
+   * History under that thread, so they are not imported and not part of
+   * `importedCount`. Missing on older servers, which import them as well.
+   */
+  alreadyRunByStarkCount: Schema.optionalKey(NonNegativeInt),
   updatedCount: Schema.optional(NonNegativeInt),
   unchangedCount: Schema.optional(NonNegativeInt),
   truncated: Schema.optional(Schema.Boolean),
@@ -112,6 +131,39 @@ export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanEr
   override get message(): string {
     return `Failed to scan agent sessions during ${this.operation}.`;
   }
+}
+
+const AGENT_SESSION_IMPORT_THREAD_PREFIX = "import:";
+const isProviderInstanceId = Schema.is(ProviderInstanceId);
+
+/**
+ * The thread an imported CLI session lives in. The id is stable, so importing
+ * the same session again finds the same thread, and the server recognizes an
+ * imported thread by it: keep the format, threads imported earlier depend on it.
+ */
+export function agentSessionImportThreadId(input: {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+}): ThreadId {
+  return ThreadId.make(
+    `${AGENT_SESSION_IMPORT_THREAD_PREFIX}${input.providerInstanceId}:${input.providerSessionId}`,
+  );
+}
+
+/** The CLI session a thread was imported from, or `null` for any other thread. */
+export function parseAgentSessionImportThreadId(threadId: string): {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: string;
+} | null {
+  if (!threadId.startsWith(AGENT_SESSION_IMPORT_THREAD_PREFIX)) return null;
+  const rest = threadId.slice(AGENT_SESSION_IMPORT_THREAD_PREFIX.length);
+  // Instance ids are slugs, so the first colon ends the instance id.
+  const separator = rest.indexOf(":");
+  if (separator <= 0) return null;
+  const providerInstanceId = rest.slice(0, separator);
+  const providerSessionId = rest.slice(separator + 1);
+  if (!isProviderInstanceId(providerInstanceId) || providerSessionId.trim() === "") return null;
+  return { providerInstanceId, providerSessionId };
 }
 
 /** Local history discovery is opt-in and never launches a provider. */

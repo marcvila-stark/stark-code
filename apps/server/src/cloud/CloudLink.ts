@@ -334,7 +334,7 @@ function stringToBytes(value: string): Uint8Array {
 }
 
 /** Records each one-shot marker; false when any already existed, so the request is a replay. */
-export function consumeCloudReplayGuards(input: {
+function consumeCloudReplayGuards(input: {
   readonly secrets: ServerSecretStore.ServerSecretStore["Service"];
   readonly names: ReadonlyArray<string>;
   readonly value: Uint8Array;

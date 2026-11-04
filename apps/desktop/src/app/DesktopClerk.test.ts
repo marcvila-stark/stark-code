@@ -117,7 +117,7 @@ describe("DesktopClerk", () => {
       // the lock both lives in and creates the userData directory — so the
       // real path must be set before the bridge exists.
       assert.deepEqual(events, [
-        "setPath:userData:/tmp/app-data/starkcode-dev",
+        "setPath:userData:/tmp/app-data/stark-code-dev",
         "createClerkBridge",
       ]);
       storageMock.mockClear();
@@ -130,13 +130,13 @@ describe("DesktopClerk", () => {
       name: "packaged Windows",
       isDevelopment: false,
       platform: "win32" as const,
-      userData: "/tmp/app-data/starkcode-v2",
+      userData: "/tmp/app-data/stark-code-v2",
     },
     {
       name: "development",
       isDevelopment: true,
       platform: "win32" as const,
-      userData: "/tmp/app-data/starkcode-dev",
+      userData: "/tmp/app-data/stark-code-dev",
     },
   ])(
     "creates the bridge before startup can yield to the event loop ($name)",
@@ -317,7 +317,7 @@ it.effect(
 );
 
 it.effect.each(["startup", "open-url"] as const)(
-  "receives hosted web sign-in through the desktop %s handler",
+  "receives local web sign-in through the desktop %s handler",
   (entry) =>
     Effect.gen(function* () {
       storageMock.mockReturnValue(storageAdapter);
@@ -341,7 +341,7 @@ it.effect.each(["startup", "open-url"] as const)(
       }).toString();
       const request = {
         authorizationUrl: authorize.toString(),
-        returnUrl: "https://unconfigured.invalid/welcome#agents:remote-one",
+        returnUrl: "http://127.0.0.1:3001/welcome#agents:remote-one",
         environmentId: EnvironmentId.make("remote-one"),
         instanceId: ProviderInstanceId.make("work"),
         flowId: "flow-one",

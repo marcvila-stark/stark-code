@@ -1,3 +1,4 @@
+import type { DesktopUpdateState } from "@starkfuture/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -9,6 +10,7 @@ import { makeComponentLogger } from "../app/DesktopObservability.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronMenu from "../electron/ElectronMenu.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
 import * as DesktopWindow from "./DesktopWindow.ts";
 
 export class DesktopApplicationMenuActionError extends Schema.TaggedError<DesktopApplicationMenuActionError>()(
@@ -31,6 +33,7 @@ export class DesktopApplicationMenu extends Context.Service<
 >()("@starkfuture/desktop/window/DesktopApplicationMenu") {}
 
 type DesktopApplicationMenuRuntimeServices =
+  | DesktopUpdates.DesktopUpdates
   | DesktopWindow.DesktopWindow
   | ElectronDialog.ElectronDialog;
 
@@ -59,6 +62,54 @@ const runMainContentsCommand = Effect.fn("desktop.menu.runMainContentsCommand")(
   yield* desktopWindow.runMainContentsCommand(command);
 });
 
+/**
+ * What "Check for Updates…" tells the user once the check ran, or null when
+ * the app window shows the result (an update found, downloading or ready).
+ * A build with updates off says why; it never claims to be up to date.
+ */
+export function describeMenuUpdateCheck(
+  state: DesktopUpdateState,
+): Pick<Electron.MessageBoxOptions, "type" | "title" | "message" | "detail"> | null {
+  if (state.status === "disabled") {
+    return {
+      type: "info",
+      title: "Automatic updates are off",
+      message: "Automatic updates are off.",
+      detail: state.disabledReason?.message ?? "This build can't update itself.",
+    };
+  }
+  if (state.status === "up-to-date") {
+    return {
+      type: "info",
+      title: "You're up to date",
+      message: `Stark Code ${state.currentVersion} is the newest version.`,
+    };
+  }
+  if (state.status === "error") {
+    return {
+      type: "warning",
+      title: "Couldn't check for updates",
+      message: "Couldn't check for updates.",
+      detail: state.message ?? "Try again later.",
+    };
+  }
+  return null;
+}
+
+const checkForUpdatesFromMenu = Effect.gen(function* () {
+  const updates = yield* DesktopUpdates.DesktopUpdates;
+  const electronDialog = yield* ElectronDialog.ElectronDialog;
+  const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  const before = yield* updates.getState;
+  const state = before.status === "disabled" ? before : (yield* updates.check("menu")).state;
+  const dialog = describeMenuUpdateCheck(state);
+  if (dialog === null) {
+    yield* desktopWindow.revealOrCreateMain;
+    return;
+  }
+  yield* electronDialog.showMessageBox({ ...dialog, buttons: ["OK"] });
+}).pipe(Effect.withSpan("desktop.menu.checkForUpdates"));
+
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const electronMenu = yield* ElectronMenu.ElectronMenu;
@@ -83,6 +134,9 @@ export const make = Effect.gen(function* () {
   };
 
   const configure = Effect.gen(function* () {
+    const checkForUpdatesClick = () => {
+      runMenuEffect("check-for-updates", checkForUpdatesFromMenu);
+    };
     const settingsClick = () => {
       runMenuEffect("open-settings", dispatchMenuAction("open-settings"));
     };
@@ -112,6 +166,7 @@ export const make = Effect.gen(function* () {
         label: environment.displayName,
         submenu: [
           { role: "about", label: `About ${environment.displayName}` },
+          { label: "Check for Updates…", click: checkForUpdatesClick },
           { type: "separator" },
           {
             label: "Settings...",

@@ -1,3 +1,6 @@
+import type { ScheduledTaskRun } from "@starkfuture/contracts";
+import { scheduledTaskRunStateLabel } from "@starkfuture/client-runtime/scheduled-task-runs";
+
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
@@ -54,4 +57,20 @@ export function formatNextScheduledTaskRun(nextRunAt: string, now: number): stri
     ...(next.getFullYear() !== current.getFullYear() ? { year: "numeric" as const } : {}),
   });
   return `Next run ${date} at ${time}`;
+}
+
+function agoLabel(at: number, now: number): string {
+  const elapsed = now - at;
+  if (!Number.isFinite(elapsed)) return "";
+  if (elapsed < MINUTE) return "just now";
+  if (elapsed < HOUR) return `${Math.floor(elapsed / MINUTE)}m ago`;
+  if (elapsed < DAY) return `${Math.floor(elapsed / HOUR)}h ago`;
+  return `${Math.floor(elapsed / DAY)}d ago`;
+}
+
+/** The newest run's state and when it started, or when it was due if it never did. */
+export function formatScheduledTaskLastRun(run: ScheduledTaskRun, now: number): string {
+  const ago = agoLabel(Date.parse(run.startedAt ?? run.createdAt), now);
+  const state = scheduledTaskRunStateLabel(run.state);
+  return ago === "" ? `Last run: ${state}` : `Last run: ${state} · ${ago}`;
 }

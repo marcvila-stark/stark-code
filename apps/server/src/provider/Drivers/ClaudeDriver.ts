@@ -406,10 +406,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         displayName,
         accentColor,
         enabled,
-        snapshot,
-        invalidateCaches: usagePublisher.invalidate.pipe(
-          Effect.andThen(Cache.invalidateAll(capabilitiesProbeCache)),
-        ),
+        snapshot: {
+          ...snapshot,
+          // A fresh probe of the same account must keep its live CLI publisher.
+          // Only a real login/organization change retires that process's usage.
+          invalidateAccount: usagePublisher.invalidate.pipe(
+            Effect.andThen(snapshot.invalidateAccount ?? Effect.void),
+          ),
+        },
+        invalidateCaches: Cache.invalidateAll(capabilitiesProbeCache),
         snapshotForCwd: (cwd: string) =>
           snapshot.getSnapshot.pipe(
             Effect.flatMap((machineSnapshot) =>

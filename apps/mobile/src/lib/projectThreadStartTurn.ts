@@ -5,6 +5,7 @@ import {
   type ChatAttachment,
   type ModelSelection,
   type OrchestrationMessageContext,
+  type PermissionSource,
   type ProjectId,
   type ProviderInteractionMode,
   type RuntimeMode,
@@ -28,6 +29,8 @@ export interface ProjectThreadStartTurnSpec {
   readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
+  /** Omitted means a Stark preset; the server stores `inherit` only where supported. */
+  readonly permissionSource?: PermissionSource;
   readonly workspaceMode: "local" | "worktree";
   readonly branch: string | null;
   readonly worktreePath: string | null;
@@ -66,6 +69,7 @@ export function buildProjectThreadStartTurnInput(spec: ProjectThreadStartTurnSpe
         modelSelection: spec.modelSelection,
         runtimeMode: spec.runtimeMode,
         interactionMode: spec.interactionMode,
+        ...(spec.permissionSource === undefined ? {} : { permissionSource: spec.permissionSource }),
         branch: spec.branch,
         worktreePath: isWorktree ? null : spec.worktreePath,
         createdAt: spec.createdAt,

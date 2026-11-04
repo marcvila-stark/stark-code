@@ -85,8 +85,14 @@ export const layer: Layer.Layer<ThreadForkServiceV2> = Layer.succeed(
             cause: forkableSourceRunStatusError(input.sourceRun),
           });
         }
+        // A fork starts its own audit trail and has no run to wait for.
+        const {
+          permissionMigrations: _permissionMigrations,
+          permissionChangePending: _permissionChangePending,
+          ...sourceThread
+        } = input.sourceProjection.thread;
         const targetThread: OrchestrationV2AppThread = {
-          ...input.sourceProjection.thread,
+          ...sourceThread,
           runtimeMode:
             input.sourceProjection.thread.runtimeMode === "full-access"
               ? "approval-required"

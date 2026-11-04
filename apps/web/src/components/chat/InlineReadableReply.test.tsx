@@ -372,7 +372,10 @@ it("cancels a deferred list scroll when its conversation is left", async () => {
   const dispose = revealReadableOverview({
     overview,
     viewport: container,
-    scrollToOffset: () => new Promise<void>((resolve) => { complete = resolve; }),
+    scrollToOffset: () =>
+      new Promise<void>((resolve) => {
+        complete = resolve;
+      }),
     cancelScroll,
     onSettled,
   });

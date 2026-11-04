@@ -16,6 +16,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@starkfuture/contracts";
 import * as Deferred from "effect/Deferred";
@@ -472,6 +473,40 @@ it.effect(
       });
 
       expect(dispatched).toEqual(["message.dispatch"]);
+    }).pipe(Effect.provide(layerTest));
+  },
+);
+
+it.effect(
+  "the dispatch chokepoint refuses Ask again for a lost decision on a project-disabled instance",
+  () => {
+    const projectId = ProjectId.make("project:thread-management:chokepoint");
+    const instanceId = ProviderInstanceId.make("codex_work");
+    const dispatched: Array<string> = [];
+    const layerTest = layerDispatchChokepointTest(
+      ServerSettings.layerTest({
+        providerInstances: { [instanceId]: { driver: "codex", enabled: true } },
+        projectSettingsOverrides: {
+          [projectId]: { providerInstances: { [instanceId]: { enabled: false } } },
+        },
+      }),
+    )(dispatched);
+
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(
+        threads.dispatch({
+          type: "runtime-request.ask-again",
+          commandId: CommandId.make("command:thread-management:chokepoint-ask-again"),
+          threadId: ThreadId.make("thread:thread-management:chokepoint"),
+          requestIds: [RuntimeRequestId.make("request:thread-management:lost")],
+        }),
+      );
+
+      expect(error).toBeInstanceOf(
+        ThreadManagementService.ThreadManagementProviderInstanceDisabledError,
+      );
+      expect(dispatched).toEqual([]);
     }).pipe(Effect.provide(layerTest));
   },
 );

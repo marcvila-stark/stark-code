@@ -261,6 +261,11 @@ it("continues to default newly created tasks to origin", () => {
   expect(createDraft(null, null).startFromOrigin).toBe(true);
 });
 
+it("starts new tasks on the project's default mode and keeps a saved task's own", () => {
+  expect(createDraft(null, null).runtimeMode).toBeNull();
+  expect(editDraft(legacyTask).runtimeMode).toBe("full-access");
+});
+
 describe("scheduled task model defaults", () => {
   const instanceId = ProviderInstanceId.make("codex");
   const projectId = ProjectId.make("project");

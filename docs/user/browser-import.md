@@ -1,26 +1,27 @@
 # Import browser sessions
 
-The desktop app can import cookies from another browser so you can reuse its signed-in sessions
-in your **Personal imported sessions** profile. Agents cannot open this profile or any other
-personal profile. They use a separate **Agent browser** whose sessions are discarded when the app quits.
+The desktop app can copy sign-in cookies from another browser into its own **Personal imported
+sessions** profile, so sites like Stark Pages open already signed in. The copies stay on this
+computer, encrypted with your system keychain. They are not uploaded to Stark servers and are used
+when you visit the selected websites. Agents cannot open this profile or any other personal
+profile. They use a separate **Agent browser** whose sessions are discarded when the app quits.
 
 During setup, choose **Browser** after connecting your agents. Your default browser is selected
-when it is recognized. Choose **Review import**, select the source profile and the
-sites to copy, then confirm and import the selected sites. No sites start selected.
-Only the exact selected cookie domains are copied; a parent domain is a separate
-choice because its cookies can sign you into multiple subdomains.
-
-Stark sites appear first. **Select Stark sites** selects only addresses under starkfuture.com;
-choose shared services such as Google or GitHub yourself because they may include personal accounts.
-Use search to find other sites, or **Select all** to explicitly include every listed site.
-The import button shows the number selected. Changing the selection requires confirmation again.
-Select all is unavailable when the browser cannot provide a complete site list; add exact
-site addresses instead. An import can include up to 2,000 sites.
+when it is recognized. Choose **Review before importing**, pick the source profile and the sites
+to copy, then choose **Copy sign-ins**. **Stark sites** and **Sign-in providers** (Google,
+Microsoft and GitHub) are one-click sets when your browser has them. Choose the site names under a
+set to list every site in it and untick the ones you don't want. Every other site is under
+**Other sites**, where you can also add one by name. Nothing starts selected, and
+one import copies up to 100 sites. Only the exact selected sites are copied; a parent domain is a
+separate choice because its cookies can sign you into multiple subdomains. If a site still asks
+you to sign in, copy its sign-in provider too.
 
 To import later, open **Settings → Integrations → Browser profiles →
 Add profile**, then choose a browser under **Import from**. Close the source browser before
 importing, and allow an operating-system keyring unlock prompt if one appears.
 Imports always go into Personal imported sessions, regardless of the current default profile.
+To remove imported sign-ins, choose **Clear cookies and cache** for Personal imported sessions
+in the same list.
 
 This is a one-time copy. Later login changes stay separate between the two browsers, and some
 sites may still require you to sign in again.

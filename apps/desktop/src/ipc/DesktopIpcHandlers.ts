@@ -1,3 +1,4 @@
+import { browserCapture, installBrowserCaptureEventForwarding } from "./methods/browserCapture.ts";
 import * as Effect from "effect/Effect";
 
 import { receiveProviderAuthCallback, cancelProviderAuthCallback } from "./methods/providerAuth.ts";
@@ -31,11 +32,15 @@ import {
   resolveSshPasswordPrompt,
 } from "./methods/sshEnvironment.ts";
 import {
+  acknowledgeUpdateRestart,
+  cancelUpdateDownload,
   checkForUpdate,
   downloadUpdate,
   getUpdateState,
   installUpdate,
+  registerUpdateRestartParticipant,
   setUpdateChannel,
+  setUpdatePostponed,
 } from "./methods/updates.ts";
 import {
   getAppBranding,
@@ -112,6 +117,8 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(getClientSettings);
   yield* ipc.handle(setClientSettings);
   yield* ipc.handle(getConnectionCatalog);
+  yield* installBrowserCaptureEventForwarding();
+  yield* ipc.handle(browserCapture);
   yield* ipc.handle(getSnapShotState);
   yield* ipc.handle(setupSnapShot);
   yield* ipc.handle(previewSnapShotConfig);
@@ -180,6 +187,10 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(downloadUpdate);
   yield* ipc.handle(installUpdate);
   yield* ipc.handle(checkForUpdate);
+  yield* ipc.handle(cancelUpdateDownload);
+  yield* ipc.handle(setUpdatePostponed);
+  yield* ipc.handle(registerUpdateRestartParticipant);
+  yield* ipc.handle(acknowledgeUpdateRestart);
   yield* ipc.handle(getCliCommandState);
   yield* ipc.handle(installCliCommand);
   yield* ipc.handle(uninstallCliCommand);

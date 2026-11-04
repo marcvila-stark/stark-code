@@ -30,10 +30,18 @@ describe("requestLatencyState", () => {
     expect(getSlowRpcAckRequests()).toMatchObject([
       {
         requestId: "1",
+        method: "server.getConfig",
         tag: "server.getConfig",
         thresholdMs: SLOW_RPC_ACK_THRESHOLD_MS,
       },
     ]);
+  });
+
+  it("ignores connector sign-in, which answers only after the user signs in", () => {
+    trackRpcRequestSent("1", WS_METHODS.mcpServerSignIn);
+    vi.advanceTimersByTime(SLOW_RPC_ACK_THRESHOLD_MS * 4);
+
+    expect(getSlowRpcAckRequests()).toEqual([]);
   });
 
   it("clears the slow request once the server acknowledges it", () => {

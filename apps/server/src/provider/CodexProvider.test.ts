@@ -1,11 +1,25 @@
 import { assert, it } from "@effect/vitest";
+import { CodexSettings } from "@starkfuture/contracts";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 import {
   applyPreferredCodexDefaultModel,
+  makePendingCodexProvider,
   mapCodexModelCapabilities,
   parseCodexSkillsListResponse,
 } from "./CodexProvider.ts";
 import type * as CodexSchema from "effect-codex-app-server/schema";
+
+const DEFAULT_CODEX_SETTINGS = Schema.decodeSync(CodexSettings)({});
+
+it.effect("advertises Supervised as Codex's only Stark preset, and Codex's own settings", () =>
+  Effect.gen(function* () {
+    const provider = yield* makePendingCodexProvider(DEFAULT_CODEX_SETTINGS);
+    assert.deepStrictEqual(provider.supportedRuntimeModes, ["approval-required"]);
+    assert.strictEqual(provider.nativePermissionInherit, true);
+  }),
+);
 
 it("preserves native Codex plugin identity without guessing from its installation path", () => {
   const skill = {

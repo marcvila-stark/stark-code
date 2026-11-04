@@ -116,7 +116,9 @@ instance:
 
 Stark Code remembers your provider, model, and model options for new threads. A
 project's configured model takes precedence; resetting that project setting
-returns to the remembered selection.
+returns to the remembered selection. Before you have picked one, or when the
+remembered provider can no longer run, new threads start on Claude if it is
+signed in and ready, otherwise on the first provider that is.
 
 Leaving reasoning level or service tier unset uses the provider's own configuration.
 
@@ -327,7 +329,9 @@ return to the conversation.
 **Terminal** runs shell commands beside the chat. **Agent shell** opens the native
 Claude or Codex program in the main conversation area. **Terminal below chat**
 controls the separate bottom drawer. Chat details, including branch and working
-folder controls, are also available in Tools.
+folder controls, are also available in Tools. **Hide chat details** at the bottom
+of the card hides it in every chat, even after a restart, until you choose
+**Tools → Chat details** again.
 
 ## View Stark Pages
 

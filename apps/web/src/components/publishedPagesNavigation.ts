@@ -30,7 +30,7 @@ function resultValue(result: StarkPublishedPagesReadResult): unknown {
   throw new Error("Pages returned a response this version cannot display.");
 }
 
-export function publishedProjectTitle(root: string): string {
+function publishedProjectTitle(root: string): string {
   return root.split("/").findLast(Boolean)?.replace(/[-_]+/g, " ") || root;
 }
 

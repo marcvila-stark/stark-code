@@ -93,29 +93,30 @@ describe("Pages website IPC trust boundary", () => {
       }),
   );
 
-  it.effect(
-    "rejects foreign main-frame origins and admits only the configured dev origin in development",
-    () =>
-      Effect.gen(function* () {
-        for (const options of [
-          { url: "https://pages.starkfuture.com/" },
-          { url: "starkcode://other/" },
-          { url: "starkcode://user:pass@app/" },
-          { url: "http://localhost:5173/" },
-          { url: "http://localhost:5174/", development: true },
-          { windowAvailable: false },
-        ]) {
-          const f = fixture(options);
-          expect(
-            Exit.isFailure(yield* Effect.exit(f.run(getState.handler(undefined, f.event)))),
-          ).toBe(true);
-          expect(f.controller.getState).not.toHaveBeenCalled();
-        }
-        const dev = fixture({ url: "http://localhost:5173/chat", development: true });
-        expect(yield* dev.run(getState.handler(undefined, dev.event))).toMatchObject({
-          title: "Stark Pages",
-        });
-      }),
+  it.effect("rejects foreign main-frame origins and admits only this build's app scheme", () =>
+    Effect.gen(function* () {
+      for (const options of [
+        { url: "https://pages.starkfuture.com/" },
+        { url: "starkcode://other/" },
+        { url: "starkcode://user:pass@app/" },
+        { url: "http://localhost:5173/" },
+        { url: "starkcode-dev://app/" },
+        // The main window loads starkcode-dev://app in development, never the dev server.
+        { url: "http://localhost:5173/chat", development: true },
+        { url: "starkcode://app/", development: true },
+        { windowAvailable: false },
+      ]) {
+        const f = fixture(options);
+        expect(
+          Exit.isFailure(yield* Effect.exit(f.run(getState.handler(undefined, f.event)))),
+        ).toBe(true);
+        expect(f.controller.getState).not.toHaveBeenCalled();
+      }
+      const dev = fixture({ url: "starkcode-dev://app/#/chat", development: true });
+      expect(yield* dev.run(getState.handler(undefined, dev.event))).toMatchObject({
+        title: "Stark Pages",
+      });
+    }),
   );
 
   it.effect(

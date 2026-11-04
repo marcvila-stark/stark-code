@@ -109,6 +109,8 @@ export function nativeAgentLaunch(input: {
       : /^(?:--permission-mode(?:=|$)|--dangerously-skip-permissions$)/.test(arg),
   );
   // Keep explicit user configuration; a normal native launch asks for approvals.
+  // This is the terminal's own policy: the account's new-chat permission source
+  // (inherit Claude's settings or a Stark preset) never changes it.
   if (!hasPermissionPolicy && !(BRAND.requireApprovalsByDefault && input.driver === "codex")) {
     args.push(
       ...(input.driver === "codex"

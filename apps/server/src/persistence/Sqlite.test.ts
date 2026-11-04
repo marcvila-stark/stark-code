@@ -107,7 +107,13 @@ it.effect("collects planner statistics for an existing database on open", () => 
       const rows = yield* sql<{ readonly stat: string }>`
         SELECT stat FROM sqlite_stat1 WHERE idx = 'stats_probe_thread_idx'
       `;
-      assert.deepEqual([...rows], [{ stat: "1000 100" }]);
+      assert.lengthOf(rows, 1);
+      const [indexedRows, estimatedRowsPerKey] = rows[0]!.stat.split(" ").map(Number);
+      assert.equal(indexedRows, 1000);
+      // PRAGMA optimize uses bounded analysis, so selectivity is an estimate.
+      assert.isTrue(Number.isFinite(estimatedRowsPerKey));
+      assert.isAbove(estimatedRowsPerKey!, 0);
+      assert.isAtMost(estimatedRowsPerKey!, indexedRows!);
     }).pipe(Effect.provide(persistence()));
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),

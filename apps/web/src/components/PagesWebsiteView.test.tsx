@@ -280,3 +280,42 @@ it("discards a capture arriving after the panel is closed", async () => {
   await render();
   expect(container.querySelector("img")).toBeNull();
 });
+
+it("shows progress outside the native website, then useful failure and retry states", async () => {
+  await render();
+  await act(() => stateEvent({ ...ready, loading: true }));
+  expect(container.textContent).toContain("Waiting for Pages to respond");
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+  await act(() =>
+    stateEvent({
+      ...ready,
+      error: "This Mac is offline. Reconnect to the internet, then try again.",
+    }),
+  );
+  expect(container.textContent).not.toContain("Waiting for Pages to respond");
+  expect(container.textContent).toContain("Pages couldn’t load");
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("offline");
+  expect(container.textContent).not.toContain("Already signed in");
+  expect(bridge.navigate).not.toHaveBeenCalled();
+  await click("Try again");
+  await act(() => stateEvent({ ...ready, loading: true }));
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+  expect(container.textContent).toContain("Waiting for Pages to respond");
+  await act(() => stateEvent(ready));
+  expect(container.textContent).not.toContain("Waiting for Pages to respond");
+  expect(bridge.setBounds).toHaveBeenLastCalledWith(expect.objectContaining({ visible: true }));
+});
+
+it("ignores an initial lookup rejection when a newer working state already arrived", async () => {
+  let rejectInitial!: (error: Error) => void;
+  vi.mocked(bridge.getState).mockReturnValue(
+    new Promise((_resolve, reject) => {
+      rejectInitial = reject;
+    }),
+  );
+  await render();
+  await act(() => stateEvent(ready));
+  await act(() => rejectInitial(new Error("old failure")));
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+  expect(container.textContent).toContain(ready.title);
+});

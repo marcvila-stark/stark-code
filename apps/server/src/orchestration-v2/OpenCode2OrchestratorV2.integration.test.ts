@@ -79,9 +79,8 @@ const mcpRules = (name: string) => [
   { action: "stark-code-*", resource: "*", effect: "deny" },
   { action: `stark-code-thread_${name}_*`, resource: "*", effect: "allow" },
 ];
-const FULL_ACCESS = [{ action: "*", resource: "*", effect: "allow" }];
-/** Full access for the thread named `name`. */
-const starkRules = (name: string) => [...FULL_ACCESS, ...mcpRules(name)];
+/** Non-Claude providers stay Supervised under Stark presets. */
+const starkRules = (name: string) => supervisedRules(name);
 /** Paths the build and plan agents allow for themselves, as 2.0.18 lists them. */
 const BUILD_PATHS = [
   {
@@ -136,16 +135,11 @@ const supervisedRules = (name: string) => [
   ...BUILD_PATHS,
   ...mcpRules(name),
 ];
-const autoEditRules = (name: string) => [
-  { action: "shell", resource: "*", effect: "ask" },
-  { action: "edit", resource: "*", effect: "allow" },
-  { action: "external_directory", resource: "*", effect: "ask" },
-  ...BUILD_PATHS,
-  ...mcpRules(name),
-];
-/** Plan mode on Full access: edits are denied except the plan agent's own plan files. */
+/** Plan mode keeps shell supervised and denies edits outside the agent's own plan paths. */
 const planRules = (name: string) => [
-  { action: "*", resource: "*", effect: "allow" },
+  { action: "shell", resource: "*", effect: "ask" },
+  { action: "edit", resource: "*", effect: "ask" },
+  { action: "external_directory", resource: "*", effect: "ask" },
   { action: "edit", resource: "*", effect: "deny" },
   ...PLAN_PATHS,
   ...mcpRules(name),
@@ -223,8 +217,8 @@ const createdSession = (
   directory: string,
   name: string,
   permissions: ReadonlyArray<unknown> = starkRules(name),
-  // Only a mode that narrows Full access reads the agents' own path rules.
-  narrows = false,
+  // Supervised presets preserve the agents' own path rules.
+  narrows = true,
 ): ReadonlyArray<ProviderReplayEntry> => [
   out("event.subscribe"),
   out("model.list", "<any>"),
@@ -273,7 +267,7 @@ const threadCommands = (input: {
       projectId: ProjectId.make(`project:${input.name}`),
       title: input.name,
       modelSelection: bigPickle,
-      runtimeMode: input.runtimeMode ?? "full-access",
+      runtimeMode: input.runtimeMode ?? "approval-required",
       interactionMode: input.interactionMode ?? "default",
       branch: null,
       worktreePath: input.worktreePath,
@@ -334,7 +328,7 @@ const runScenario = (input: {
   });
 
 describe("OpenCode 2 through the orchestrator", () => {
-  it.effect.each(["message", "thread settings"] as const)(
+  it.live.each(["message", "thread settings"] as const)(
     "switches the session's model before the next prompt when changed from the %s",
     (via) =>
       Effect.gen(function* () {
@@ -388,7 +382,7 @@ describe("OpenCode 2 through the orchestrator", () => {
       }).pipe(Effect.scoped),
   );
 
-  it.effect("moves the session to the thread's new worktree before the next prompt", () =>
+  it.live("moves the session to the thread's new worktree before the next prompt", () =>
     Effect.gen(function* () {
       const name = "opencode2-worktree-move";
       const before = yield* checkpointWorkspace(`${name}-before`);
@@ -406,6 +400,8 @@ describe("OpenCode 2 through the orchestrator", () => {
           reply("session.get", sessionInfo(before, starkRules(name), name)),
           // The worktree change detached the thread, so its session is loaded afresh.
           ...noOpenRequests,
+          out("agent.list", "<any>"),
+          reply("agent.list", agentList(after)),
           out("session.move", { sessionID: SESSION, directory: after }),
           reply("session.move", null),
           // The moved thread reopens its session, which writes the entry again.
@@ -432,7 +428,7 @@ describe("OpenCode 2 through the orchestrator", () => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("gives a session made with older rules Stark's rules before its next prompt", () =>
+  it.live("gives a session made with older rules Stark's rules before its next prompt", () =>
     Effect.gen(function* () {
       const name = "opencode2-resume-rules";
       const before = yield* checkpointWorkspace(`${name}-before`);
@@ -462,6 +458,8 @@ describe("OpenCode 2 through the orchestrator", () => {
             ),
           ),
           ...noOpenRequests,
+          out("agent.list", "<any>"),
+          reply("agent.list", agentList(after)),
           out("session.update", { sessionID: SESSION, permissions: starkRules(name) }),
           reply("session.update", null),
           out("session.move", { sessionID: SESSION, directory: after }),
@@ -488,35 +486,33 @@ describe("OpenCode 2 through the orchestrator", () => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect(
-    "creates a Supervised thread's session with rules that ask before shell and edits",
-    () =>
-      Effect.gen(function* () {
-        const name = "opencode2-supervised-rules";
-        const cwd = yield* checkpointWorkspace(name);
-        const thread = threadCommands({
-          name,
-          worktreePath: cwd,
-          runtimeMode: "approval-required",
-        });
-        const projection = yield* runScenario({
-          name,
-          threadId: thread.threadId,
-          entries: [
-            ...createdSession(cwd, name, supervisedRules(name), true),
-            ...instructionsWritten,
-            ...answeredPrompt("FIRST"),
-          ],
-          commands: [thread.create, thread.message("first")],
-        });
-        assert.deepEqual(
-          projection.runs.map((run) => run.status),
-          ["completed"],
-        );
-      }).pipe(Effect.scoped),
+  it.live("creates a Supervised thread's session with rules that ask before shell and edits", () =>
+    Effect.gen(function* () {
+      const name = "opencode2-supervised-rules";
+      const cwd = yield* checkpointWorkspace(name);
+      const thread = threadCommands({
+        name,
+        worktreePath: cwd,
+        runtimeMode: "approval-required",
+      });
+      const projection = yield* runScenario({
+        name,
+        threadId: thread.threadId,
+        entries: [
+          ...createdSession(cwd, name, supervisedRules(name), true),
+          ...instructionsWritten,
+          ...answeredPrompt("FIRST"),
+        ],
+        commands: [thread.create, thread.message("first")],
+      });
+      assert.deepEqual(
+        projection.runs.map((run) => run.status),
+        ["completed"],
+      );
+    }).pipe(Effect.scoped),
   );
 
-  it.effect("rewrites the session's rules when the thread's mode changes between turns", () =>
+  it.live("keeps a Supervised session when legacy mode commands ask for broader permissions", () =>
     Effect.gen(function* () {
       const name = "opencode2-mode-change";
       const cwd = yield* checkpointWorkspace(name);
@@ -535,19 +531,8 @@ describe("OpenCode 2 through the orchestrator", () => {
           ...createdSession(cwd, name),
           ...instructionsWritten,
           ...answeredPrompt("FIRST"),
-          // A mode change detaches nothing: the same session is resumed with the new rules.
-          out("session.get", { sessionID: SESSION }),
-          reply("session.get", sessionInfo(cwd, starkRules(name), name)),
-          out("agent.list", "<any>"),
-          reply("agent.list", agentList(cwd)),
-          out("session.update", { sessionID: SESSION, permissions: autoEditRules(name) }),
-          reply("session.update", null),
+          // Unsupported wider presets stay at the provider's Supervised floor.
           ...answeredPrompt("SECOND"),
-          // Back to Full access: the narrowing rules go.
-          out("session.get", { sessionID: SESSION }),
-          reply("session.get", sessionInfo(cwd, autoEditRules(name), name)),
-          out("session.update", { sessionID: SESSION, permissions: starkRules(name) }),
-          reply("session.update", null),
           ...answeredPrompt("THIRD"),
         ],
         commands: [
@@ -567,7 +552,7 @@ describe("OpenCode 2 through the orchestrator", () => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("denies edits outside the plan directory in plan mode and lifts it after", () =>
+  it.live("denies edits outside the plan directory in plan mode and lifts it after", () =>
     Effect.gen(function* () {
       const name = "opencode2-plan-rules";
       const cwd = yield* checkpointWorkspace(name);
@@ -584,10 +569,15 @@ describe("OpenCode 2 through the orchestrator", () => {
           ...answeredPrompt("PLANNED"),
           out("session.get", { sessionID: SESSION }),
           reply("session.get", sessionInfo(cwd, planRules(name), name)),
-          out("session.update", { sessionID: SESSION, permissions: starkRules(name) }),
+          out("session.update", {
+            sessionID: SESSION,
+            permissions: [...supervisedRules(name).slice(0, 3), ...PLAN_PATHS, ...mcpRules(name)],
+          }),
           reply("session.update", null),
           out("session.switchAgent", { sessionID: SESSION, agent: "build" }),
           reply("session.switchAgent", null),
+          out("session.update", { sessionID: SESSION, permissions: supervisedRules(name) }),
+          reply("session.update", null),
           ...answeredPrompt("BUILT"),
         ],
         commands: [
@@ -609,7 +599,7 @@ describe("OpenCode 2 through the orchestrator", () => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("forks from an earlier turn before the next turn's user message", () =>
+  it.live("forks from an earlier turn before the next turn's user message", () =>
     Effect.gen(function* () {
       const name = "opencode2-fork";
       const cwd = yield* checkpointWorkspace(name);
@@ -680,7 +670,7 @@ describe("OpenCode 2 through the orchestrator", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
   );
 
-  it.effect("never sends OpenCode a queued message that was cancelled", () =>
+  it.live("never sends OpenCode a queued message that was cancelled", () =>
     Effect.gen(function* () {
       const name = "opencode2-queued-cancel";
       const cwd = yield* checkpointWorkspace(name);
@@ -830,7 +820,7 @@ describe("OpenCode 2 through the orchestrator", () => {
     return { result, projection };
   });
 
-  it.effect("backfills a follow-up whose stream dropped mid-run and ends it completed", () =>
+  it.live("backfills a follow-up whose stream dropped mid-run and ends it completed", () =>
     Effect.gen(function* () {
       const { result, projection } = yield* backgroundReconnect({
         name: "opencode2-follow-up-reconnect",
@@ -927,7 +917,7 @@ describe("OpenCode 2 through the orchestrator", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
   );
 
-  it.effect(
+  it.live(
     "settles a background subagent whose end was lost with the stream, and takes the next turn",
     () =>
       Effect.gen(function* () {
@@ -1031,7 +1021,7 @@ describe("OpenCode 2 through the orchestrator", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
   );
 
-  it.effect(
+  it.live(
     "settles a background subagent whose report OpenCode delivers into the launching turn",
     () =>
       Effect.gen(function* () {
@@ -1130,58 +1120,93 @@ describe("OpenCode 2 through the orchestrator", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
   );
 
-  it.effect(
-    "runs plan mode as OpenCode's plan agent and switches back before the next prompt",
-    () =>
-      Effect.gen(function* () {
-        const name = "opencode2_switch";
-        const cwd = yield* checkpointWorkspace(name);
-        const thread = threadCommands({ name, worktreePath: cwd });
-        // The spike's recording: plan agent, then build agent and a new model on
-        // one session. Its `<work>` is this test's workspace.
-        const recorded = yield* Effect.gen(function* () {
-          const fs = yield* FileSystem.FileSystem;
-          const path = yield* Path.Path;
-          const text = yield* fs.readFileString(
-            yield* path.fromFileUrl(
-              new URL(
-                "./testkit/fixtures/opencode2_switch/opencode_transcript.ndjson",
-                import.meta.url,
-              ),
+  it.live("runs plan mode as OpenCode's plan agent and switches back before the next prompt", () =>
+    Effect.gen(function* () {
+      const name = "opencode2_switch";
+      const cwd = yield* checkpointWorkspace(name);
+      const thread = threadCommands({ name, worktreePath: cwd });
+      // The spike's recording: plan agent, then build agent and a new model on
+      // one session. Its `<work>` is this test's workspace.
+      const recorded = yield* Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const text = yield* fs.readFileString(
+          yield* path.fromFileUrl(
+            new URL(
+              "./testkit/fixtures/opencode2_switch/opencode_transcript.ndjson",
+              import.meta.url,
             ),
-          );
-          return yield* decodeProviderReplayNdjson(text.replaceAll("<work>", cwd));
-        }).pipe(Effect.provide(NodeServices.layer));
-        const projection = yield* runScenario({
-          name,
-          threadId: thread.threadId,
-          entries: recorded.entries,
-          commands: [
-            thread.create,
-            thread.interactionMode("mode-plan", "plan"),
-            thread.message(
-              "plan",
-              bigPickle,
-              "Create a file named plan_probe.txt containing HI using the write tool.",
-            ),
-            thread.interactionMode("mode-default", "default"),
-            thread.message("switched", nemotron, "Reply exactly SWITCHED."),
-          ],
-        });
-        assert.deepEqual(
-          projection.runs.map((run) => [run.status, run.modelSelection.model]),
-          [
-            ["completed", bigPickle.model],
-            ["completed", nemotron.model],
-          ],
+          ),
         );
-        const replies = projection.turnItems.flatMap((item) =>
-          item.type === "assistant_message" ? [item.text] : [],
-        );
-        // The plan agent refused to write; OpenCode's own reminder told it why.
-        assert.include(replies[0], "Plan mode");
-        assert.equal(replies[1], "SWITCHED");
-        assert.lengthOf(projection.providerThreads, 1);
-      }).pipe(Effect.scoped),
+        return yield* decodeProviderReplayNdjson(text.replaceAll("<work>", cwd));
+      }).pipe(Effect.provide(NodeServices.layer));
+      const nativeSession = "ses_f14812197ffeCbw641wM2r3ZmP";
+      const paths = [
+        "<home>/data/opencode/shell/*/*",
+        "<home>/data/opencode/tool-output/*",
+        "/tmp/opencode/*",
+        "<home>/config/opencode/*",
+      ].map((resource) => ({ action: "external_directory", resource, effect: "allow" }));
+      const rules = (plan: boolean) => [
+        ...supervisedRules(name).slice(0, 3),
+        ...paths,
+        ...(plan
+          ? [
+              { action: "edit", resource: "<home>/.opencode/plan/*", effect: "allow" },
+              {
+                action: "external_directory",
+                resource: "<home>/.opencode/plan/*",
+                effect: "allow",
+              },
+            ]
+          : []),
+        ...mcpRules(name),
+      ];
+      // Keep the native lifecycle recording, with explicit Supervised requests
+      // both before and after switching from the plan agent to build.
+      const entries = recorded.entries.flatMap((entry): ProviderReplayEntry[] => {
+        if (entry.type !== "runtime_exit" && entry.label === "session.update") {
+          return [out("session.update", { sessionID: nativeSession, permissions: rules(true) })];
+        }
+        if (entry.type !== "runtime_exit" && entry.label === "session.inbox.enqueued.3") {
+          return [
+            entry,
+            out("session.update", { sessionID: nativeSession, permissions: rules(false) }),
+            reply("session.update", null),
+          ];
+        }
+        return [entry];
+      });
+      const projection = yield* runScenario({
+        name,
+        threadId: thread.threadId,
+        entries,
+        commands: [
+          thread.create,
+          thread.interactionMode("mode-plan", "plan"),
+          thread.message(
+            "plan",
+            bigPickle,
+            "Create a file named plan_probe.txt containing HI using the write tool.",
+          ),
+          thread.interactionMode("mode-default", "default"),
+          thread.message("switched", nemotron, "Reply exactly SWITCHED."),
+        ],
+      });
+      assert.deepEqual(
+        projection.runs.map((run) => [run.status, run.modelSelection.model]),
+        [
+          ["completed", bigPickle.model],
+          ["completed", nemotron.model],
+        ],
+      );
+      const replies = projection.turnItems.flatMap((item) =>
+        item.type === "assistant_message" ? [item.text] : [],
+      );
+      // The plan agent refused to write; OpenCode's own reminder told it why.
+      assert.include(replies[0], "Plan mode");
+      assert.equal(replies[1], "SWITCHED");
+      assert.lengthOf(projection.providerThreads, 1);
+    }).pipe(Effect.scoped),
   );
 });

@@ -2,6 +2,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
+  ProviderDriverKind,
   type ProviderInteractionMode,
   ProviderInstanceId,
   RunId,
@@ -17,8 +18,9 @@ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.t
 const EPOCH = DateTime.makeUnsafe("2026-01-01T00:00:00.000Z");
 
 /**
- * A thread in the middle of a turn on the `codex` instance: the shape the
- * access gate reads for a thread caller, and for the threads a caller targets.
+ * A thread in the middle of a turn, on the `codex` instance unless `instance`
+ * says otherwise: the shape the access gate reads for a thread caller, and
+ * for the threads a caller targets.
  */
 export const liveThreadShell = (
   id: ThreadId,
@@ -26,9 +28,11 @@ export const liveThreadShell = (
     readonly runtimeMode?: RuntimeMode;
     readonly interactionMode?: ProviderInteractionMode;
     readonly activeRunId?: RunId | null;
+    /** Each instance runs the driver of the same name. */
+    readonly instance?: "codex" | "claudeAgent";
   } = {},
 ): OrchestrationV2ThreadShell => {
-  const providerInstanceId = ProviderInstanceId.make("codex");
+  const providerInstanceId = ProviderInstanceId.make(modes.instance ?? "codex");
   return {
     id,
     projectId: ProjectId.make("project:mcp-test"),
@@ -64,12 +68,33 @@ export const liveThreadShell = (
 };
 
 /**
+ * The provider records the access gate reads to learn which provider a
+ * calling thread really runs on: one provider thread on its instance, whose
+ * driver shares the instance's name.
+ */
+export const liveThreadRecords = (shell: OrchestrationV2ThreadShell | null) =>
+  Effect.succeed({
+    providerSessions: [],
+    providerThreads:
+      shell === null
+        ? []
+        : [
+            {
+              driver: ProviderDriverKind.make(shell.providerInstanceId),
+              providerInstanceId: shell.providerInstanceId,
+            },
+          ],
+  } as unknown as Pick<OrchestrationV2ThreadProjection, "providerSessions" | "providerThreads">);
+
+/**
  * `ThreadManagementService` that answers only the access gate's lookups,
- * every thread a live full-access one. For tests of a tool rather than of who
- * may call it.
+ * every thread a live full-access one on the `codex` instance. Codex runs
+ * Supervised under the brand, so these callers hold no environment authority.
+ * For tests of a tool rather than of who may call it.
  */
 export const liveThreadsLayer = Layer.mock(ThreadManagement.ThreadManagementService)({
   getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+  getThreadRecords: (threadId) => liveThreadRecords(liveThreadShell(threadId)) as never,
 });
 
 /**

@@ -17,11 +17,13 @@ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.t
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
-import { liveThreadShell } from "./McpToolAccess.testkit.ts";
+import { liveThreadRecords, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const supervisedThreadId = ThreadId.make("thread:supervised");
 const planThreadId = ThreadId.make("thread:plan");
 const fullAccessThreadId = ThreadId.make("thread:full-access");
+const clampedThreadId = ThreadId.make("thread:clamped-codex");
+const inheritThreadId = ThreadId.make("thread:inherit");
 const endedThreadId = ThreadId.make("thread:ended");
 
 const shells = new Map([
@@ -30,7 +32,17 @@ const shells = new Map([
     planThreadId,
     liveThreadShell(planThreadId, { runtimeMode: "approval-required", interactionMode: "plan" }),
   ],
-  [fullAccessThreadId, liveThreadShell(fullAccessThreadId)],
+  // Claude runs the Bypass it stored.
+  [fullAccessThreadId, liveThreadShell(fullAccessThreadId, { instance: "claudeAgent" })],
+  // Codex stored full access, but the brand runs it Supervised.
+  [clampedThreadId, liveThreadShell(clampedThreadId)],
+  // It follows Codex's own settings.
+  [
+    inheritThreadId,
+    Object.assign(liveThreadShell(inheritThreadId, { runtimeMode: "approval-required" }), {
+      permissionSource: "inherit",
+    }),
+  ],
   [endedThreadId, liveThreadShell(endedThreadId, { activeRunId: null })],
 ]);
 
@@ -40,7 +52,7 @@ const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationSco
   thread: {
     threadId,
     providerSessionId: `provider:${threadId}`,
-    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerInstanceId: shells.get(threadId)!.providerInstanceId,
   },
   client: undefined,
   capabilities: new Set(["orchestration"]),
@@ -97,6 +109,7 @@ const ProbeToolkit = Toolkit.make(
     parameters: Schema.Struct({
       runtimeMode: Schema.optional(RuntimeMode),
       interactionMode: Schema.optional(ProviderInteractionMode),
+      modelSelection: Schema.optional(Schema.Struct({ instanceId: ProviderInstanceId })),
     }),
   }),
   Tool.make("writes_environment", probe),
@@ -193,6 +206,8 @@ const call = (
 const supervised = threadCaller(supervisedThreadId);
 const plan = threadCaller(planThreadId);
 const fullAccess = threadCaller(fullAccessThreadId);
+const clampedCodex = threadCaller(clampedThreadId);
+const inheriting = threadCaller(inheritThreadId);
 const ended = threadCaller(endedThreadId);
 const supervisedClient = clientCaller("approval-required");
 const fullAccessClient = clientCaller("full-access");
@@ -265,6 +280,38 @@ it.effect.each([
   ["starts_threads", supervisedClient, { runtimeMode: "auto" }, "runtime_mode_escalation_denied"],
   ["starts_threads", fullAccessClient, { runtimeMode: "full-access" }, "full-access/default"],
 
+  // Stark's ceilings come from what the provider runs, not what the thread stored.
+  ["writes_environment", clampedCodex, {}, "capability_denied"],
+  ["starts_threads", clampedCodex, {}, "approval-required/default"],
+  ["starts_threads", clampedCodex, { runtimeMode: "auto" }, "runtime_mode_escalation_denied"],
+  ["writes_threads", clampedCodex, { threadId: supervisedThreadId }, "ran"],
+  [
+    "writes_threads",
+    clampedCodex,
+    { threadId: fullAccessThreadId },
+    "runtime_mode_escalation_denied",
+  ],
+  // A thread that follows its provider's own settings grants Supervised and, as a
+  // target, counts as the broadest preset.
+  ["writes_environment", inheriting, {}, "capability_denied"],
+  ["starts_threads", inheriting, {}, "approval-required/default"],
+  ["writes_threads", supervised, { threadId: inheritThreadId }, "runtime_mode_escalation_denied"],
+  ["writes_threads", fullAccess, { threadId: inheritThreadId }, "ran"],
+  // Another provider instance starts only at its narrowest mode, and only when asked for.
+  [
+    "starts_threads",
+    fullAccess,
+    { modelSelection: { instanceId: "codex" } },
+    "runtime_mode_escalation_denied",
+  ],
+  [
+    "starts_threads",
+    fullAccess,
+    { runtimeMode: "approval-required", modelSelection: { instanceId: "codex" } },
+    "approval-required/default",
+  ],
+  ["starts_threads", fullAccess, { runtimeMode: "auto" }, "auto/default"],
+
   // Projects and environment settings need full access.
   ["writes_environment", fullAccess, {}, "ran"],
   ["writes_environment", supervised, {}, "capability_denied"],
@@ -278,6 +325,7 @@ it.effect.each([
       probeServer(
         Layer.mock(ThreadManagement.ThreadManagementService)({
           getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+          getThreadRecords: (threadId) => liveThreadRecords(shells.get(threadId) ?? null) as never,
         }),
       ),
     ),

@@ -1,4 +1,4 @@
-import { CommandId } from "@starkfuture/contracts";
+import { CommandId, type ThreadId } from "@starkfuture/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -23,11 +23,13 @@ import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
+import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import * as MaintenanceGate from "../maintenance/MaintenanceGate.ts";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
   "OrchestrationEffectExecutionError",
@@ -90,6 +92,7 @@ export const layerExecutor: Layer.Layer<
   | ThreadTitleRegenerationService.ThreadTitleRegenerationService
   | ThreadManagementService.ThreadManagementService
   | ServerSettings.ServerSettingsService
+  | RuntimePolicy.RuntimePolicyV2
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
   Effect.gen(function* () {
@@ -104,6 +107,49 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+
+    /**
+     * Hands a chat's narrowed permissions to its live provider thread through
+     * the session runtime's `applyRuntimePolicy`, resolved the way a turn start
+     * resolves them (the runtime policy, then the clamp for non-Claude
+     * drivers). A session that is gone, or a runtime without the method,
+     * applies them with the next turn.
+     */
+    const applyRuntimePolicy = (
+      threadId: ThreadId,
+      request: Extract<
+        EffectOutbox.OrchestrationEffectRequestV2,
+        { readonly type: "provider-runtime.apply-policy" }
+      >,
+    ) =>
+      Effect.gen(function* () {
+        const session = yield* providerSessions.get(request.providerSessionId);
+        if (Option.isNone(session)) return;
+        const runtime = session.value;
+        if (runtime.applyRuntimePolicy === undefined) return;
+        const projection = yield* threads.getThreadRecords(threadId, ["providerThreads"]);
+        const providerThread = projection.providerThreads.find(
+          (candidate) => candidate.id === request.providerThreadId,
+        );
+        if (providerThread === undefined) return;
+        const resolved = yield* runtimePolicy.resolve({
+          thread: projection.thread,
+          modelSelection: projection.thread.modelSelection,
+        });
+        // Routed as the session manager routes every launch and turn.
+        const application = yield* runtime.applyRuntimePolicy({
+          providerThread,
+          runtimePolicy: ProviderSessionManager.sessionRuntimePolicy(runtime.driver, resolved),
+          timing: request.timing,
+        });
+        yield* Effect.logInfo("Applied changed permissions to a live provider thread", {
+          threadId,
+          providerSessionId: request.providerSessionId,
+          timing: request.timing,
+          application,
+        });
+      });
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
@@ -129,6 +175,17 @@ export const layerExecutor: Layer.Layer<
               ),
             );
           }
+          case "provider-runtime.apply-policy":
+            return applyRuntimePolicy(effect.threadId, effect.request).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
           case "provider-session.detach":
             return providerSessions
               .detach({
@@ -391,20 +448,66 @@ export const layerExecutor: Layer.Layer<
                     }),
                 ),
               );
-          case "runtime-request.respond":
+          case "runtime-request.respond": {
+            const requestId = effect.request.requestId;
+            // Records how delivering the answer went. It never fails the
+            // effect: a report that does not land must not resend the answer.
+            const reportDelivery = (
+              state: "delivered" | "not_delivered" | "uncertain",
+              reason?: string,
+            ) =>
+              threads
+                .dispatch({
+                  type: "runtime-request.delivery.update",
+                  commandId: CommandId.make(
+                    `command:runtime-request-delivery:${effect.id}:${effect.attemptCount}`,
+                  ),
+                  threadId: effect.threadId,
+                  requestId,
+                  state,
+                  ...(reason === undefined ? {} : { reason }),
+                })
+                .pipe(
+                  Effect.asVoid,
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning("Could not record an answer's delivery", {
+                      effectId: effect.id,
+                      requestId,
+                      state,
+                      cause,
+                    }),
+                  ),
+                );
             return runtimeRequests
               .respond({
                 threadId: effect.threadId,
                 providerSessionId: effect.request.providerSessionId,
-                requestId: effect.request.requestId,
+                requestId,
                 ...(effect.request.decision === undefined
                   ? {}
                   : { decision: effect.request.decision }),
+                ...(effect.request.optionId === undefined
+                  ? {}
+                  : { optionId: effect.request.optionId }),
+                ...(effect.request.feedback === undefined
+                  ? {}
+                  : { feedback: effect.request.feedback }),
                 ...(effect.request.answers === undefined
                   ? {}
                   : { answers: effect.request.answers }),
               })
               .pipe(
+                // A failure is reported on the last attempt only, and before
+                // the worker settles the outbox row: a process that dies in
+                // between leaves the row unsettled, and startup recovery marks
+                // the answer uncertain. An answer the provider already closed
+                // or took was recorded by that event and is not sent again.
+                Effect.flatMap((outcome) =>
+                  outcome === "delivered" ? reportDelivery("delivered") : Effect.void,
+                ),
+                Effect.tapError((error) =>
+                  willRetry ? Effect.void : reportDelivery(error.delivery, error.deliveryReason),
+                ),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({
@@ -414,6 +517,7 @@ export const layerExecutor: Layer.Layer<
                     }),
                 ),
               );
+          }
           case "checkpoint.files.restore":
             return checkpointRollback
               .restoreFiles({
@@ -616,6 +720,7 @@ export const layerWithOptions = (
     Effect.gen(function* () {
       const outbox = yield* EffectOutbox.EffectOutboxV2;
       const executor = yield* OrchestrationEffectExecutorV2;
+      const maintenance = yield* MaintenanceGate.MaintenanceGate;
       const workerId = options.workerId ?? `orchestration-v2:${process.pid}`;
       const leaseDurationMs = Math.max(1, options.leaseDurationMs ?? 30_000);
       const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
@@ -711,8 +816,18 @@ export const layerWithOptions = (
 
       const runOnce = (excludeRestartContinuations = false) =>
         Effect.gen(function* () {
+          // A closed maintenance gate claims nothing. The claim is what counts
+          // an attempt, so waiting here never uses up a retry. A recovery hold
+          // keeps restart continuations until the user resumes.
+          if (yield* maintenance.claimsPaused) return false;
+          const maintenanceHoldsContinuations = yield* maintenance.restartContinuationsHeld;
           const claimExit = yield* Effect.exit(
-            outbox.claimNext({ workerId, leaseDurationMs, excludeRestartContinuations }),
+            outbox.claimNext({
+              workerId,
+              leaseDurationMs,
+              excludeRestartContinuations:
+                excludeRestartContinuations || maintenanceHoldsContinuations,
+            }),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
             result: Exit.isFailure(claimExit)
@@ -832,6 +947,9 @@ export const layerWithOptions = (
         runOnce: runOnce(),
         runRecoveryOnce: runOnce(true),
         nextClaimableAt: outbox.nextClaimableAt.pipe(
+          // While claims are paused or continuations held, a due row may be one
+          // this worker must not claim; wait for new work instead of spinning.
+          Effect.flatMap((next) => maintenanceNextClaimableAt(maintenance, next)),
           Effect.mapError(
             (cause) =>
               new OrchestrationEffectWorkerError({
@@ -851,6 +969,21 @@ export const layerWithOptions = (
       });
     }),
   );
+
+const maintenanceNextClaimableAt = (
+  maintenance: MaintenanceGate.MaintenanceGateService,
+  next: Option.Option<DateTime.Utc>,
+) =>
+  Effect.gen(function* () {
+    if (Option.isNone(next)) return next;
+    const holding =
+      (yield* maintenance.claimsPaused) || (yield* maintenance.restartContinuationsHeld);
+    if (!holding) return next;
+    const now = yield* DateTime.now;
+    return DateTime.toEpochMillis(next.value) <= DateTime.toEpochMillis(now)
+      ? Option.none<DateTime.Utc>()
+      : next;
+  });
 
 export const layer = layerWithOptions();
 

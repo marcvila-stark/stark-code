@@ -36,7 +36,6 @@ import {
 import { resolveSpawnCommand } from "@starkfuture/shared/shell";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
 import {
-  AUTH_PROBE_TIMEOUT_MS,
   buildServerProvider,
   COMPACT_SLASH_COMMAND,
   providerModelsFromSettings,
@@ -54,6 +53,10 @@ import * as HostProcess from "@starkfuture/shared/HostProcess";
 import packageJson from "../../package.json" with { type: "json" };
 const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
 const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
+// Account routing and model discovery run sequentially and can each involve
+// network requests. The shared ten-second auth budget can expire even when
+// Codex is signed in and responding normally.
+const CODEX_PROVIDER_PROBE_TIMEOUT_MS = 30_000;
 
 type CodexRateLimitsProbe =
   | {
@@ -73,10 +76,18 @@ const CODEX_CATALOG_REFRESH_TIMEOUT = "3 seconds" as const;
 const CODEX_CATALOG_REFRESH_POLL = "100 millis" as const;
 const CODEX_CLIENT_NAME = "Stark Code";
 
+/**
+ * In Stark, Codex runs only Supervised as a Stark preset; a chat can instead
+ * opt in to Codex's own settings (`nativePermissionInherit`), which new chats
+ * never do by default. Advertising the one mode lets the server step a saved
+ * Codex chat's broader mode down to it instead of trusting the stored value.
+ */
 const CODEX_PRESENTATION = {
   displayName: "Codex",
   showInteractionModeToggle: true,
   reportsContextWindow: true,
+  supportedRuntimeModes: ["approval-required"],
+  nativePermissionInherit: true,
 } as const;
 
 export interface CodexAppServerProviderSnapshot {
@@ -691,7 +702,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     ...(managedAuth ? { skipNativeUsage: true } : {}),
   }).pipe(
     Effect.scoped,
-    Effect.timeoutOption(Duration.millis(AUTH_PROBE_TIMEOUT_MS)),
+    Effect.timeoutOption(Duration.millis(CODEX_PROVIDER_PROBE_TIMEOUT_MS)),
     Effect.result,
   );
 

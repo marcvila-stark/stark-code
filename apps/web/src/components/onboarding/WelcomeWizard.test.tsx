@@ -186,7 +186,7 @@ it("offers browser import after agents and can revisit it without importing or s
   expect(connect).not.toHaveBeenCalled();
 });
 
-it("starts with local agents and keeps other computers an explicit choice", async () => {
+it("keeps local alpha setup focused on agents and folders without offering remote computers", async () => {
   window.desktopBridge = {
     getLocalEnvironmentBootstraps: () => [
       {
@@ -201,10 +201,7 @@ it("starts with local agents and keeps other computers an explicit choice", asyn
   await act(async () => root.render(<WelcomeWizard localAvailable onDone={vi.fn()} />));
   expect(document.body.textContent).toContain("Connect your agents");
   expect(document.body.textContent).not.toContain("Connect your computers");
-  await click("Use another computer");
-  expect(document.body.textContent).toContain("Connect your computers");
-  await click("Continue");
-  expect(document.body.textContent).toContain("Connect your agents");
+  expect(document.body.textContent).not.toContain("Use another computer");
   await click("Continue");
   expect(document.body.textContent).toContain("Choose your main folder");
 });
@@ -226,6 +223,7 @@ it("keeps the connection choice for a remote primary, even in the desktop app", 
   await act(async () => root.render(<WelcomeWizard localAvailable onDone={vi.fn()} />));
   expect(document.body.textContent).toContain("Connect your computers");
   await click("Continue");
+  expect(document.body.textContent).toContain("Use another computer");
   await click("Continue");
   expect(document.body.textContent).toContain("Choose your main folder");
   expect(listBrowserImportSources).not.toHaveBeenCalled();

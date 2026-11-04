@@ -55,9 +55,21 @@ describe("searchSettings", () => {
     expect(isSettingsSearchScopeAvailable(item.scope, "environment")).toBe(true);
     expect(isSettingsSearchScopeAvailable(item.scope, "project")).toBe(false);
   });
+  it.each(["preview browser", "headless", "html preview"])(
+    "finds the preview browser install for %s",
+    (query) => {
+      expect(searchSettings(query).map((item) => item.id)).toContain("preview-browser");
+    },
+  );
   it("finds saved permission rules and the MCP server screen", () => {
     expect(searchSettings("saved approval rules")[0]?.to).toBe("/settings/permissions");
     expect(searchSettings("MCP servers")[0]?.to).toBe("/settings/mcp-servers");
+  });
+  it("finds scheduled task run history", () => {
+    expect(searchSettings("run history")[0]?.to).toBe("/settings/scheduled-tasks");
+    expect(searchSettings("automation runs").map((item) => item.id)).toContain(
+      "scheduled-task-runs",
+    );
   });
   it.each(["OTel", "OTLP", "telemetry export", "Grafana"])(
     "does not offer external telemetry configuration for %s",

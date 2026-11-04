@@ -79,6 +79,7 @@ import {
   acpPostSettleMonitorPromptShouldSuppress,
   acpPostSettleWakeEvidence,
   acpPostSettleWakeShouldBuffer,
+  acpEditedPaths,
   acpProjectedCommandExitCode,
   acpToolCallDiffPatch,
   acpTurnStartShouldPreserveContinuation,
@@ -123,6 +124,31 @@ describe("acpProjectedCommandExitCode", () => {
     assert.equal(acpProjectedCommandExitCode("completed", failedOutput), 1);
     assert.equal(acpProjectedCommandExitCode("failed", failedOutput), 1);
     assert.equal(acpProjectedCommandExitCode("completed", {}), undefined);
+  });
+});
+
+describe("acpEditedPaths", () => {
+  const edit = (data: Record<string, unknown>) => ({ toolCallId: "edit", kind: "edit", data });
+
+  it("names every file an edit's locations and diffs touch", () => {
+    assert.deepEqual(
+      acpEditedPaths(
+        edit({
+          locations: [{ path: "/repo/a.ts" }, { path: "/repo/b.ts", line: 3 }],
+          content: [
+            { type: "diff", path: "/repo/b.ts", oldText: "x", newText: "y" },
+            { type: "diff", path: "/repo/c.ts", oldText: null, newText: "z" },
+          ],
+        }),
+      ),
+      ["/repo/a.ts", "/repo/b.ts", "/repo/c.ts"],
+    );
+    assert.deepEqual(acpEditedPaths(edit({ rawInput: { file_path: "src/a.ts" } })), ["src/a.ts"]);
+  });
+
+  it("names no file when the edit does not say which it wrote", () => {
+    // The item then carries only its title as a label, which is not a path.
+    assert.deepEqual(acpEditedPaths(edit({ rawInput: { pattern: "TODO" } })), []);
   });
 });
 

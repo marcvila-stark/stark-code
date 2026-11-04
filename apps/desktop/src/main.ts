@@ -1,3 +1,4 @@
+import * as DesktopBrowserCapture from "./browserCapture/DesktopBrowserCapture.ts";
 import * as MacPermissions from "./permissions/MacPermissions.ts";
 for (const stream of [process.stdout, process.stderr]) {
   stream.on("error", (err: NodeJS.ErrnoException) => {
@@ -53,6 +54,7 @@ import * as DesktopBackendPool from "./backend/DesktopBackendPool.ts";
 import * as DesktopLocalEnvironmentAuth from "./backend/DesktopLocalEnvironmentAuth.ts";
 import * as DesktopNetworkInterfaces from "./backend/DesktopNetworkInterfaces.ts";
 import * as DesktopEnvironment from "./app/DesktopEnvironment.ts";
+import * as DesktopLocationAnchor from "./app/DesktopLocationAnchor.ts";
 import * as DesktopLifecycle from "./app/DesktopLifecycle.ts";
 import * as DesktopLinuxUrlHandler from "./app/DesktopLinuxUrlHandler.ts";
 import * as DesktopShutdown from "./app/DesktopShutdown.ts";
@@ -72,6 +74,7 @@ import * as DesktopLegacyLocalStorage from "./app/DesktopLegacyLocalStorage.ts";
 import * as DesktopTelemetryPublisher from "./telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopRendererHistory from "./telemetry/DesktopRendererHistory.ts";
 import * as DesktopUpdates from "./updates/DesktopUpdates.ts";
+import * as DesktopInstallPreflight from "./updates/DesktopInstallPreflight.ts";
 import * as BrowserImport from "./preview/BrowserImport/BrowserImport.ts";
 import * as LinuxBrowserSecret from "./preview/BrowserImport/LinuxBrowserSecret.ts";
 import * as BrowserSession from "./preview/BrowserSession.ts";
@@ -92,6 +95,16 @@ if (process.argv.includes("--version")) {
   Electron.app.exit(0);
 }
 
+// Before anything reads the environment (the default config provider keeps its
+// first snapshot): the updater's relaunch has none, and a rehearsal build must
+// never open the live install.
+const desktopStartupLocations = DesktopLocationAnchor.applyDesktopStartupLocations({
+  env: process.env,
+  homeDirectory: NodeOS.homedir(),
+  appPath: Electron.app.getAppPath(),
+  isPackaged: Electron.app.isPackaged,
+});
+
 const layerDesktopEnvironment = Layer.unwrap(
   Effect.gen(function* () {
     const metadata = yield* Effect.service(ElectronApp.ElectronApp).pipe(
@@ -105,6 +118,7 @@ const layerDesktopEnvironment = Layer.unwrap(
       platform,
       processArch,
       ...metadata,
+      startupLocations: desktopStartupLocations,
     });
   }),
 );
@@ -240,7 +254,10 @@ const layerDesktopApplication = Layer.mergeAll(
   layerDesktopSsh,
 ).pipe(
   Layer.provideMerge(layerDesktopSnapShot),
+  Layer.provideMerge(DesktopBrowserCapture.layer.pipe(Layer.provide(layerDesktopFoundation))),
   Layer.provideMerge(DesktopUpdates.layer),
+  // One maintenance channel for the updater and the recovery notice.
+  Layer.provideMerge(DesktopInstallPreflight.layerLivePorts),
   Layer.provideMerge(layerDesktopWslBackend),
   Layer.provideMerge(layerDesktopLocalEnvironmentAuth),
 );

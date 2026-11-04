@@ -371,7 +371,7 @@ describe("CursorAdapterV2", () => {
     ),
   );
 
-  it.effect("projects Cursor directory trees and lint diagnostics as file search results", () =>
+  it.effect("projects Cursor search results and generated image files", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -405,6 +405,24 @@ describe("CursorAdapterV2", () => {
             },
             ...(type === "tool-call-completed"
               ? { result: { status: "success" as const, value: { content: [], isError: false } } }
+              : {}),
+          },
+        })),
+        // An image asked for without a path names its file only once it is written.
+        ...(["tool-call-started", "tool-call-completed"] as const).map((type) => ({
+          type,
+          modelCallId: "native-model-call",
+          callId: "generate-image",
+          toolCall: {
+            type: "generateImage" as const,
+            args: { description: "a logo" },
+            ...(type === "tool-call-completed"
+              ? {
+                  result: {
+                    status: "success" as const,
+                    value: { filePath: "assets/logo.png", imageData: "" },
+                  },
+                }
               : {}),
           },
         })),
@@ -694,6 +712,23 @@ describe("CursorAdapterV2", () => {
           args: { city: "Berlin" },
         });
       }
+      assert.deepEqual(
+        events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "file_change"
+            ? [
+                {
+                  status: event.turnItem.status,
+                  fileName: event.turnItem.fileName,
+                  written: event.turnItem.agentWrittenPaths,
+                },
+              ]
+            : [],
+        ),
+        [
+          { status: "running", fileName: "generated-image", written: [] },
+          { status: "completed", fileName: "assets/logo.png", written: undefined },
+        ],
+      );
       const fileSearchItems = events.flatMap((event) =>
         event.type === "turn_item.updated" &&
         event.turnItem.type === "file_search" &&

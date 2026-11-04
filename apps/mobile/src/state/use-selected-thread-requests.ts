@@ -14,7 +14,25 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { type ProviderApprovalDecision, type RuntimeRequestId } from "@starkfuture/contracts";
+import {
+  type EnvironmentId,
+  type ProviderApprovalDecision,
+  type RuntimeRequestId,
+} from "@starkfuture/contracts";
+import {
+  describeRuntimeResponseFailure,
+  resolveRuntimeRequestOutcome,
+  runtimeResponseAttemptsAtom,
+  type RuntimeResponse,
+  type RuntimeResponseAttempt,
+} from "@starkfuture/client-runtime/state/runtime-request-response";
+import {
+  type AtomCommandResult,
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@starkfuture/client-runtime/state/runtime";
+import * as Option from "effect/Option";
+import type { ApprovalResponseInput } from "@starkfuture/client-runtime/approvals/permission-presentation";
 import {
   type PendingThreadRequests,
   type ThreadUserInputQuestion,
@@ -32,12 +50,26 @@ import {
   type PendingUserInputDraftAnswer,
 } from "../lib/threadActivity";
 import { appAtomRegistry } from "./atom-registry";
-import { useSelectedThreadPendingRequests } from "./use-thread-detail";
+import {
+  useSelectedThreadLostRequests,
+  useSelectedThreadDetailState,
+  useSelectedThreadPendingRequests,
+} from "./use-thread-detail";
 import { useThreadSelection } from "./use-thread-selection";
 import { useAtomCommand } from "./use-atom-command";
 import { readEnvironmentScope } from "./session";
 
 const EMPTY_PENDING_REQUESTS: PendingThreadRequests = { approvals: [], userInputs: [] };
+
+const NO_RUNTIME_RESPONSE_ATTEMPTS = Atom.make<
+  ReadonlyMap<RuntimeRequestId, RuntimeResponseAttempt>
+>(new Map()).pipe(Atom.withLabel("mobile:runtime-response-attempts:empty"));
+
+function runtimeResponseAttemptsFor(environmentId: EnvironmentId | null) {
+  return environmentId === null
+    ? NO_RUNTIME_RESPONSE_ATTEMPTS
+    : runtimeResponseAttemptsAtom(environmentId);
+}
 
 const userInputDraftsByRequestKeyAtom = Atom.make<
   Record<string, Record<string, PendingUserInputDraftAnswer>>
@@ -94,8 +126,50 @@ export function useSelectedThreadRequests() {
     threadEnvironment.dismissUserInput,
     "thread user input dismissal",
   );
+  const askAgainLostRequests = useAtomCommand(
+    threadEnvironment.askAgainLostRequests,
+    "ask again for lost decisions",
+  );
+  const dismissLostRequests = useAtomCommand(
+    threadEnvironment.dismissLostRequests,
+    "lost decision dismissal",
+  );
+  const lostRequests = useSelectedThreadLostRequests();
+  const [lostRequestsBusy, setLostRequestsBusy] = useState(false);
   const { selectedThread: selectedThreadShell } = useThreadSelection();
   const pendingRequests = useSelectedThreadPendingRequests();
+  const runtimeResponseAttempts = useAtomValue(
+    runtimeResponseAttemptsFor(selectedThreadShell?.environmentId ?? null),
+  );
+  // A failed answer is explained by the thread as it is when the failure arrives: only a live
+  // projection that still holds the request says what became of it.
+  const selectedThreadDetailState = useSelectedThreadDetailState();
+  const requestTruthRef = useRef({
+    threadStatus: selectedThreadDetailState.status,
+    runtimeRequests: Option.getOrNull(selectedThreadDetailState.data)?.runtimeRequests ?? null,
+  });
+  useEffect(() => {
+    requestTruthRef.current = {
+      threadStatus: selectedThreadDetailState.status,
+      runtimeRequests: Option.getOrNull(selectedThreadDetailState.data)?.runtimeRequests ?? null,
+    };
+  }, [selectedThreadDetailState.data, selectedThreadDetailState.status]);
+  const alertResponseFailure = useCallback(
+    (
+      result: AtomCommandResult<unknown, unknown>,
+      requestId: RuntimeRequestId,
+      kind: RuntimeResponse["kind"],
+    ) => {
+      if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+      const notice = describeRuntimeResponseFailure({
+        error: squashAtomCommandFailure(result),
+        kind,
+        outcome: resolveRuntimeRequestOutcome({ ...requestTruthRef.current, requestId }),
+      });
+      Alert.alert(notice.title, notice.message);
+    },
+    [],
+  );
   const userInputDraftsByRequestKey = useAtomValue(userInputDraftsByRequestKeyAtom);
   const userInputResponsesInFlight = useRef(new Set<string>());
   const [respondingApprovalId, setRespondingApprovalId] = useState<RuntimeRequestId | null>(null);
@@ -226,7 +300,12 @@ export function useSelectedThreadRequests() {
   );
 
   const onRespondToApproval = useCallback(
-    async (requestId: RuntimeRequestId, decision: ProviderApprovalDecision) => {
+    async (
+      requestId: RuntimeRequestId,
+      decision: ProviderApprovalDecision,
+      // The chosen option's id and any reason; the server refuses a decision it can't match.
+      response?: ApprovalResponseInput,
+    ) => {
       if (
         !selectedThreadShell ||
         !readEnvironmentScope(selectedThreadShell.environmentId, AuthOrchestrationOperateScope)
@@ -247,12 +326,14 @@ export function useSelectedThreadRequests() {
           threadId: selectedThreadShell.id,
           requestId,
           decision,
+          ...response,
         },
       });
+      alertResponseFailure(result, requestId, "approval");
       setRespondingApprovalId((current) => (current === requestId ? null : current));
       return result;
     },
-    [activePendingApprovals, respondToApproval, selectedThreadShell],
+    [activePendingApprovals, alertResponseFailure, respondToApproval, selectedThreadShell],
   );
 
   const onSubmitUserInput = useCallback(async () => {
@@ -324,6 +405,7 @@ export function useSelectedThreadRequests() {
           : {}),
       },
     });
+    alertResponseFailure(result, activePendingUserInput.requestId, "user-input");
     userInputResponsesInFlight.current.delete(responseKey);
     setRespondingUserInputId((current) =>
       current === activePendingUserInput.requestId ? null : current,
@@ -332,6 +414,7 @@ export function useSelectedThreadRequests() {
   }, [
     activePendingUserInput,
     activePendingUserInputAnswers,
+    alertResponseFailure,
     respondToUserInput,
     selectedThreadShell,
   ]);
@@ -354,11 +437,90 @@ export function useSelectedThreadRequests() {
         requestId: activePendingUserInput.requestId,
       },
     });
+    alertResponseFailure(result, activePendingUserInput.requestId, "dismiss");
     setRespondingUserInputId((current) =>
       current === activePendingUserInput.requestId ? null : current,
     );
     return result;
-  }, [activePendingUserInput, dismissUserInput, selectedThreadShell]);
+  }, [activePendingUserInput, alertResponseFailure, dismissUserInput, selectedThreadShell]);
+
+  // Sends an answer that could not be confirmed again under its original command, so an answer
+  // that already landed is confirmed instead of rejected as answered.
+  const onRetryRuntimeResponse = useCallback(
+    async (requestId: RuntimeRequestId) => {
+      const attempt = runtimeResponseAttempts.get(requestId);
+      if (
+        !selectedThreadShell ||
+        attempt?.phase !== "unconfirmed" ||
+        !readEnvironmentScope(selectedThreadShell.environmentId, AuthOrchestrationOperateScope)
+      ) {
+        return;
+      }
+      const environmentId = selectedThreadShell.environmentId;
+      const setResponding =
+        attempt.kind === "approval" ? setRespondingApprovalId : setRespondingUserInputId;
+      setResponding(requestId);
+      const result =
+        attempt.kind === "approval"
+          ? await respondToApproval({
+              environmentId,
+              input: { ...attempt.input, commandId: attempt.commandId },
+            })
+          : attempt.kind === "user-input"
+            ? await respondToUserInput({
+                environmentId,
+                input: { ...attempt.input, commandId: attempt.commandId },
+              })
+            : await dismissUserInput({
+                environmentId,
+                input: { ...attempt.input, commandId: attempt.commandId },
+              });
+      alertResponseFailure(result, requestId, attempt.kind);
+      setResponding((current) => (current === requestId ? null : current));
+    },
+    [
+      alertResponseFailure,
+      dismissUserInput,
+      respondToApproval,
+      respondToUserInput,
+      runtimeResponseAttempts,
+      selectedThreadShell,
+    ],
+  );
+
+  // Ask again and Dismiss act only on the requests named; a single card button names one.
+  const onLostRequests = useCallback(
+    async (
+      action: "ask-again" | "dismiss",
+      requestIds: readonly [RuntimeRequestId, ...RuntimeRequestId[]],
+    ) => {
+      if (
+        !selectedThreadShell ||
+        !readEnvironmentScope(selectedThreadShell.environmentId, AuthOrchestrationOperateScope)
+      ) {
+        return;
+      }
+      setLostRequestsBusy(true);
+      const run = action === "ask-again" ? askAgainLostRequests : dismissLostRequests;
+      const result = await run({
+        environmentId: selectedThreadShell.environmentId,
+        input: { threadId: selectedThreadShell.id, requestIds },
+      });
+      setLostRequestsBusy(false);
+      return result;
+    },
+    [askAgainLostRequests, dismissLostRequests, selectedThreadShell],
+  );
+  const onAskAgainLostRequests = useCallback(
+    (requestIds: readonly [RuntimeRequestId, ...RuntimeRequestId[]]) =>
+      onLostRequests("ask-again", requestIds),
+    [onLostRequests],
+  );
+  const onDismissLostRequests = useCallback(
+    (requestIds: readonly [RuntimeRequestId, ...RuntimeRequestId[]]) =>
+      onLostRequests("dismiss", requestIds),
+    [onLostRequests],
+  );
 
   return {
     activePendingApproval,
@@ -367,10 +529,16 @@ export function useSelectedThreadRequests() {
     activePendingUserInputAnswers,
     respondingApprovalId,
     respondingUserInputId,
+    runtimeResponseAttempts,
     onRespondToApproval,
+    onRetryRuntimeResponse,
     onSelectUserInputOption,
     onChangeUserInputCustomAnswer,
     onSubmitUserInput,
     onDismissUserInput,
+    lostRequests,
+    lostRequestsBusy,
+    onAskAgainLostRequests,
+    onDismissLostRequests,
   };
 }

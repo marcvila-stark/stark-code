@@ -799,10 +799,10 @@ export function buildRemoteStarkRunnerScript(input?: RemoteStarkRunnerOptions): 
     throw new SshInvalidArchiveVersionError({ archiveVersion });
   }
   // Strip the `/v<version>` the helper appends: the script builds URLs itself.
-  const releaseBaseUrl = cliReleaseDownloadBaseUrl("", input?.releaseBaseUrl ?? undefined).replace(
-    /\/v$/u,
-    "",
-  );
+  const releaseBaseUrl =
+    nodeScriptPath !== ""
+      ? ""
+      : cliReleaseDownloadBaseUrl("", input?.releaseBaseUrl ?? undefined).replace(/\/v$/u, "");
   return stripTrailingNewlines(
     applyScriptPlaceholders(REMOTE_RUNNER_SCRIPT, {
       STARK_NODE_SCRIPT_PATH: shellSingleQuote(nodeScriptPath),

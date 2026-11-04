@@ -9,8 +9,6 @@ apps/*/dist-exe
 infra/*/dist
 .astro
 packages/*/dist
-.env
-.env.local
 build/
 .logs/
 release/
@@ -37,9 +35,7 @@ apps/mobile/.generated/
 artifacts/app-store/screenshots/
 .github/pr-assets/
 native/**/target/
-node_modules/
 .alchemy/
-*.log
 .env*
 !.env.example
 
@@ -48,6 +44,25 @@ node_modules/
 
 # Fork development state and tooling
 .tools/
-.stark-code/
+/.worktrees/
+# Optional read-only reference checkouts, restored with sync:repos.
+/.repos/
 /apps/desktop/resources/stark-workbench/
 /apps/desktop/resources/stark-workbench.extract-*/
+
+# Desktop packaging stages rebuilt helpers here; sources live in native/.
+/apps/desktop/prod-resources/
+/apps/desktop/resources/browser-secret/
+
+# Personal agent state and scratch output; keep shared skills/config tracked.
+/.claude/settings.local.json
+/.claude/worktrees/
+/.codex/sessions/
+/work/
+/outputs/
+
+# Generated test output, not fixtures or reviewed screenshot baselines.
+/coverage/
+/test-results/
+apps/*/coverage/
+apps/*/test-results/

@@ -6,6 +6,7 @@ import type { WorktreeSetupCardProps } from "./worktree-setup-card";
 import type { ComposerTextPaste } from "../../native/StarkComposerEditor.types";
 import { type EnvironmentConnectionPhase } from "@starkfuture/client-runtime/connection";
 import type { EnvironmentThreadShell } from "@starkfuture/client-runtime/state/shell";
+import type { ApprovalResponseInput } from "@starkfuture/client-runtime/approvals/permission-presentation";
 import type { HandoffEndpoints } from "@starkfuture/client-runtime/handoff";
 import type {
   CodexFeedbackSubmission,
@@ -33,7 +34,10 @@ import {
   appendCodexArtifactTemplateUsePrompt,
   type CodexArtifactTemplate,
 } from "@starkfuture/shared/codexArtifactTemplates";
-import type { ThreadUserInputQuestion } from "@starkfuture/client-runtime/state/thread-requests";
+import type {
+  ThreadLostRequest,
+  ThreadUserInputQuestion,
+} from "@starkfuture/client-runtime/state/thread-requests";
 import {
   presentPendingBackgroundWork,
   presentProviderGoal,
@@ -119,10 +123,15 @@ import type {
   ThreadFeedLatestRun,
 } from "../../lib/threadActivity";
 import { PendingApprovalCard } from "./PendingApprovalCard";
+import {
+  resolveRuntimeRequestResponseState,
+  type RuntimeResponseAttempt,
+} from "@starkfuture/client-runtime/state/runtime-request-response";
 import { ComposerErrorNotice } from "./ComposerErrorNotice";
 import { ComposerFeedback } from "./ComposerFeedback";
 import { ComposerUsageLimits } from "./ComposerUsageLimits";
 import { PendingUserInputCard } from "./PendingUserInputCard";
+import { LostRequestCard } from "./LostRequestCard";
 import { ProviderSubagentBar } from "./ProviderSubagentBar";
 import { ThreadCreationFailedCard } from "./ThreadCreationFailedCard";
 import {
@@ -192,6 +201,8 @@ export interface ThreadDetailScreenProps {
   readonly activePendingUserInputDrafts: Record<string, PendingUserInputDraftAnswer>;
   readonly activePendingUserInputAnswers: Record<string, string | ReadonlyArray<string>> | null;
   readonly respondingUserInputId: RuntimeRequestId | null;
+  /** Answers this client sent to the environment, by request, while they are out. */
+  readonly runtimeResponseAttempts?: ReadonlyMap<RuntimeRequestId, RuntimeResponseAttempt>;
   readonly draftMessage: string;
   readonly draftAttachments: ReadonlyArray<DraftComposerAttachment>;
   readonly connectionStateLabel: EnvironmentConnectionPhase;
@@ -237,6 +248,7 @@ export interface ThreadDetailScreenProps {
   readonly onRespondToApproval: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
+    response?: ApprovalResponseInput,
   ) => Promise<unknown>;
   readonly onSelectUserInputOption: (
     requestId: RuntimeRequestId,
@@ -250,7 +262,18 @@ export interface ThreadDetailScreenProps {
   ) => void;
   readonly onSubmitUserInput: () => Promise<unknown>;
   readonly onDismissUserInput: () => Promise<unknown>;
+  /** Sends an answer that could not be confirmed again under its original command. */
+  readonly onRetryRuntimeResponse?: (requestId: RuntimeRequestId) => Promise<unknown>;
   readonly showContent?: boolean;
+  /** Open decisions lost to a restart, shutdown or provider exit. */
+  readonly lostRequests: ReadonlyArray<ThreadLostRequest>;
+  readonly lostRequestsBusy: boolean;
+  readonly onAskAgainLostRequests: (
+    requestIds: readonly [RuntimeRequestId, ...RuntimeRequestId[]],
+  ) => Promise<unknown>;
+  readonly onDismissLostRequests: (
+    requestIds: readonly [RuntimeRequestId, ...RuntimeRequestId[]],
+  ) => Promise<unknown>;
 }
 
 function latestStreamingAssistantMessage(
@@ -492,6 +515,29 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const pendingBackgroundWork = presentPendingBackgroundWork(
     props.selectedThread.pendingBackgroundTasks,
   );
+  // Request cards answer only over a live connection and a synchronized thread, and say why not.
+  const responseStateFor = (
+    request: Pick<PendingUserInput, "requestId" | "responseCapability">,
+    respondingId: RuntimeRequestId | null,
+  ) =>
+    resolveRuntimeRequestResponseState({
+      connectionPhase: props.connectionStateLabel,
+      threadStatus: props.threadSyncStatus ?? "live",
+      responseCapability: request.responseCapability,
+      canOperate: props.canOperateThread,
+      responding: respondingId === request.requestId,
+      attempt: props.runtimeResponseAttempts?.get(request.requestId)?.phase,
+    });
+  const pendingApprovalResponseState = props.activePendingApproval
+    ? responseStateFor(props.activePendingApproval, props.respondingApprovalId)
+    : null;
+  const pendingUserInputResponseState = props.activePendingUserInput
+    ? responseStateFor(props.activePendingUserInput, props.respondingUserInputId)
+    : null;
+  const onRetryRuntimeResponse = props.onRetryRuntimeResponse;
+  const retryRuntimeResponse = onRetryRuntimeResponse
+    ? (requestId: RuntimeRequestId) => void onRetryRuntimeResponse(requestId)
+    : undefined;
   const floatingStatus = ((): FloatingWorkingStatus | null => {
     const connectionStatus = connectionFloatingStatus({
       connectionError: props.connectionError,
@@ -1361,8 +1407,12 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                         <PendingApprovalCard
                           canOperateThread={props.canOperateThread}
                           approval={props.activePendingApproval}
+                          cwd={props.threadCwd}
                           respondingApprovalId={props.respondingApprovalId}
+                          responseState={pendingApprovalResponseState}
                           onRespond={props.onRespondToApproval}
+                          onRetry={retryRuntimeResponse}
+                          providerName={providerSubagentProvider?.displayName}
                         />
                       ) : null}
                       {props.activePendingUserInput ? (
@@ -1379,12 +1429,32 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                           drafts={props.activePendingUserInputDrafts}
                           answers={props.activePendingUserInputAnswers}
                           respondingUserInputId={props.respondingUserInputId}
+                          responseState={pendingUserInputResponseState}
+                          onRetry={retryRuntimeResponse}
                           onSelectOption={props.onSelectUserInputOption}
                           onChangeCustomAnswer={props.onChangeUserInputCustomAnswer}
                           onSubmit={props.onSubmitUserInput}
                           onDismiss={props.onDismissUserInput}
                         />
                       ) : null}
+                    </Animated.View>
+                  ) : null}
+                  {/* Answer an open request first: the server refuses Ask again until then. */}
+                  {!props.activePendingApproval &&
+                  !props.activePendingUserInput &&
+                  props.lostRequests.length > 0 ? (
+                    <Animated.View
+                      className="shrink-0 px-4 pb-3"
+                      entering={FadeInDown.duration(220)}
+                      exiting={FadeOut.duration(140)}
+                    >
+                      <LostRequestCard
+                        canOperateThread={props.canOperateThread}
+                        requests={props.lostRequests}
+                        busy={props.lostRequestsBusy}
+                        onAskAgain={props.onAskAgainLostRequests}
+                        onDismiss={props.onDismissLostRequests}
+                      />
                     </Animated.View>
                   ) : null}
                 </View>

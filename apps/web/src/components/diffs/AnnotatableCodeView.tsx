@@ -7,16 +7,32 @@ import type {
   SelectedLineRange,
 } from "@pierre/diffs";
 import type { CodeViewHandle } from "@pierre/diffs/react";
-import type { ScopedThreadRef } from "@starkfuture/contracts";
-import { useCallback, useMemo, useState, type ReactNode, type Ref } from "react";
+import type { RunId, ScopedThreadRef } from "@starkfuture/contracts";
+import { MessageSquarePlusIcon } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type Ref,
+} from "react";
 
 import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { fnv1a32, resolveFileDiffPath } from "~/lib/diffRendering";
 import {
+  buildDiffFileReviewComment,
   buildDiffReviewComment,
+  diffFileCommentRange,
+  diffFileHasCommentableLines,
   restoreDiffReviewCommentRange,
   type ReviewCommentContext,
 } from "~/reviewCommentContext";
+
+import { Button } from "../ui/button";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 import { nextFileCommentId } from "../files/fileCommentAnnotations";
 import { DiffCommentAnnotation } from "./DiffCommentAnnotation";
@@ -25,6 +41,8 @@ import { StyledDiffCodeView, type StyledDiffCodeViewOptions } from "./StyledDiff
 interface DiffCommentAnnotationEntry {
   id: string;
   kind: "draft" | "comment";
+  /** A draft for the whole file submits the file's hunks instead of the selected rows. */
+  scope?: "file";
   range: SelectedLineRange;
   rangeLabel: string;
   text: string;
@@ -97,6 +115,47 @@ interface AnnotatableCodeViewProps {
   ) => ReactNode;
   /** Unfold a collapsed file that holds the find match being navigated to. */
   onRevealSearchMatch: (fileKey: string) => void;
+  /** The turn this diff shows. Comments made here carry it so a correction links to the turn. */
+  reviewRunId?: RunId | undefined;
+  /** Unfold a collapsed file before opening a whole-file comment in it. */
+  onUnfoldFile?: (fileKey: string) => void;
+}
+
+/** Opens a whole-file comment, or says why a file without changed lines cannot take one. */
+function DiffFileCommentButton({
+  filePath,
+  unavailableReason,
+  onComment,
+}: {
+  filePath: string;
+  unavailableReason: string | null;
+  onComment: () => void;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            size="icon-micro"
+            variant="ghost"
+            aria-label={
+              unavailableReason === null
+                ? `Comment on ${filePath}`
+                : `${filePath}: ${unavailableReason}`
+            }
+            disabled={unavailableReason !== null}
+            onClick={(event) => {
+              event.stopPropagation();
+              onComment();
+            }}
+          />
+        }
+      >
+        <MessageSquarePlusIcon className="size-3.5" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">{unavailableReason ?? "Comment on file"}</TooltipPopup>
+    </Tooltip>
+  );
 }
 
 interface DiffSelectionContext {
@@ -118,6 +177,8 @@ export function AnnotatableCodeView({
   renderHeaderFilenameSuffix,
   renderHeaderPrefix,
   onRevealSearchMatch,
+  reviewRunId,
+  onUnfoldFile,
 }: AnnotatableCodeViewProps) {
   const addReviewComment = useComposerDraftStore((store) => store.addReviewComment);
   const removeReviewComment = useComposerDraftStore((store) => store.removeReviewComment);
@@ -133,6 +194,8 @@ export function AnnotatableCodeView({
     annotation: DiffCommentLineAnnotation;
   } | null>(null);
   const [draftText, setDraftText] = useState("");
+  const [viewer, setViewer] = useState<AnnotatableCodeViewHandle | null>(null);
+  useImperativeHandle(viewerRef, () => viewer!, [viewer]);
 
   const filesByKey = useMemo(() => new Map(files.map((file) => [file.fileKey, file])), [files]);
   const items = useMemo<CodeViewDiffItem<DiffCommentAnnotationGroup>[]>(
@@ -198,22 +261,78 @@ export function AnnotatableCodeView({
       );
       const file = draft ? filesByKey.get(draft.fileKey) : undefined;
       if (!entry || !file) return;
-      const comment = buildDiffReviewComment({
+      const base = {
         id: entry.id,
         sectionId,
         sectionTitle,
         filePath: file.filePath,
         fileDiff: file.fileDiff,
-        range: entry.range,
         text,
-      });
+        runId: reviewRunId,
+      };
+      const comment =
+        entry.scope === "file"
+          ? buildDiffFileReviewComment(base)
+          : buildDiffReviewComment({ ...base, range: entry.range });
       if (comment) addReviewComment(composerDraftTarget, comment);
       setSelectedLines(null);
       setDraft(null);
       setDraftText("");
     },
-    [addReviewComment, composerDraftTarget, draft, filesByKey, sectionId, sectionTitle],
+    [
+      addReviewComment,
+      composerDraftTarget,
+      draft,
+      filesByKey,
+      reviewRunId,
+      sectionId,
+      sectionTitle,
+    ],
   );
+
+  // Header buttons can render before a draft opens elsewhere; an open draft is never replaced.
+  const openDraft = useRef(draft);
+  useEffect(() => {
+    openDraft.current = draft;
+  }, [draft]);
+  const pendingFileDraftScroll = useRef<{ fileKey: string; range: SelectedLineRange } | null>(null);
+  const beginFileComment = useCallback(
+    (fileKey: string, fileDiff: FileDiffMetadata, collapsed: boolean) => {
+      const range = diffFileCommentRange(fileDiff);
+      if (!range || openDraft.current !== null) return;
+      if (collapsed) onUnfoldFile?.(fileKey);
+      const id = nextFileCommentId();
+      setSelectedLines(null);
+      setDraftText("");
+      setDraft({
+        fileKey,
+        annotation: {
+          side: annotationSide(range),
+          lineNumber: range.end,
+          metadata: {
+            entries: [
+              { id, kind: "draft", scope: "file", range, rangeLabel: "whole file", text: "" },
+            ],
+          },
+        },
+      });
+      pendingFileDraftScroll.current = { fileKey, range };
+    },
+    [onUnfoldFile],
+  );
+  // The draft sits at the file's last changed line, which can be far below the header.
+  useEffect(() => {
+    const target = pendingFileDraftScroll.current;
+    if (target === null || viewer === null || draft?.fileKey !== target.fileKey) return;
+    pendingFileDraftScroll.current = null;
+    viewer.scrollTo({
+      type: "line",
+      id: target.fileKey,
+      lineNumber: target.range.end,
+      side: annotationSide(target.range),
+      align: "center",
+    });
+  }, [draft, viewer]);
 
   const beginComment = useCallback(
     (range: SelectedLineRange | null, context: DiffSelectionContext) => {
@@ -252,7 +371,7 @@ export function AnnotatableCodeView({
   return (
     <StyledDiffCodeView<DiffCommentAnnotationGroup>
       key={codeViewKey}
-      {...(viewerRef ? { viewerRef } : {})}
+      viewerRef={setViewer}
       {...(className ? { className } : {})}
       {...(unsafeCSSExtra ? { unsafeCSSExtra } : {})}
       {...(renderHeaderMetadata
@@ -273,7 +392,24 @@ export function AnnotatableCodeView({
         onGutterUtilityClick: beginComment,
       }}
       renderHeaderFilenameSuffix={(item) =>
-        item.type === "diff" ? renderHeaderFilenameSuffix(item.fileDiff) : null
+        item.type === "diff" ? (
+          <>
+            {renderHeaderFilenameSuffix(item.fileDiff)}
+            <DiffFileCommentButton
+              filePath={resolveFileDiffPath(item.fileDiff)}
+              unavailableReason={
+                item.fileDiff.cacheKey?.endsWith(":pending") === true
+                  ? "The diff is still loading"
+                  : !diffFileHasCommentableLines(item.fileDiff)
+                    ? "No changed lines to comment on"
+                    : hasOpenComment
+                      ? "Finish the open comment first"
+                      : null
+              }
+              onComment={() => beginFileComment(item.id, item.fileDiff, item.collapsed === true)}
+            />
+          </>
+        ) : null
       }
       renderHeaderPrefix={(item) =>
         item.type === "diff"

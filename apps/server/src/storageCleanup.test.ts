@@ -161,6 +161,19 @@ describe("V2 storage cleanup eligibility", () => {
     ).toBe(false);
   });
 
+  it("retains the worktree a lost decision would be asked again in", () => {
+    const lostRuntimeRequest = {
+      id: RuntimeRequestId.make("request:lost"),
+      kind: "command" as const,
+      cause: "server_restart" as const,
+      lostAt: at(-1_000),
+    };
+    expect(storageCleanupThreadIdle({ ...candidate(), lostRuntimeRequest }, NOW_MS)).toBe(false);
+    expect(storageCleanupThreadIdle({ ...candidate(), lostRuntimeRequest: null }, NOW_MS)).toBe(
+      true,
+    );
+  });
+
   it("retains a queued prompt before the new run has been projected", () => {
     expect(
       storageCleanupThreadIdle({ ...candidate(), latestUserMessageAt: at(-1_000) }, NOW_MS),

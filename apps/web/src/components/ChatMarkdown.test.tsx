@@ -92,6 +92,124 @@ import ChatMarkdown, {
   shouldUseMarkdownFileBrowserPrimaryAction,
 } from "./ChatMarkdown";
 
+describe("ChatMarkdown inline preview galleries", () => {
+  it.each(["\n", "\n\n"])(
+    "changes only adjacent figures and expands the selected image without moving prose (%j)",
+    async (separator) => {
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const onImageExpand = vi.fn();
+      try {
+        await act(() =>
+          root.render(
+            <ChatMarkdown
+              cwd={undefined}
+              onImageExpand={onImageExpand}
+              text={[
+                "Before the figures.",
+                [
+                  "![Desktop](https://images.test/desktop.png)",
+                  "![Mobile](https://images.test/mobile.png)",
+                ].join(separator),
+                "Caption between groups.",
+                "![Detail](https://images.test/detail.png)",
+                "After the figures.",
+              ].join("\n\n")}
+            />,
+          ),
+        );
+        expect(container.querySelectorAll('[aria-label="Next preview"]')).toHaveLength(1);
+        expect(container.querySelector('[aria-live="polite"]')?.textContent).toBe("Desktop");
+        const mobile = container.querySelector<HTMLImageElement>('img[alt="Mobile"]')!;
+        await act(() => mobile.dispatchEvent(new Event("load")));
+        await act(() =>
+          container.querySelector<HTMLButtonElement>('[aria-label="Next preview"]')!.click(),
+        );
+        expect(container.querySelector('[aria-live="polite"]')?.textContent).toBe("Mobile");
+        expect(container.querySelector('img[alt="Desktop"]')!.closest("[hidden]")).not.toBeNull();
+        expect(container.querySelector('img[alt="Mobile"]')!.closest("[hidden]")).toBeNull();
+        await act(() =>
+          container.querySelector<HTMLButtonElement>('[aria-label="Open full screen"]')!.click(),
+        );
+        expect(onImageExpand).toHaveBeenCalledWith(
+          expect.objectContaining({
+            index: 1,
+            images: expect.arrayContaining([expect.objectContaining({ name: "Mobile" })]),
+          }),
+        );
+        const blocks = [...container.querySelector(".chat-markdown")!.children];
+        expect(blocks.map((block) => block.tagName)).toEqual(["P", "DIV", "P", "DIV", "P"]);
+        expect(blocks[0]!.textContent).toBe("Before the figures.");
+        expect(blocks[2]!.textContent).toBe("Caption between groups.");
+        expect(blocks[4]!.textContent).toBe("After the figures.");
+      } finally {
+        await act(() => root.unmount());
+        container.remove();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("keeps remote consent per image and leaves linked images and prose inline", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(() =>
+        root.render(
+          <ChatMarkdown
+            cwd={undefined}
+            remoteImagePolicy="click-to-load"
+            text={[
+              "![First](https://images.test/first.png)",
+              "![Second](https://images.test/second.png)",
+              "[![Linked badge](https://images.test/badge.png)](https://example.test)",
+              "Words ![Inline](https://images.test/inline.png) continue here.",
+            ].join("\n\n")}
+          />,
+        ),
+      );
+      expect(container.querySelectorAll("img")).toHaveLength(0);
+      expect(
+        container.querySelector<HTMLButtonElement>('[aria-label="Open full screen"]')!.disabled,
+      ).toBe(true);
+      const firstLoad = [...container.querySelectorAll("button")].find(
+        (button) => button.textContent === "Load image",
+      )!;
+      await act(() => firstLoad.click());
+      expect(container.querySelectorAll("img")).toHaveLength(1);
+      await act(() =>
+        container.querySelector<HTMLButtonElement>('[aria-label="Next preview"]')!.click(),
+      );
+      expect(container.querySelector('[aria-live="polite"]')?.textContent).toBe("Second");
+      expect(container.querySelectorAll("img")).toHaveLength(1);
+      expect(
+        container.querySelector<HTMLButtonElement>('[aria-label="Open full screen"]')!.disabled,
+      ).toBe(true);
+      await act(() =>
+        container.querySelector<HTMLButtonElement>('[aria-label="Previous preview"]')!.click(),
+      );
+      expect(container.querySelector('img[alt="First"]')!.closest("[hidden]")).toBeNull();
+      expect(
+        container.querySelector('a[href="https://example.test"]')!.closest("p"),
+      ).not.toBeNull();
+      expect(
+        [...container.querySelectorAll("p")].some((paragraph) =>
+          paragraph.textContent?.startsWith("Words "),
+        ),
+      ).toBe(true);
+      expect(container.querySelectorAll('[aria-label="Open full screen"]')).toHaveLength(1);
+    } finally {
+      await act(() => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 function codeButton(renderer: ReactTestRenderer, label: string) {
   const button = renderer.root
     .findAllByType(Button)

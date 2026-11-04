@@ -24,6 +24,8 @@ export type ChoiceRowProps = {
   readonly selected: boolean;
   readonly onPress: () => void;
   readonly isLast: boolean;
+  /** Shown but not selectable, with the reason under the description. */
+  readonly disabledReason?: string;
 };
 
 type RowSelectionProps = {
@@ -139,9 +141,12 @@ export function ModelRowContent(
 export function ChoiceRowContent(props: ChoiceRowProps & RowSelectionProps) {
   return (
     <Pressable
-      accessibilityLabel={props.description ? `${props.label}. ${props.description}` : props.label}
+      accessibilityLabel={[props.label, props.description, props.disabledReason]
+        .filter(Boolean)
+        .join(". ")}
       accessibilityRole="radio"
-      accessibilityState={{ checked: props.selected }}
+      accessibilityState={{ checked: props.selected, disabled: props.disabledReason !== undefined }}
+      disabled={props.disabledReason !== undefined}
       onPress={props.onPress}
       style={props.minimumHeight === undefined ? undefined : { minHeight: props.minimumHeight }}
       className={cn(
@@ -150,10 +155,13 @@ export function ChoiceRowContent(props: ChoiceRowProps & RowSelectionProps) {
       )}
     >
       {props.leadingSelection}
-      <View className="min-w-0 flex-1 gap-0.5">
+      <View className={cn("min-w-0 flex-1 gap-0.5", props.disabledReason && "opacity-50")}>
         <Text className="text-base font-stark-medium text-foreground">{props.label}</Text>
         {props.description ? (
           <Text className="text-sm leading-5 text-foreground-muted">{props.description}</Text>
+        ) : null}
+        {props.disabledReason ? (
+          <Text className="text-sm leading-5 text-foreground-muted">{props.disabledReason}</Text>
         ) : null}
       </View>
       {props.trailingSelection}

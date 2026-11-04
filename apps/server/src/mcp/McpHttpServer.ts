@@ -570,7 +570,8 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
 });
 
 interface ImageToolResult {
-  readonly screenshot: {
+  /** Absent when the tool had nothing to capture; the result then goes out as text only. */
+  readonly screenshot?: {
     readonly mimeType: "image/png";
     readonly data: string;
     readonly width: number;
@@ -678,6 +679,15 @@ const registerImageTool = <T extends Tool.Any, E, R>(
               onFailure: imageToolFailure(tool.name, operation, failureText),
               onSuccess: ({ encodedResult }) => {
                 const { screenshot, ...rest } = encodedResult as ImageToolResult;
+                if (screenshot === undefined) {
+                  return Effect.succeed(
+                    new McpSchema.CallToolResult({
+                      isError: false,
+                      structuredContent: rest,
+                      content: [{ type: "text", text: JSON.stringify(rest) }],
+                    }),
+                  );
+                }
                 const includeImage =
                   (payload as { readonly includeImage?: boolean } | undefined)?.includeImage !==
                   false;

@@ -189,6 +189,72 @@ it.effect("never calls a global reconnect, including manual per-server actions",
   }).pipe(Effect.scoped),
 );
 
+it.effect("diagnoses failed global-only connections without reloading healthy servers", () =>
+  Effect.gen(function* () {
+    const network = yield* Ref.make<McpRecovery.NetworkState>({
+      state: "network-unavailable",
+      vpnState: "forticlient-disconnected",
+    });
+    let networkChecks = 0;
+    let reloads = 0;
+    const s = yield* setup(
+      [row("healthy", "connected"), row("broken", "failed"), row("login", "needs-auth")],
+      {
+        scope: "all",
+        inspectNetwork: () =>
+          Effect.sync(() => {
+            networkChecks += 1;
+          }).pipe(Effect.andThen(Ref.get(network))),
+        reload: () =>
+          Effect.sync(() => {
+            reloads += 1;
+            return { status: "reloaded" as const, failedServers: [] };
+          }),
+      },
+    );
+    const first = yield* s.recovery.check;
+    assert.equal(networkChecks, 1);
+    assert.deepEqual(first[1]?.recovery, {
+      state: "network-unavailable",
+      attempts: 0,
+      vpnState: "forticlient-disconnected",
+    });
+    yield* s.recovery.check;
+    yield* TestClock.adjust("59 seconds");
+    assert.equal(networkChecks, 1);
+    yield* Ref.set(network, "unknown");
+    yield* TestClock.adjust("1 second");
+    const next = yield* s.recovery.check;
+    assert.equal(networkChecks, 2);
+    assert.deepEqual(next[1]?.recovery, { state: "manual", attempts: 0 });
+    assert.deepEqual(s.calls, []);
+    assert.equal(reloads, 0);
+  }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "defers global-only network checks during active work and reports a known VPN outage",
+  () =>
+    Effect.gen(function* () {
+      let networkChecks = 0;
+      const s = yield* setup([row("broken", "failed")], {
+        scope: "all",
+        inspectNetwork: () =>
+          Effect.sync(() => {
+            networkChecks += 1;
+            return "vpn-off" as const;
+          }),
+      });
+      yield* Ref.set(s.busy, true);
+      assert.equal((yield* s.recovery.check)[0]?.recovery?.state, "manual");
+      assert.equal(networkChecks, 0);
+      yield* Ref.set(s.busy, false);
+      assert.equal((yield* s.recovery.check)[0]?.recovery?.state, "vpn-off");
+      assert.equal(networkChecks, 1);
+      assert.deepEqual(s.calls, []);
+    }).pipe(Effect.scoped),
+);
+
 it.effect("observes failures during a turn and repairs only after all work is idle", () =>
   Effect.gen(function* () {
     const s = yield* setup([row("broken", "failed")]);

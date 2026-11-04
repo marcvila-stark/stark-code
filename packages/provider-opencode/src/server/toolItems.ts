@@ -3,7 +3,10 @@
  * Both report a tool as a name, a JSON input, text output, and free-form
  * metadata; only how they deliver those differs.
  */
-import type { OrchestrationV2TurnItem } from "@starkfuture/contracts";
+import type {
+  OrchestrationV2FileChangeDetail,
+  OrchestrationV2TurnItem,
+} from "@starkfuture/contracts";
 import { formatReadToolLabel, formatSearchToolLabel } from "@starkfuture/shared/toolActivity";
 
 // Search results stay on the timeline wire, so keep their text a preview.
@@ -62,6 +65,29 @@ function recordNumber(input: unknown, ...keys: ReadonlyArray<string>): number | 
   return undefined;
 }
 
+/**
+ * The files a patch in Codex's format (`*** Update File: path`, as OpenCode's apply_patch takes
+ * it) touches, in the operation names Codex patches report.
+ */
+function patchFileChanges(patchText: string) {
+  const changes: Array<OrchestrationV2FileChangeDetail> = [];
+  for (const line of patchText.split(/\r?\n/)) {
+    const header = /^\*\*\* (Add|Update|Delete) File: (.+)$/.exec(line);
+    const operation = header?.[1]?.toLowerCase();
+    const path = header?.[2]?.trim();
+    if (operation && path) {
+      changes.push({ operation, path });
+      continue;
+    }
+    const movedTo = /^\*\*\* Move to: (.+)$/.exec(line)?.[1]?.trim();
+    const moved = changes.at(-1);
+    if (movedTo && moved) {
+      changes[changes.length - 1] = { operation: "rename", path: movedTo, oldPath: moved.path };
+    }
+  }
+  return changes;
+}
+
 function stableJson(value: unknown): string {
   if (typeof value === "string") return value;
   try {
@@ -103,10 +129,16 @@ export function openCodeToolTurnItem(
       const diffStr =
         recordString(tool.completedMetadata, "diff", "patch") ??
         (base.status === "failed" && output?.trim() ? output : undefined);
+      const path = recordString(input, "filePath", "path", "file");
+      const patchText = recordString(input, "patchText", "patch");
+      const changes = path === undefined && patchText ? patchFileChanges(patchText) : [];
       return {
         ...base,
         type: "file_change",
-        fileName: recordString(input, "filePath", "path", "file") ?? tool.name,
+        fileName: path ?? changes[0]?.path ?? tool.name,
+        ...(changes.length === 0 ? {} : { changes }),
+        // Without a path the tool's name is only a label, so say its files are unknown.
+        ...(path === undefined && changes.length === 0 ? { agentWrittenPaths: [] } : {}),
         ...(oldStr === undefined ? {} : { oldStr }),
         ...(newStr === undefined ? {} : { newStr }),
         ...(diffStr === undefined ? {} : { diffStr }),

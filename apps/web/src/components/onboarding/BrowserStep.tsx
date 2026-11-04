@@ -101,8 +101,9 @@ export function BrowserStep({
         Bring your website sign-ins
       </h1>
       <p className={`${styles.intro} mb-6.5 max-w-[540px] text-muted-foreground`}>
-        Choose which website sign-ins to copy into a personal browser profile. Agents cannot open
-        it.
+        Copy the sign-ins of the sites you pick, like Stark Pages, into Stark Code&rsquo;s own
+        browser profile on this computer, so they open already signed in. Agents cannot open that
+        profile.
       </p>
       <div className="rounded-lg border border-border p-5 max-sm:p-4.25">
         {!bridge ? (

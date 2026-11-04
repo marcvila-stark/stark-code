@@ -80,8 +80,10 @@ contains a copied Codex setup. Use a fresh shadow directory and sign in again.
 
 Stark Code checks connection health at session startup and between turns. Codex
 currently exposes only a global MCP reload, so Stark Code does not automatically
-reconnect a failed server and disturb healthy connections. Sign-in failures show
-a sign-in action. Connection controls wait until agent work has finished.
+reconnect a failed server and disturb healthy connections. Failed remote connections
+still get network and VPN checks. Sign-in failures show a sign-in action. Connection
+controls wait until agent work has finished. A successful reload request is not proof
+that every server connected; check the resulting server statuses.
 The chat shows a connection notice only when a tool call in the current turn
 needs that connection. Other issues remain available in connection settings.
 
@@ -89,12 +91,48 @@ In a live conversation in the local desktop app, open **+ → Connectors → Man
 choose **Reload MCPs**. This asks the running Codex provider session to reload its
 MCP configuration; watch the server list for connection results. **Refresh status**
 only rereads that list. No model turn is started.
+This list reflects the provider's observations; it cannot prove that an otherwise
+silent connection will answer its next tool call. An explicit discovery failure
+is shown as failed even if the provider still labels the transport connected.
 **Settings → MCP servers** can inspect connections, but cannot reload existing
 conversations.
 
 The native Codex terminal has separate connections and no live MCP reload command.
 Its **Connections** control provides `/mcp` for inspection. Restart Codex and resume the
 session to load changed configuration.
+
+## Permissions
+
+Codex chats run under **Supervised**: Codex asks before commands and file changes, and its sandbox
+is read-only. A chat can instead use Codex's own settings, from your `config.toml`, its permission
+profiles and rules. Choose **Reset to inherited** in the chat's permission popover; it needs
+settings permission and applies once no run is active and Codex's session has restarted. The
+popover shows the approval policy, sandbox, reviewer and permission profile Codex reported for the
+running session; the approval policy keeps Codex's own word, such as `untrusted`, with its meaning
+on hover. If your settings send approvals to Codex's automatic review, the conversation
+shows what it approved or denied; Stark Code never turns automatic review on and never overrides
+its denial.
+
+An approval card offers only the choices Codex lists for that request. **Deny** (or **Deny and
+stop** when Codex lists no plain Deny) and the narrowest allow Codex offers are the card's buttons;
+the others are under **More approval options**, allows from shortest- to longest-lived, then
+**Always block** and **Deny and stop**:
+
+- **Allow once** and **Allow for this session**. Codex remembers a session approval until its
+  session restarts.
+- **Always allow (Codex, every project)**: a command-prefix rule saved in this Codex home's rules.
+  The card shows the exact rule. A prefix that would allow too much, such as an interpreter, a
+  shell or a network tool, is left out.
+- **Always allow** or **Always block** one network host, saved in this Codex home's network rules.
+- **Deny**, which refuses and lets Codex continue, and **Deny and stop**, which refuses and ends the
+  turn. Codex takes no typed reason.
+
+Saved rules apply to every project using that Codex home, need settings permission and are not
+offered on mobile. A permissions request offers **Grant for this turn** or **Grant for this
+session** for exactly the paths and network access the card lists, or **Deny**. Paths read as
+Codex names them, such as `/ (the whole filesystem)`, a glob marked `(pattern)`, or `$TMPDIR`. For a Stark Pages
+publish, Codex asks every time: session choices and saved allow rules are left out. If Codex closes a request
+itself before your answer arrives, the card says so and nothing is sent.
 
 ## Answer questions while Codex works
 
@@ -108,9 +146,12 @@ supports async questions.
 ## Approve app access
 
 Codex tools can request access to another app. Respond to the named app's request
-in the thread on web, desktop, or mobile. Some tools offer access for one request,
-the current session, or permanently. See [Permission modes](./permission-modes.md)
-for command and file approvals.
+in the thread on web, desktop, or mobile. Some tools offer access for one request or
+the current session; Stark Code does not offer permanent access, because Codex does not
+say what it would save. When the request is about a tool call, the card shows that call
+and its arguments. A form field the approval does not answer is never filled with a default;
+if that field is required, the request is declined instead. See [Permission modes](./permission-modes.md) for command
+and file approvals.
 
 ## Codex says I hit a usage limit
 

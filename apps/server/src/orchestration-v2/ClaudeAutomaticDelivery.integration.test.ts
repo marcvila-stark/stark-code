@@ -124,7 +124,7 @@ const result = (uuid: string, aborted: boolean) =>
     modelUsage: {},
   });
 
-it.effect.each(["child completion", "scheduled message", "user steering"] as const)(
+it.live.each(["child completion", "scheduled message", "user steering"] as const)(
   "delivers %s with Claude's native pending-tool cancellation behavior",
   (delivery) =>
     Effect.scoped(
@@ -175,12 +175,16 @@ it.effect.each(["child completion", "scheduled message", "user steering"] as con
           const threadId = ThreadId.make("thread:automatic-delivery");
           const projectId = ProjectId.make("project:automatic-delivery");
           const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
-            orchestrator.streamDomainEvents.pipe(
-              Stream.filter(predicate),
-              Stream.take(1),
-              Stream.runDrain,
-              Effect.forkScoped,
-            );
+            Effect.gen(function* () {
+              const sink = yield* EventSink.EventSinkV2;
+              const afterSequence = yield* sink.latestSequence();
+              return yield* orchestrator.streamStoredEventsFrom({ afterSequence }).pipe(
+                Stream.filter(({ event }) => predicate(event)),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+            });
           yield* orchestrator.dispatch({
             type: "thread.create",
             commandId: CommandId.make("create"),
@@ -188,7 +192,7 @@ it.effect.each(["child completion", "scheduled message", "user steering"] as con
             projectId,
             title: "Automatic delivery",
             modelSelection,
-            runtimeMode: "full-access",
+            runtimeMode: "approval-required",
             interactionMode: "default",
             branch: null,
             worktreePath: cwd,
@@ -305,7 +309,7 @@ it.effect.each(["child completion", "scheduled message", "user steering"] as con
                   threadId,
                   workspaceStrategy: { type: "root" },
                   modelSelection,
-                  runtimeMode: "full-access",
+                  runtimeMode: "approval-required",
                   interactionMode: "default",
                 }),
               );

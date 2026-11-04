@@ -8,7 +8,9 @@ Agents can place local images in a page by file path. Stark Code embeds them whe
 
 HTML tools are not pre-approved as read-only actions. Preview pages cannot connect to websites, and generated replies block external images, fonts, scripts and data requests. Ask the agent to embed the content it needs. For a compact overview of a completed answer, choose **Make readable** beneath that reply. It adds a summary, table or flowchart above the original reply.
 
-Before publishing, agents check their work with screenshots from a small headless browser that Stark Code keeps for itself; it never uses a browser you installed. The first preview on a machine downloads it once (about 120 MB) into Stark Code's data folder, so that preview can take a minute. Browser tabs on a remote environment use the same browser, so whichever comes first downloads it. Some Linux hosts need [setup](remote-access.md#browser-host-setup) before it can start. Pages publish without it.
+For a flowchart, sequence, state or other diagram, agents usually write a Mermaid diagram in their reply instead, which the chat draws without a tool call or approval. Mobile shows the diagram's source.
+
+Before publishing, agents can check their work with screenshots from a small headless browser that Stark Code keeps for itself; it never uses a browser you installed. Stark Code installs it only when you ask: on web or desktop, open **Settings → Agents & accounts → Setup doctor** and choose **Install preview browser** (about 100 to 120 MB, into Stark Code's data folder). The same row shows its progress. Until it is installed, agents are told it is missing, so they publish without a screenshot check, draw a Mermaid diagram, or describe the page; a preview never downloads it. Browser tabs on a remote environment use the same browser, and opening one, yours or an agent's, downloads it if it is missing. Some Linux hosts need [setup](remote-access.md#browser-host-setup) before it can start. Pages publish without it.
 
 ## MCP apps
 

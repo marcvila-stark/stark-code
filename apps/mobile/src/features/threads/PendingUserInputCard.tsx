@@ -2,6 +2,11 @@ import { RequestActionButton } from "./RequestActionButton";
 import { QuestionAttachments } from "./QuestionAttachments";
 import type { RuntimeRequestId } from "@starkfuture/contracts";
 import type { ThreadUserInputQuestion } from "@starkfuture/client-runtime/state/thread-requests";
+import {
+  canAnswerRuntimeRequest,
+  isSendingRuntimeResponse,
+  type RuntimeRequestResponseState,
+} from "@starkfuture/client-runtime/state/runtime-request-response";
 import { useCallback, useRef } from "react";
 import { Platform, Pressable, ScrollView, View, type LayoutChangeEvent } from "react-native";
 import Animated, {
@@ -16,6 +21,7 @@ import Animated, {
 } from "react-native-reanimated";
 
 import { USER_INPUT_TOGGLE_DURATION_MS } from "./pendingUserInputLayout";
+import { RuntimeRequestResponseCaption } from "./RuntimeRequestResponseCaption";
 
 import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
@@ -62,6 +68,10 @@ export interface PendingUserInputCardProps {
   readonly drafts: Record<string, PendingUserInputDraftAnswer>;
   readonly answers: Record<string, string | ReadonlyArray<string>> | null;
   readonly respondingUserInputId: RuntimeRequestId | null;
+  /** Whether the question can take an answer now; without it only the provider gates it. */
+  readonly responseState?: RuntimeRequestResponseState | null;
+  /** Sends an answer that could not be confirmed again under its original command. */
+  readonly onRetry?: ((requestId: RuntimeRequestId) => void) | undefined;
   readonly onSelectOption: (
     requestId: RuntimeRequestId,
     question: ThreadUserInputQuestion,
@@ -111,8 +121,13 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
   const questionCount = props.pendingUserInput.questions.length;
   // Message responses start a new run and remain available after the provider exits.
   const canRespond = props.pendingUserInput.responseCapability !== "not_resumable";
-  const isResponding = props.respondingUserInputId === props.pendingUserInput.requestId;
-  const responseDisabled = !canRespond || isResponding;
+  const responseState = props.responseState ?? null;
+  const isResponding =
+    props.respondingUserInputId === props.pendingUserInput.requestId ||
+    (responseState !== null && isSendingRuntimeResponse(responseState));
+  // Offline or still syncing: the question stays visible but takes no answer.
+  const answerable = responseState === null || canAnswerRuntimeRequest(responseState);
+  const responseDisabled = !canRespond || isResponding || !answerable;
 
   const cardCoverage = props.cardCoverage;
   const barHeightRef = useRef(0);
@@ -288,6 +303,14 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
             run to continue.
           </Text>
         ) : null}
+        {responseState ? (
+          <RuntimeRequestResponseCaption
+            state={responseState}
+            onRetry={
+              props.onRetry ? () => props.onRetry?.(props.pendingUserInput.requestId) : undefined
+            }
+          />
+        ) : null}
         {props.pendingUserInput.questions.map((question) => {
           const draft = props.drafts[question.id];
           return (
@@ -367,7 +390,7 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
         <Pressable
           accessibilityRole="button"
           className="items-center justify-center rounded-2xl px-4 py-2.5 active:opacity-70"
-          disabled={isResponding}
+          disabled={isResponding || !answerable}
           onPress={() => void props.onDismiss()}
         >
           <Text className="font-stark-bold text-sm text-foreground-muted">

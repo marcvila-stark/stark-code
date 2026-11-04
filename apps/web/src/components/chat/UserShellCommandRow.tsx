@@ -20,12 +20,16 @@ export function userShellStatus(item: UserShellCommandItem | null, runStatus?: s
   if (item?.timedOut) return "timed out";
   if (item?.exitCode !== undefined && item.status !== "running") return `exit ${item.exitCode}`;
   if (item?.status === "failed" || runStatus === "failed") return "failed to start";
+  // Removed from the queue, or a check skipped because newer work ran first.
+  if (item === null && runStatus === "cancelled") return "not run";
   return item?.status === "running" || item?.status === "pending" || runStatus === "running"
     ? "Running"
     : "Queued";
 }
 
 export function UserShellCommandRow(props: {
+  /** Replaces the `!` marker, for example to name the turn a check ran after. */
+  readonly title?: string;
   readonly command: string;
   readonly respond: boolean;
   readonly item: UserShellCommandItem | null;
@@ -42,7 +46,11 @@ export function UserShellCommandRow(props: {
   return (
     <section aria-label="User shell command" className="space-y-2 rounded-lg border p-3 text-sm">
       <div className="flex items-center justify-between gap-2">
-        <span className="font-mono">!</span>
+        {props.title ? (
+          <span className="min-w-0 truncate font-medium">{props.title}</span>
+        ) : (
+          <span className="font-mono">!</span>
+        )}
         <span className={destructive ? "text-destructive" : "text-muted-foreground"}>
           {status}
           {props.item?.durationMs !== undefined

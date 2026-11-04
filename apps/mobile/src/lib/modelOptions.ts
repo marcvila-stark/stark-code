@@ -11,6 +11,7 @@ import { resolveProjectProviderInstanceEnabled } from "@starkfuture/contracts";
 import {
   buildExplicitProviderOptionSelectionsFromDescriptors,
   getProviderOptionDescriptors,
+  orderByAutomaticProviderPreference,
 } from "@starkfuture/shared/model";
 
 export type ModelOption = {
@@ -24,6 +25,8 @@ export type ModelOption = {
   readonly providerIconUrl?: string | undefined;
   readonly isDefault: boolean;
   readonly isLegacy: boolean;
+  /** The provider's last probe said it can run now; the automatic new-task pick needs this. */
+  readonly isProviderReady?: boolean;
   readonly isUnavailable?: boolean;
   readonly isHidden?: boolean;
   readonly canHide?: boolean;
@@ -252,18 +255,36 @@ export function resolveDefaultableModelSelection(
   return provider?.driver !== "antigravity" && model?.isLegacy === true ? null : usable;
 }
 
+/**
+ * Draft, then project default, then the last manual pick. With none of those,
+ * a new task starts on a ready provider, Claude first, using that provider's
+ * advertised default model; only when no provider reports ready does it fall
+ * back to the first usable option.
+ */
 export function resolveNewTaskModelSelection(input: {
   readonly draftSelection: ModelSelection | null;
   readonly projectDefaultSelection: ModelSelection | null;
   readonly stickySelection: ModelSelection | null;
   readonly modelOptions: ReadonlyArray<ModelOption>;
 }): ModelSelection | null {
+  const usable = input.modelOptions.filter((option) => !option.isUnavailable);
+  const [automatic] = orderByAutomaticProviderPreference(
+    usable.filter((option) => option.isProviderReady === true),
+    (option) => option.providerDriver,
+  );
+  const automaticOptions = automatic
+    ? usable.filter((option) => option.providerKey === automatic.providerKey)
+    : [];
   return (
     input.draftSelection ??
     input.projectDefaultSelection ??
     input.stickySelection ??
-    input.modelOptions.find((option) => option.isDefault && !option.isUnavailable)?.selection ??
-    input.modelOptions.find((option) => !option.isUnavailable)?.selection ??
+    (
+      automaticOptions.find((option) => option.isDefault) ??
+      automaticOptions.find((option) => !option.isLegacy)
+    )?.selection ??
+    usable.find((option) => option.isDefault)?.selection ??
+    usable[0]?.selection ??
     null
   );
 }
@@ -322,6 +343,7 @@ export function buildModelOptions(
         canHide: !model.isCustom,
         isDefault: model.isDefault === true,
         isLegacy: model.isLegacy === true,
+        isProviderReady: provider.status === "ready",
         ...(updateRequired ? { providerUpdateRequired: updateRequired } : {}),
         capabilities: model.capabilities,
         selection: normalizeSelectionOptions(

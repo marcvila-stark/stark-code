@@ -60,11 +60,12 @@ const button = (label: string) => {
   if (!element) throw new Error(`Missing ${label}`);
   return element;
 };
-const checkbox = (label: string) => {
-  const element = [...document.querySelectorAll<HTMLElement>('[role="checkbox"]')].find(
-    (item) => item.getAttribute("aria-label") === label,
-  );
-  if (!element) throw new Error(`Missing checkbox ${label}`);
+/** A recommended site set's checkbox, found by the set's title. */
+const siteSet = (title: string) => {
+  const element = [...document.querySelectorAll("label")]
+    .find((item) => item.textContent?.startsWith(title))
+    ?.querySelector<HTMLElement>('[role="checkbox"]');
+  if (!element) throw new Error(`Missing site set ${title}`);
   return element;
 };
 const render = (id = localId as EnvironmentId | null) =>
@@ -112,19 +113,18 @@ it("starts with the default browser and zero selected sites, then imports only e
   expect(button("Browser to import from").textContent).toContain("Brave");
   expect(importCookies).not.toHaveBeenCalled();
   await click("Choose sites");
-  expect(document.body.textContent).toContain("Import from Brave");
-  expect(document.body.textContent).toContain("0 sites selected");
-  expect(button("Select sites to import").disabled).toBe(true);
-  await click("Select Stark sites (2)");
+  expect(document.body.textContent).toContain("Use your Brave sign-ins in Stark Code");
+  expect(siteSet("Stark sites").getAttribute("aria-checked")).toBe("false");
+  expect(button("Copy sign-ins").disabled).toBe(true);
+  await act(() => siteSet("Stark sites").click());
   expect(importCookies).not.toHaveBeenCalled();
-  await act(() => checkbox("Allow copying sign-ins for selected sites").click());
-  await click("Import 2 sites");
+  await click("Copy sign-ins for 2 sites");
   expect(importCookies).toHaveBeenCalledExactlyOnceWith({
     environmentId: localId,
     sourceId: "brave",
     sourceProfileDirectory: "Default",
     targetProfileId: "personal-imported",
-    selectedDomains: ["id.starkfuture.com", "pages.starkfuture.com"],
+    selectedDomains: ["pages.starkfuture.com", "id.starkfuture.com"],
     consent: true,
   });
   expect(imported).toHaveBeenCalledOnce();
@@ -133,10 +133,9 @@ it("starts with the default browser and zero selected sites, then imports only e
 it("blocks a pending import if its captured local destination goes away", async () => {
   await render();
   await click("Choose sites");
-  await click("Select Stark sites (2)");
-  await act(() => checkbox("Allow copying sign-ins for selected sites").click());
+  await act(() => siteSet("Stark sites").click());
   await render(null);
-  await click("Import 2 sites");
+  await click("Copy sign-ins for 2 sites");
   expect(importCookies).not.toHaveBeenCalled();
   expect(imported).not.toHaveBeenCalled();
 });
@@ -152,9 +151,8 @@ it("keeps an explicit import failure visible without claiming a successful sign-
   importCookies.mockRejectedValue(new Error("Browser import failed: readFailed."));
   await render();
   await click("Choose sites");
-  await click("Select Stark sites (2)");
-  await act(() => checkbox("Allow copying sign-ins for selected sites").click());
-  await click("Import 2 sites");
+  await act(() => siteSet("Stark sites").click());
+  await click("Copy sign-ins for 2 sites");
   expect(importCookies).toHaveBeenCalledOnce();
   expect(imported).not.toHaveBeenCalled();
   expect(document.body.textContent).toContain("cookie database could not be read");

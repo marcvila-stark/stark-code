@@ -7,6 +7,8 @@ import {
   ProviderSessionId,
   RunAttemptId,
   ProviderApprovalDecision,
+  ProviderApprovalFeedback,
+  ProviderApprovalOptionId,
   ProviderUserInputAnswers,
   ProviderThreadId,
   ProviderTurnId,
@@ -75,11 +77,25 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
       ]),
     ),
   }),
+  /**
+   * Applies a chat's narrowed permissions to a live provider thread during a
+   * run: `now` stops the provider's running work so they apply at once,
+   * `after-run` lets it finish. Adapters without the hook apply them next turn.
+   */
+  Schema.Struct({
+    type: Schema.Literal("provider-runtime.apply-policy"),
+    providerSessionId: ProviderSessionId,
+    providerThreadId: ProviderThreadId,
+    timing: Schema.Literals(["now", "after-run"]),
+  }),
   Schema.Struct({
     type: Schema.Literal("runtime-request.respond"),
     providerSessionId: ProviderSessionId,
     requestId: RuntimeRequestId,
     decision: Schema.optional(ProviderApprovalDecision),
+    /** The offered option the user chose; the adapter sends exactly its native response. */
+    optionId: Schema.optional(ProviderApprovalOptionId),
+    feedback: Schema.optional(ProviderApprovalFeedback),
     answers: Schema.optional(ProviderUserInputAnswers),
   }),
   Schema.Struct({
@@ -146,6 +162,7 @@ export const PROCESS_BOUND_EFFECT_TYPES = [
   "provider-turn.steer",
   "provider-turn.restart",
   "runtime-request.respond",
+  "provider-runtime.apply-policy",
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 
 export const OrchestrationEffectStatusV2 = Schema.Literals([
@@ -224,6 +241,11 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  /** A thread's pending or running effects of these types, oldest first. */
+  readonly listUnsettled: (input: {
+    readonly threadId: ThreadId;
+    readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+  }) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -465,6 +487,24 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               : new EffectOutboxError({ operation: "list", cause }),
           ),
         ),
+      listUnsettled: ({ threadId, effectTypes }) =>
+        effectTypes.length === 0
+          ? Effect.succeed([])
+          : sql<EffectRow>`
+              SELECT *
+              FROM orchestration_v2_effect_outbox
+              WHERE thread_id = ${threadId}
+                AND status IN ('pending', 'running')
+                AND effect_type IN ${sql.in(effectTypes)}
+              ORDER BY created_at ASC, effect_id ASC
+            `.pipe(
+              Effect.flatMap((rows) => decodeRows("list-unsettled", rows)),
+              Effect.mapError((cause) =>
+                isEffectOutboxError(cause)
+                  ? cause
+                  : new EffectOutboxError({ operation: "list-unsettled", cause }),
+              ),
+            ),
       cancelUnsettled: ({ threadId, effectTypes, reason }) =>
         Effect.gen(function* () {
           if (effectTypes.length === 0) return [];

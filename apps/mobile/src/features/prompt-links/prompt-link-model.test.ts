@@ -23,7 +23,7 @@ describe("promptLinkSearchFromParams", () => {
       value: {
         kind: "new",
         prompt: { text: "Fix the bug & add tests = done?", hiddenCharacters: 0 },
-        repository: { owner: "example", name: "starkcode" },
+        repository: { owner: "example", name: "stark-code" },
         provider: "codex",
         model: null,
       },

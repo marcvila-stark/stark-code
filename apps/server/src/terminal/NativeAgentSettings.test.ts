@@ -81,7 +81,12 @@ describe("native Claude settings", () => {
     expect(merged.hooks).toMatchObject({
       Stop: [
         { hooks: [{ command: "existing-stop" }] },
-        { hooks: [{ command: "capture", async: true }] },
+        {
+          hooks: [
+            { command: "capture --attention-only", async: false },
+            { command: "capture", async: true },
+          ],
+        },
       ],
       PreToolUse: [{ matcher: "pages_upload" }, { matcher: "*" }],
     });

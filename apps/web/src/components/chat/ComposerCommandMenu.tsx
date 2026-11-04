@@ -293,10 +293,7 @@ const SKILL_SOURCE_LABEL_BY_KIND: Record<CatalogSourceKind, string> = {
   other: "Provider",
 };
 
-export function CatalogSourceBadge(props: {
-  kind: CatalogSourceKind;
-  sourceName?: string | undefined;
-}) {
+function CatalogSourceBadge(props: { kind: CatalogSourceKind; sourceName?: string | undefined }) {
   const Icon = SKILL_SOURCE_ICON_BY_KIND[props.kind];
   const label = `${SKILL_SOURCE_LABEL_BY_KIND[props.kind]}${props.sourceName ? ` ${props.sourceName}` : ""}`;
   return (

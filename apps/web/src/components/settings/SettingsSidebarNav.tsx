@@ -61,10 +61,7 @@ const SnapShotIcon = createLucideIcon("snap-shot", [
       key: "capture-frame",
     },
   ],
-  [
-    "rect",
-    { width: "10", height: "8", x: "7", y: "8", rx: "2", key: "window" },
-  ],
+  ["rect", { width: "10", height: "8", x: "7", y: "8", rx: "2", key: "window" }],
   ["circle", { cx: "12", cy: "12", r: "1.5", key: "lens" }],
 ]);
 
@@ -104,9 +101,7 @@ const SETTINGS_SECTION_ICONS: Readonly<
 
 function SettingsSectionIcon({ to }: { to: SettingsPath }) {
   const Icon = SETTINGS_SECTION_ICONS[to];
-  return (
-    <Icon className="mt-0.5 size-3.5 shrink-0 text-sidebar-muted-foreground/60" />
-  );
+  return <Icon className="mt-0.5 size-3.5 shrink-0 text-sidebar-muted-foreground/60" />;
 }
 
 export function SettingsSidebarHeader() {
@@ -133,26 +128,18 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
   const navigate = useNavigate();
   const currentHash = useLocation({ select: (location) => location.hash });
   const currentSearch = useLocation({ select: (location) => location.search });
-  const scopeSearch = useMemo(
-    () => validateSettingsScopeSearch(currentSearch),
-    [currentSearch],
-  );
+  const scopeSearch = useMemo(() => validateSettingsScopeSearch(currentSearch), [currentSearch]);
   const { isMobile, setOpenMobile, open, setOpen } = useSidebar();
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [activeResultIndex, setActiveResultIndex] = useState(0);
   const searchableItems = useAvailableSettingsSearchItems(scopeSearch);
-  const results = useMemo(
-    () => searchSettings(query, searchableItems),
-    [query, searchableItems],
-  );
+  const results = useMemo(() => searchSettings(query, searchableItems), [query, searchableItems]);
   const isSearching = query.trim().length > 0;
   const hasResults = results.length > 0;
 
   useEffect(() => {
-    setActiveResultIndex((index) =>
-      Math.min(index, Math.max(results.length - 1, 0)),
-    );
+    setActiveResultIndex((index) => Math.min(index, Math.max(results.length - 1, 0)));
   }, [results.length]);
 
   useEffect(() => {
@@ -261,9 +248,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
       }
       if (event.key === "ArrowUp") {
         event.preventDefault();
-        setActiveResultIndex(
-          (index) => (index - 1 + results.length) % results.length,
-        );
+        setActiveResultIndex((index) => (index - 1 + results.length) % results.length);
         return;
       }
       if (event.key === "Enter") {
@@ -272,13 +257,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
         if (result) handleSearchResultClick(result);
       }
     },
-    [
-      activeResultIndex,
-      clearSearch,
-      handleSearchResultClick,
-      isSearching,
-      results,
-    ],
+    [activeResultIndex, clearSearch, handleSearchResultClick, isSearching, results],
   );
   const renderSectionLink = (to: SettingsPath) => {
     const parentPath = [
@@ -333,11 +312,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
                 role="combobox"
                 aria-autocomplete="list"
                 aria-expanded={isSearching && hasResults}
-                aria-controls={
-                  isSearching && hasResults
-                    ? "settings-search-results"
-                    : undefined
-                }
+                aria-controls={isSearching && hasResults ? "settings-search-results" : undefined}
                 aria-activedescendant={
                   isSearching && results[activeResultIndex]
                     ? `settings-search-result-${results[activeResultIndex].id}`
@@ -406,9 +381,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
             ) : (
               <div className="stark-settings-nav-groups">
                 {SETTINGS_NAV_GROUPS.map((group) => (
-                  <SidebarMenu key={group.label}>
-                    {group.paths.map(renderSectionLink)}
-                  </SidebarMenu>
+                  <SidebarMenu key={group.label}>{group.paths.map(renderSectionLink)}</SidebarMenu>
                 ))}
               </div>
             )}

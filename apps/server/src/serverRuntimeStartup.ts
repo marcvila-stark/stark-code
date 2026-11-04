@@ -1,14 +1,19 @@
 import {
   CommandId,
   DEFAULT_MODEL,
+  DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_SERVER_SETTINGS,
   type ModelSelection,
+  newChatPermissionSourceFor,
   type Project,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  type ServerProvider,
   ThreadId,
 } from "@starkfuture/contracts";
+import { orderByAutomaticProviderPreference } from "@starkfuture/shared/model";
 import { resolveProjectSettings } from "@starkfuture/shared/projectSettings";
 import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
@@ -31,6 +36,7 @@ import { flushCompileCache } from "./compileCache.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as EffectWorker from "./orchestration-v2/EffectWorker.ts";
+import * as PermissionFreeze from "./orchestration-v2/PermissionFreeze.ts";
 import * as LegacyV1ThreadImporter from "./orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ProviderRuntimeRecovery from "./orchestration-v2/ProviderRuntimeRecoveryService.ts";
@@ -38,6 +44,7 @@ import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManag
 import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
+import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
@@ -174,10 +181,32 @@ const recordStartupHeartbeat = Effect.gen(function* () {
   });
 });
 
-export const getAutoBootstrapThreadModelSelection = (): ModelSelection => ({
-  instanceId: ProviderInstanceId.make("codex"),
-  model: DEFAULT_MODEL,
-});
+/**
+ * Model for the thread opened on the startup folder when its project has no
+ * default. Same automatic pick as a new thread in the client: a provider whose
+ * last known status is ready, Claude first, on its advertised default model.
+ * Codex stays the answer when nothing has reported ready yet, such as the
+ * first start with no cached provider status.
+ */
+export const getAutoBootstrapThreadModelSelection = (
+  providers: ReadonlyArray<ServerProvider>,
+): ModelSelection => {
+  const ready = orderByAutomaticProviderPreference(
+    providers.filter(
+      (provider) =>
+        provider.enabled && provider.availability !== "unavailable" && provider.status === "ready",
+    ),
+    (provider) => provider.driver,
+  );
+  for (const provider of ready) {
+    const model =
+      provider.models.find((candidate) => candidate.isDefault && !candidate.isCustom)?.slug ??
+      provider.models.find((candidate) => !candidate.isCustom)?.slug ??
+      DEFAULT_MODEL_BY_PROVIDER[provider.driver];
+    if (model) return { instanceId: provider.instanceId, model };
+  }
+  return { instanceId: ProviderInstanceId.make("codex"), model: DEFAULT_MODEL };
+};
 
 interface AutoBootstrapWelcomeTargets {
   readonly bootstrapProjectId?: ProjectId;
@@ -262,6 +291,7 @@ const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const threadLaunch = yield* ThreadLaunch.ThreadLaunchService;
+  const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const path = yield* Path.Path;
 
   let bootstrapProjectId: ProjectId | undefined;
@@ -270,7 +300,6 @@ const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
   if (serverConfig.autoBootstrapProjectFromCwd) {
     // Project creation has no user model choice; only the bootstrap thread
     // gets an automatic selection, and an explicit project default wins.
-    const threadModelSelection = getAutoBootstrapThreadModelSelection();
     const { project } = yield* projects.bootstrap({
       commandId: CommandId.make(yield* randomUUID),
       projectId: ProjectId.make(yield* randomUUID),
@@ -285,16 +314,30 @@ const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
     if (existingThread === undefined) {
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const settings = yield* serverSettings.getSettings;
+      const providers = yield* providerRegistry.getProviders;
+      const modelSelection =
+        resolveProjectSettings(settings, project.id, project).settings.defaultModelSelection ??
+        getAutoBootstrapThreadModelSelection(providers);
       const launched = yield* threadLaunch.launch({
         commandId: CommandId.make(yield* randomUUID),
         projectId: project.id,
         title: "New thread",
-        modelSelection:
-          resolveProjectSettings(settings, project.id, project).settings.defaultModelSelection ??
-          threadModelSelection,
+        modelSelection,
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: resolveProjectSettings(settings, project.id, project).settings
           .defaultRuntimeMode,
+        // A new chat, so it takes the instance's new-chat default like any other.
+        permissionSource: newChatPermissionSourceFor({
+          driver:
+            providers.find((provider) => provider.instanceId === modelSelection.instanceId)
+              ?.driver ?? ProviderDriverKind.make(modelSelection.instanceId),
+          newChatPermissionSource: Object.hasOwn(
+            settings.providerInstances,
+            modelSelection.instanceId,
+          )
+            ? settings.providerInstances[modelSelection.instanceId]?.newChatPermissionSource
+            : undefined,
+        }),
         workspaceStrategy: { type: "root" },
         createdBy: "system",
         creationSource: "server",
@@ -386,17 +429,26 @@ export function runOrderedV2StartupPhases<
   Recovery,
   Bootstrap,
   ImportError,
+  FreezeError,
   RecoveryError,
   DelegationError,
   WorkerError,
   BootstrapError,
   ImportContext,
+  FreezeContext,
   RecoveryContext,
   DelegationContext,
   WorkerContext,
   BootstrapContext,
 >(input: {
   readonly importLegacyShells: Effect.Effect<Import, ImportError, ImportContext>;
+  /**
+   * Narrows saved chats and tasks to the modes they actually ran with. Runs
+   * after imports so imported chats are covered, and before recovery and the
+   * effect worker so no queued run, delegated request or continuation starts
+   * under a stored mode broader than what it ran with.
+   */
+  readonly freezePermissions: Effect.Effect<unknown, FreezeError, FreezeContext>;
   readonly recover: Effect.Effect<Recovery, RecoveryError, RecoveryContext>;
   /** Settles delegated tasks whose runs recovery just terminalized. */
   readonly recoverDelegatedTasks: Effect.Effect<void, DelegationError, DelegationContext>;
@@ -405,6 +457,7 @@ export function runOrderedV2StartupPhases<
 }) {
   return Effect.gen(function* () {
     yield* input.importLegacyShells;
+    yield* input.freezePermissions;
     const recovery = yield* input.recover;
     yield* input.recoverDelegatedTasks;
     yield* input.startEffectWorker;
@@ -418,6 +471,7 @@ const make = (options?: StartupOptions) =>
     const serverConfig = yield* ServerConfig.ServerConfig;
     const keybindings = yield* Keybindings.Keybindings;
     const legacyV1ThreadImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+    const permissionFreeze = yield* PermissionFreeze.PermissionFreeze;
     const providerRuntimeRecovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -514,6 +568,20 @@ const make = (options?: StartupOptions) =>
                 : Effect.logInfo("Imported legacy v1 thread shells", summary),
             ),
           ),
+        ),
+        freezePermissions: runStartupPhase(
+          "orchestration-v2.permission-freeze",
+          permissionFreeze
+            .run()
+            .pipe(
+              Effect.tap((summary) =>
+                summary.migratedThreadCount === 0 &&
+                summary.migratedScheduledTaskCount === 0 &&
+                summary.failedThreadCount === 0
+                  ? Effect.void
+                  : Effect.logInfo("Aligned saved permissions with what they ran", summary),
+              ),
+            ),
         ),
         recover: runStartupPhase("orchestration-v2.recovery", providerRuntimeRecovery.recover),
         recoverDelegatedTasks: runStartupPhase(

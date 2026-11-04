@@ -11,11 +11,7 @@ import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
 
 import { isElectron } from "../env";
 import { getLocalStorageItem, removeLocalStorageItem } from "../hooks/useLocalStorage";
-import {
-  isRichTextBoldShortcut,
-  resolveShortcutCommand,
-  shortcutLabelForCommand,
-} from "../keybindings";
+import { isRichTextBoldShortcut, resolveShortcutCommand } from "../keybindings";
 import { isEditableFocused } from "../lib/editableFocus";
 import { isPreviewFocused } from "../lib/previewFocus";
 import { isTerminalFocused } from "../lib/terminalFocus";
@@ -23,9 +19,9 @@ import { isModelPickerOpen } from "../modelPickerVisibility";
 import { selectActiveRightPanel, useRightPanelStore } from "../rightPanelStore";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { resolveThreadRouteRef } from "../threadRoutes";
-import { cn, isMacPlatform } from "../lib/utils";
+import { isMacPlatform } from "../lib/utils";
 import { primaryServerKeybindingsAtom } from "../state/server";
-import { useEnvironmentIdentificationMode, useLegacySidebarEnabled } from "../hooks/useSettings";
+import { useLegacySidebarEnabled } from "../hooks/useSettings";
 import {
   PanelAnimationSuppressionProvider,
   usePanelAnimationSettings,
@@ -36,9 +32,9 @@ import { useThreadVisitedMigration } from "../hooks/useThreadVisitedMigration";
 import ThreadSidebar from "./Sidebar";
 import { SideChatMigration } from "./chat/SideChatMigration";
 import { SettingsSidebarHeader, SettingsSidebarNav } from "./settings/SettingsSidebarNav";
-import { SidebarBrandWidthProbe } from "./sidebar/SidebarChrome";
+import { AppIconRail, AppTopBar } from "./AppNavigationChrome";
+import navigationStyles from "./AppNavigationChrome.module.css";
 import { MainAppLocationTracker } from "./sidebar/mainAppLocation";
-import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
 import { useProjects } from "../state/entities";
 import {
   clampThreadSidebarWidth,
@@ -48,17 +44,9 @@ import {
   THREAD_MAIN_CONTENT_MIN_WIDTH,
   THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
 } from "./threadSidebarWidth";
-import {
-  Sidebar,
-  SidebarProvider,
-  SidebarRail,
-  SidebarTrigger,
-  useSidebar,
-  useSidebarVisibility,
-} from "./ui/sidebar";
-import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
+import { Sidebar, SidebarProvider, SidebarRail, useSidebar } from "./ui/sidebar";
 
-const MACOS_TRAFFIC_LIGHTS_LEFT_INSET = "var(--desktop-window-controls-inset, 90px)";
+const APP_RAIL_WIDTH = 48;
 
 function subscribeToViewportWidth(onChange: () => void): () => void {
   window.addEventListener("resize", onChange);
@@ -83,19 +71,8 @@ function readInitialThreadSidebarWidth(): number {
 
 function SidebarControl() {
   const usagePageOpen = useLocation({ select: (location) => location.pathname === "/usage" });
-  const settingsPageOpen = useLocation({
-    select: (location) => /^\/settings(\/|$)/.test(location.pathname),
-  });
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
-  const { toggleSidebar, isMobile, mobileSheetMounted } = useSidebar();
-  const isSidebarVisible = useSidebarVisibility();
-  const environmentIdentificationMode = useEnvironmentIdentificationMode();
-  const stageBackdropVariant = useSidebarStageBackdropVariant(
-    environmentIdentificationMode === "artwork",
-  );
-  const shortcutLabel = shortcutLabelForCommand(keybindings, "sidebar.toggle", {
-    context: { usagePageOpen },
-  });
+  const { toggleSidebar } = useSidebar();
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -138,42 +115,7 @@ function SidebarControl() {
     };
   }, [keybindings, toggleSidebar, usagePageOpen]);
 
-  return (
-    // The right-side layout controls carry mr-px (border compensation inside
-    // the panel), so the trigger mirrors it: both clusters sit one extra pixel
-    // off their edge and the titlebar reads symmetric.
-    // An open chat sidebar owns its trigger at the header's trailing edge.
-    // The fixed control reopens it beside the native window controls. A sheet
-    // keeps ownership until its closing transition unmounts it.
-    <div
-      className={cn(
-        "pointer-events-none fixed left-[var(--workspace-controls-left)] top-[var(--workspace-controls-top)] z-50 ml-px flex h-[var(--workspace-topbar-height)] items-center",
-        isMobile && mobileSheetMounted && "hidden",
-        isSidebarVisible && !settingsPageOpen && "hidden",
-      )}
-      data-sidebar-control=""
-    >
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <SidebarTrigger
-              // Over the stage artwork the trigger is a control on imagery, like the media
-              // viewer's arrows; that variant positions itself, so the layout is reset here.
-              variant={isSidebarVisible && stageBackdropVariant ? "media-navigation" : "ghost"}
-              className={cn(
-                "pointer-events-auto",
-                isSidebarVisible && stageBackdropVariant && "relative top-auto translate-y-0",
-              )}
-              aria-label="Toggle main sidebar"
-            />
-          }
-        />
-        <TooltipPopup side="bottom">
-          Toggle main sidebar{shortcutLabel ? ` (${shortcutLabel})` : ""}
-        </TooltipPopup>
-      </Tooltip>
-    </div>
-  );
+  return null;
 }
 
 // Moves through the app's route history like a browser's back/forward buttons.
@@ -253,9 +195,11 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
   // and a clamped drag ends with an unchanged width, which skips the re-render
   // that would otherwise refresh a render-time snapshot.
   const viewportWidth = useSyncExternalStore(subscribeToViewportWidth, readViewportWidth);
-  const [brandWidth, setBrandWidth] = useState(0);
-  const sidebarMinimumWidth = resolveThreadSidebarMinimumWidth(brandWidth);
-  const sidebarMaximumWidth = resolveThreadSidebarMaximumWidth(viewportWidth, sidebarMinimumWidth);
+  const sidebarMinimumWidth = resolveThreadSidebarMinimumWidth(0);
+  const sidebarMaximumWidth = resolveThreadSidebarMaximumWidth(
+    viewportWidth - APP_RAIL_WIDTH,
+    sidebarMinimumWidth,
+  );
   const resetSidebarWidth = () => {
     try {
       removeLocalStorageItem(THREAD_SIDEBAR_WIDTH_STORAGE_KEY);
@@ -270,30 +214,19 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
       ? getWindowFullscreenState()
       : false;
   });
-  const windowControlsInsetStyle = (
-    isMacosDesktop && !isWindowFullscreen
-      ? { "--workspace-controls-left": MACOS_TRAFFIC_LIGHTS_LEFT_INSET }
-      : {}
-  ) as CSSProperties;
-  const sidebarBrandStyle = {
-    ...windowControlsInsetStyle,
-    "--stark-sidebar-brand-display": "inline-flex",
-    "--stark-sidebar-brand-start": "20px",
-    "--stark-sidebar-brand-height": "var(--workspace-topbar-height)",
-  } as CSSProperties;
-  // A mobile sidebar sheet is portaled outside the layout. Its visible brand
-  // keeps the expanded spacing; the layout itself follows data-sidebar-state.
+  // Mobile sheets keep their own close control; desktop navigation lives in the global bar.
   const sidebarWindowStyle = {
-    ...sidebarBrandStyle,
-    "--stark-native-titlebar-inset": isMacosDesktop && !isWindowFullscreen ? "24px" : "0px",
-    ...(isMacosDesktop && !isWindowFullscreen ? { "--workspace-topbar-height": "76px" } : {}),
+    "--stark-sidebar-brand-display": "inline-flex",
+    "--stark-sidebar-brand-start": "16px",
+    "--stark-sidebar-brand-height": "56px",
   } as CSSProperties;
   const sidebarProviderStyle = {
+    "--workspace-titlebar-content-left": "var(--workspace-gutter, 16px)",
     "--sidebar-width": isOnSettings
       ? "220px"
       : `${clampThreadSidebarWidth(sidebarWidth, sidebarMinimumWidth, sidebarMaximumWidth)}px`,
     "--panel-animation-duration": `${panelAnimationDurationMs}ms`,
-    ...sidebarBrandStyle,
+    ...sidebarWindowStyle,
   } as CSSProperties;
 
   useEffect(() => {
@@ -336,14 +269,16 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
   return (
     <PanelAnimationSuppressionProvider value={panelAnimationsSuppressed}>
       <SidebarProvider
-        className="h-dvh! min-h-0!"
+        // oxlint-disable-next-line shadcn/require-static-classes -- Native app chrome uses a generated CSS module class rather than Tailwind utilities.
+        className={navigationStyles.shell}
         data-stark-sidebar-layout
         data-native-window-controls={isMacosDesktop && !isWindowFullscreen ? "macos" : undefined}
         data-panel-animations={routePanelAnimationsActive ? "true" : "false"}
         defaultOpen
         style={sidebarProviderStyle}
       >
-        <SidebarBrandWidthProbe onWidthChange={setBrandWidth} />
+        <AppTopBar />
+        <AppIconRail />
         <ProjectProjectionRetention />
         <SideChatMigration />
         <Sidebar
@@ -360,7 +295,8 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
                   minWidth: sidebarMinimumWidth,
                   shouldAcceptWidth: ({ currentWidth, nextWidth, wrapper }) =>
                     nextWidth <= currentWidth ||
-                    wrapper.clientWidth - nextWidth >= THREAD_MAIN_CONTENT_MIN_WIDTH,
+                    wrapper.clientWidth - APP_RAIL_WIDTH - nextWidth >=
+                      THREAD_MAIN_CONTENT_MIN_WIDTH,
                   storageKey: THREAD_SIDEBAR_WIDTH_STORAGE_KEY,
                   onResize: setSidebarWidth,
                 }

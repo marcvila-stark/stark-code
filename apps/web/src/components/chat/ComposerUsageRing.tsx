@@ -30,7 +30,7 @@ export function ComposerUsageRing({
   size?: ComposerControlSize;
   timestampFormat?: TimestampFormat;
   compact?: boolean;
-  onRefresh?: () => Promise<void>;
+  onRefresh?: (options: { fresh: boolean }) => Promise<void>;
 }) {
   const nowMinute = useNowMinute();
   const usage = selectComposerUsage(provider, connected, Date.parse(`${nowMinute}:00Z`));
@@ -53,7 +53,7 @@ export function ComposerUsageRing({
     provider?.enabled &&
     provider.apiBackend !== "openrouter" &&
     provider.installed &&
-    provider.auth.status === "authenticated" &&
+    provider.auth.status !== "unauthenticated" &&
     provider.auth.type !== "apiKey" &&
     provider.availability !== "unavailable" &&
     provider.usageLimits?.unavailable?.reason !== "unsupported";
@@ -72,7 +72,7 @@ export function ComposerUsageRing({
       requestRef.current = request;
       setRefreshState({ scope, busy: true, failed: false });
       try {
-        await onRefresh();
+        await onRefresh({ fresh: explicit });
         if (requestRef.current === request) setRefreshState({ scope, busy: false, failed: false });
       } catch {
         if (requestRef.current === request) setRefreshState({ scope, busy: false, failed: true });

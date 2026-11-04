@@ -8,5 +8,8 @@
   "telemetryEnabled": false,
   "cloudServicesEnabled": false,
   "requireApprovalsByDefault": true,
-  "backgroundNetworkChecksEnabled": false
+  "backgroundNetworkChecksEnabled": false,
+  "appleTeamId": "6QNLKCM5Y5",
+  "updateFeedOrigins": [],
+  "updateChannels": ["latest"]
 }

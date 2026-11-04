@@ -15,8 +15,10 @@ const GROK_MONITOR_WAKE_LABEL =
 // replays as a continuation run, like Claude and Codex background wakes.
 export function grokMonitorInput(): OrchestratorFixtureInput {
   return {
+    runtimeMode: "approval-required",
     steps: [
       { type: "message", text: GROK_MONITOR_PROMPT },
+      { type: "approve_next_runtime_request" },
       { type: "finish_held_run", targetRunIndex: 1, status: "completed" },
       { type: "release_replay_gate", label: GROK_MONITOR_WAKE_LABEL },
       { type: "finish_held_run", targetRunIndex: 2, status: "completed" },

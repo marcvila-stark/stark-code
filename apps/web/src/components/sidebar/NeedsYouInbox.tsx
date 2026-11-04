@@ -4,6 +4,7 @@ import {
   MessageCircleQuestionIcon,
   ShieldQuestionIcon,
   LogInIcon,
+  RotateCcwIcon,
 } from "lucide-react";
 import type {
   EnvironmentProject,
@@ -67,7 +68,9 @@ export function NeedsYouInbox({
                     ? MessageCircleQuestionIcon
                     : entry.kind === "sign-in"
                       ? LogInIcon
-                      : ShieldQuestionIcon;
+                      : entry.kind === "lost"
+                        ? RotateCcwIcon
+                        : ShieldQuestionIcon;
                 const action =
                   entry.kind === "question"
                     ? "Answer question"
@@ -75,7 +78,9 @@ export function NeedsYouInbox({
                       ? "Input needed"
                       : entry.kind === "sign-in"
                         ? "Sign in"
-                        : "Review approval";
+                        : entry.kind === "lost"
+                          ? "Ask again"
+                          : "Review approval";
                 return (
                   <li key={entry.key}>
                     <button

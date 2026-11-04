@@ -3,6 +3,7 @@ import {
   ProjectId,
   DEFAULT_SERVER_SETTINGS,
   type ServerConfig,
+  ProviderDriverKind,
   ProviderInstanceId,
   ScheduledTaskId,
   type ScheduledTask,
@@ -20,6 +21,8 @@ import {
   scheduledTaskDefaultModel,
   matchesScheduledTaskScope,
   scheduleFromDraft,
+  scheduledTaskModeChoices,
+  scheduledTaskProjectRuntimeMode,
   taskToDraft,
 } from "./scheduledTasksSettings.logic";
 
@@ -172,6 +175,72 @@ describe("editing scheduled task branch settings", () => {
   });
 });
 
+describe("scheduled task permissions", () => {
+  const claudeOptions = [
+    { mode: "approval-required", label: "Manual" },
+    { mode: "auto-accept-edits", label: "Accept edits" },
+    { mode: "auto", label: "Auto" },
+    { mode: "full-access", label: "Bypass permissions" },
+  ] as const;
+
+  it("offers the project default first and disables broader modes without settings permission", () => {
+    const choices = scheduledTaskModeChoices({
+      options: claudeOptions,
+      projectDefault: "approval-required",
+      selected: null,
+      canWriteSettings: false,
+    });
+    expect(
+      choices.map(({ value, label, disabledReason }) => [value, label, disabledReason]),
+    ).toEqual([
+      ["project-default", "Project default · Manual", undefined],
+      ["approval-required", "Manual", undefined],
+      ["auto-accept-edits", "Accept edits", "Needs settings permission"],
+      ["auto", "Auto", "Needs settings permission"],
+      ["full-access", "Bypass permissions", "Needs settings permission"],
+    ]);
+    expect(
+      scheduledTaskModeChoices({
+        options: claudeOptions,
+        projectDefault: "auto",
+        selected: null,
+        canWriteSettings: true,
+      }).some((choice) => choice.disabledReason !== undefined),
+    ).toBe(false);
+  });
+
+  it("keeps a saved mode the provider no longer offers, disabled without settings permission", () => {
+    const choices = scheduledTaskModeChoices({
+      options: [{ mode: "approval-required", label: "Ask before changes" }],
+      projectDefault: "approval-required",
+      selected: taskToDraft(legacyTask).runtimeMode,
+      canWriteSettings: false,
+    });
+    expect(choices.at(-1)).toEqual({
+      value: "full-access",
+      label: "Full access",
+      disabledReason: "Needs settings permission",
+    });
+  });
+
+  it("runs a task saved without a mode at the project's default", () => {
+    const projectId = ProjectId.make("project");
+    expect(
+      scheduledTaskProjectRuntimeMode(
+        {
+          ...DEFAULT_SERVER_SETTINGS,
+          defaultRuntimeMode: "approval-required",
+          projectSettingsOverrides: { [projectId]: { defaultRuntimeMode: "auto" } },
+        },
+        { id: projectId },
+      ),
+    ).toBe("auto");
+    expect(scheduledTaskProjectRuntimeMode(DEFAULT_SERVER_SETTINGS, null)).toBe(
+      DEFAULT_SERVER_SETTINGS.defaultRuntimeMode,
+    );
+  });
+});
+
 describe("webhook scheduled tasks", () => {
   const signature = { header: "x-signature", encoding: "base64", prefix: "" } as const;
   const webhookTask: ScheduledTask = {
@@ -306,6 +375,40 @@ describe("scheduled task model defaults", () => {
         },
       }),
     ).toEqual(environmentSelection);
+  });
+  it("starts on Claude when nothing is configured and Claude is ready", () => {
+    const claude = {
+      ...config.providers[0]!,
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      displayName: "Claude",
+      models: [
+        {
+          slug: "claude-opus-4-8",
+          name: "Opus",
+          isDefault: true,
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    const unconfigured = { ...config.settings, defaultModelSelection: null };
+    expect(
+      resolve(
+        { ...config, settings: unconfigured, providers: [...config.providers, claude] },
+        null,
+      ),
+    ).toEqual({ instanceId: "claudeAgent", model: "claude-opus-4-8" });
+    expect(
+      resolve(
+        {
+          ...config,
+          settings: unconfigured,
+          providers: [...config.providers, { ...claude, status: "error" as const }],
+        },
+        null,
+      ),
+    ).toEqual({ instanceId, model: "catalog-default" });
   });
   it("does not choose an implicit model on a disabled provider", () => {
     expect(

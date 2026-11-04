@@ -45,6 +45,27 @@ function makeRenderableFile(
 }
 
 describe("buildReviewSectionItems", () => {
+  it("says how many of a turn's files the agent changed", () => {
+    const sections = buildReviewSectionItems({
+      checkpoints: [
+        makeCheckpoint({
+          runId: RunId.make("run-1"),
+          checkpointTurnCount: 1,
+          completedAt: "2026-04-01T00:00:00.000Z",
+          files: [
+            { path: "plan.txt", kind: "modified", additions: 1, deletions: 1, origin: "agent" },
+            { path: "notes.md", kind: "modified", additions: 2, deletions: 0, origin: "outside" },
+          ],
+        }),
+      ],
+      gitSections: [],
+      turnDiffById: {},
+      loadingTurnIds: {},
+      loadingGitSections: false,
+    });
+    expect(sections[0]?.subtitle).toBe("1 by the agent · 1 from outside the chat");
+  });
+
   it("keeps one chip per checkpoint and appends git sources", () => {
     const checkpoints = [
       makeCheckpoint({

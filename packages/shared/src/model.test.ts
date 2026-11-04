@@ -24,6 +24,7 @@ import {
   normalizeCustomModelSlug,
   normalizeModelSlug,
   modelSelectionsEqual,
+  orderByAutomaticProviderPreference,
 } from "./model.ts";
 
 it("keeps the Codex catalog display formatting", () => {
@@ -63,6 +64,35 @@ const codexCaps: ModelCapabilities = createModelCapabilities({
       type: "boolean",
     },
   ],
+});
+
+describe("orderByAutomaticProviderPreference", () => {
+  const order = (drivers: ReadonlyArray<string>) =>
+    orderByAutomaticProviderPreference(drivers, (driver) => driver);
+
+  it("puts Claude first and keeps the catalog order for the rest", () => {
+    expect(order(["codex", "cursor", "claudeAgent", "opencode"])).toEqual([
+      "claudeAgent",
+      "codex",
+      "cursor",
+      "opencode",
+    ]);
+  });
+
+  it("keeps several instances of the same driver in their original order", () => {
+    const entries = [
+      { id: "codex", driver: "codex" },
+      { id: "claude_work", driver: "claudeAgent" },
+      { id: "claudeAgent", driver: "claudeAgent" },
+    ];
+    expect(
+      orderByAutomaticProviderPreference(entries, (entry) => entry.driver).map((entry) => entry.id),
+    ).toEqual(["claude_work", "claudeAgent", "codex"]);
+  });
+
+  it("leaves a catalog without Claude untouched", () => {
+    expect(order(["codex", "cursor"])).toEqual(["codex", "cursor"]);
+  });
 });
 
 describe("model slug normalization", () => {

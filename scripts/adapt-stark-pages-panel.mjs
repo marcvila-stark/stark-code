@@ -2,7 +2,7 @@
  * The panel verifies the host origin/source before accepting it. Older hosts keep
  * the original side-panel view; document tabs keep the renderer's normal layout.
  */
-export const STARK_PAGES_PRESENTATION_VERSION = 4;
+export const STARK_PAGES_PRESENTATION_VERSION = 7;
 
 export function adaptStarkPagesPanel(source) {
   const replace = (before, after) => {
@@ -23,6 +23,7 @@ export function adaptStarkPagesPanel(source) {
   replace(
     ".bar{display:flex;",
     `#folder-context{display:none}
+.bar .title{display:none}
 body[data-presentation="document"]{--bg:#101112;--fg:#dddcd7;--muted:#9ba196;--line:#363a37;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 body[data-presentation="document"] .mark,body[data-presentation="document"] .title,body[data-presentation="document"] #pause,body[data-presentation="document"] #resume{display:none}
 body[data-presentation="document"] .bar{min-height:55px;padding:10px 22px;gap:8px 12px}

@@ -3,7 +3,13 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
-import type { ChatAttachment } from "@starkfuture/contracts";
+import {
+  ATTACHMENT_HOLDS_FILE,
+  AttachmentHolds,
+  type ChatAttachment,
+} from "@starkfuture/contracts";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import { htmlRenderFromToolItem, mcpAppFromToolItem } from "@starkfuture/shared/toolOutput";
 
 import {
@@ -25,6 +31,9 @@ const ATTACHMENT_ID_PATTERN = new RegExp(
 export const PENDING_ATTACHMENT_THREAD_SEGMENT = "pending";
 const PENDING_ATTACHMENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PARTIAL_UPLOAD_MAX_AGE_MS = 60 * 60 * 1000;
+/** How long an update or restore keeps referenced pending uploads past their usual age. */
+const ATTACHMENT_HOLD_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const decodeAttachmentHolds = Schema.decodeUnknownOption(Schema.fromJsonString(AttachmentHolds));
 
 export function toSafeThreadAttachmentSegment(threadId: string): string | null {
   const segment = threadId
@@ -265,10 +274,54 @@ export function planAttachmentClaim(input: {
   };
 }
 
+/**
+ * Pending uploads that drafts still reference across an update or a restore,
+ * from `attachment-holds.json` next to the attachments directory. A hold
+ * older than 30 days, or an unreadable one, protects nothing.
+ */
+export function readAttachmentHolds(attachmentsDir: string, nowMs: number): ReadonlySet<string> {
+  let text: string;
+  try {
+    text = NodeFS.readFileSync(
+      NodePath.join(NodePath.dirname(attachmentsDir), ATTACHMENT_HOLDS_FILE),
+      "utf8",
+    );
+  } catch {
+    return new Set();
+  }
+  const holds = decodeAttachmentHolds(text);
+  if (Option.isNone(holds)) return new Set();
+  const heldAtMs = Date.parse(holds.value.heldAt);
+  return Number.isFinite(heldAtMs) && nowMs - heldAtMs <= ATTACHMENT_HOLD_MAX_AGE_MS
+    ? new Set(holds.value.attachmentIds)
+    : new Set();
+}
+
+/** The files of these pending uploads, for a backup to include. */
+export function pendingAttachmentFiles(
+  attachmentsDir: string,
+  attachmentIds: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  const wanted = new Set(attachmentIds);
+  let entries: string[];
+  try {
+    entries = NodeFS.readdirSync(attachmentsDir);
+  } catch {
+    return [];
+  }
+  return entries.flatMap((entry) => {
+    const attachmentId = parseAttachmentIdFromRelativePath(entry);
+    if (attachmentId === null || !wanted.has(attachmentId)) return [];
+    const resolved = resolveAttachmentRelativePath({ attachmentsDir, relativePath: entry });
+    return resolved === null ? [] : [resolved];
+  });
+}
+
 export function sweepStalePendingAttachments(input: {
   readonly attachmentsDir: string;
   readonly nowMs: number;
 }): { readonly deleted: number } {
+  const held = readAttachmentHolds(input.attachmentsDir, input.nowMs);
   let entries: string[];
   try {
     entries = NodeFS.readdirSync(input.attachmentsDir);
@@ -283,7 +336,8 @@ export function sweepStalePendingAttachments(input: {
       const attachmentId = parseAttachmentIdFromRelativePath(entry);
       if (
         !attachmentId ||
-        parseThreadSegmentFromAttachmentId(attachmentId) !== PENDING_ATTACHMENT_THREAD_SEGMENT
+        parseThreadSegmentFromAttachmentId(attachmentId) !== PENDING_ATTACHMENT_THREAD_SEGMENT ||
+        held.has(attachmentId)
       ) {
         continue;
       }

@@ -21,19 +21,21 @@ import * as Settings from "../../../serverSettings.ts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
-import { liveThreadShell } from "../../McpToolAccess.testkit.ts";
+import { liveThreadRecords, liveThreadShell } from "../../McpToolAccess.testkit.ts";
 import * as EnvironmentHandlers from "./handlers.ts";
 import { EnvironmentToolkit } from "./tools.ts";
 
 const environmentId = EnvironmentId.make("environment:preferences");
 const threadId = ThreadId.make("thread:preferences");
+// Environment settings need a provider that really runs Bypass: Claude, not clamped Codex.
+const claudeThread = (id: ThreadId) => liveThreadShell(id, { instance: "claudeAgent" });
 const caller: McpInvocationContext.McpInvocationScope = {
   environmentId,
   requestNamespace: "provider:preferences",
   thread: {
     threadId,
     providerSessionId: "provider:preferences",
-    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerInstanceId: ProviderInstanceId.make("claudeAgent"),
   },
   client: undefined,
   capabilities: new Set(["orchestration" as const]),
@@ -83,7 +85,8 @@ it.effect("updates preferences for a thread caller through the /mcp registration
         Layer.provideMerge(McpServer.McpServer.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
-            getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+            getThreadShell: (id) => Effect.succeed(claudeThread(id)),
+            getThreadRecords: (id) => liveThreadRecords(claudeThread(id)) as never,
           }),
         ),
         Layer.provide(layerEnvironment),
@@ -95,7 +98,7 @@ it.effect("updates preferences for a thread caller through the /mcp registration
 
 it.effect("refuses a preferences update when the caller's turn ends while it waits", () =>
   Effect.gen(function* () {
-    const caller = yield* Ref.make<OrchestrationV2ThreadShell>(liveThreadShell(threadId));
+    const caller = yield* Ref.make<OrchestrationV2ThreadShell>(claudeThread(threadId));
     const updates = yield* Ref.make(0);
     // Completes once the declaration's own check has read the caller.
     const checked = yield* Deferred.make<void>();
@@ -107,7 +110,7 @@ it.effect("refuses a preferences update when the caller's turn ends while it wai
         thread: {
           threadId,
           providerSessionId: "provider:preferences",
-          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
         },
         client: undefined,
         capabilities: new Set(["orchestration" as const]),
@@ -116,6 +119,7 @@ it.effect("refuses a preferences update when the caller's turn ends while it wai
       Layer.mock(ThreadManagement.ThreadManagementService)({
         getThreadShell: () =>
           Ref.get(caller).pipe(Effect.tap(() => Deferred.succeed(checked, undefined))),
+        getThreadRecords: () => Ref.get(caller).pipe(Effect.flatMap(liveThreadRecords)) as never,
       }),
       Layer.mock(Environment.ServerEnvironment)({
         getDescriptor: Effect.succeed({

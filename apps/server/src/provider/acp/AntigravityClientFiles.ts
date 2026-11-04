@@ -35,24 +35,28 @@ const resolveClientFilePath = Effect.fn("AntigravityClientFiles.resolveClientFil
     const outside = EffectAcpErrors.AcpRequestError.invalidParams(
       `Path '${input.requestPath}' is outside the session workspace.`,
     );
-    const real = yield* input.fileSystem.realPath(resolved).pipe(
-      Effect.catch(() =>
-        Effect.gen(function* () {
-          // Only a missing file (a new write) falls back to its parent; a
-          // dangling or unreadable link must not be followed on write.
-          const entryExists = yield* input.fileSystem.readLink(resolved).pipe(
-            Effect.as(true),
-            Effect.catch(() => input.fileSystem.exists(resolved)),
-            Effect.orElseSucceed(() => true),
-          );
-          if (entryExists) return yield* outside;
-          const parent = yield* input.fileSystem
-            .realPath(path.dirname(resolved))
-            .pipe(Effect.orElseSucceed(() => path.dirname(resolved)));
-          return path.join(parent, path.basename(resolved));
-        }),
-      ),
-    );
+    const canonicalPath = (
+      candidate: string,
+    ): Effect.Effect<string, EffectAcpErrors.AcpRequestError> =>
+      input.fileSystem.realPath(candidate).pipe(
+        Effect.catch(() =>
+          Effect.gen(function* () {
+            // Only a missing file (a new write) falls back to its parent; a
+            // dangling or unreadable link must not be followed on write.
+            const entryExists = yield* input.fileSystem.readLink(candidate).pipe(
+              Effect.as(true),
+              Effect.catch(() => input.fileSystem.exists(candidate)),
+              Effect.orElseSucceed(() => true),
+            );
+            if (entryExists) return yield* outside;
+            const parentPath = path.dirname(candidate);
+            if (parentPath === candidate) return yield* outside;
+            const parent = yield* canonicalPath(parentPath);
+            return path.join(parent, path.basename(candidate));
+          }),
+        ),
+      );
+    const real = yield* canonicalPath(resolved);
     const roots = yield* Effect.forEach(input.allowedRoots, (root) =>
       input.fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root)),
     );

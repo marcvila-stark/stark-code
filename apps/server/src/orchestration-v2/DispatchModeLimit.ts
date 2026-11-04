@@ -2,6 +2,8 @@ import type { ProviderInteractionMode, RuntimeMode, ThreadId } from "@starkfutur
 import * as Context from "effect/Context";
 import type * as Ref from "effect/Ref";
 
+import { exceededLimit } from "./PermissionContainment.ts";
+
 export interface DispatchModes {
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
@@ -25,6 +27,13 @@ export interface DispatchModeRefusal extends DispatchModes {
  */
 export interface DispatchModeLimitValue extends DispatchModes {
   readonly refused?: Ref.Ref<DispatchModeRefusal | undefined>;
+  /**
+   * The sender's own thread, always within its limit. The limit is the preset
+   * the sender's provider really runs, which can sit below the thread's stored
+   * one (the brand runs Codex Supervised), and that must not lock a caller out
+   * of its own thread.
+   */
+  readonly self?: ThreadId | undefined;
 }
 
 export const DispatchModeLimit = Context.Reference<DispatchModeLimitValue | undefined>(
@@ -32,21 +41,17 @@ export const DispatchModeLimit = Context.Reference<DispatchModeLimitValue | unde
   { defaultValue: () => undefined },
 );
 
-const runtimeModeRank: Record<RuntimeMode, number> = {
-  "approval-required": 0,
-  "auto-accept-edits": 1,
-  auto: 2,
-  "full-access": 3,
-};
-const interactionModeRank: Record<ProviderInteractionMode, number> = { plan: 0, default: 1 };
-
-/** Which of `modes` is broader than `limit`, if either. */
+/**
+ * Which of `modes` is broader than `limit`, if either. A thread that follows
+ * its provider's own settings counts as the broadest preset (see
+ * PermissionContainment), so a limited sender never reaches one. The
+ * sender's own thread never exceeds its limit.
+ */
 export const exceededDispatchModeLimit = (
-  limit: DispatchModes,
-  modes: DispatchModes,
+  limit: DispatchModes & Pick<DispatchModeLimitValue, "self">,
+  // The orchestrator hands over the thread itself, so `id` names it when no
+  // `threadId` is passed.
+  modes: DispatchModes & { readonly id?: ThreadId },
+  threadId: ThreadId | undefined = modes.id,
 ): "runtime" | "interaction" | undefined =>
-  runtimeModeRank[modes.runtimeMode] > runtimeModeRank[limit.runtimeMode]
-    ? "runtime"
-    : interactionModeRank[modes.interactionMode] > interactionModeRank[limit.interactionMode]
-      ? "interaction"
-      : undefined;
+  limit.self !== undefined && threadId === limit.self ? undefined : exceededLimit(limit, modes);

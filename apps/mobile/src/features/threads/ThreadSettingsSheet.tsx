@@ -264,6 +264,8 @@ type ThreadSettingsSessionProps = {
   readonly onUpdateOptionSelections: (selections: ReadonlyArray<ProviderOptionSelection>) => void;
   readonly runtimeMode: RuntimeMode;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
+  /** Why a mode cannot be picked here, such as a widening the client has no grant for. */
+  readonly runtimeModeDisabledReason?: (mode: RuntimeMode) => string | undefined;
 };
 
 export type ExistingThreadSettingsRouteSession = ThreadSettingsSessionProps & {
@@ -321,6 +323,7 @@ type ThreadSettingsSessionValue = {
   readonly runtimeMode: RuntimeMode;
   readonly runtimeModeChoices: ReturnType<typeof runtimeModeChoicesForSupportedModes>;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
+  readonly runtimeModeDisabledReason: ((mode: RuntimeMode) => string | undefined) | undefined;
   readonly displayedDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
   readonly displayedModelSelection: ModelSelection | null;
   readonly reportedModelSelection: ModelSelection | null;
@@ -626,6 +629,7 @@ function ThreadSettingsSessionProvider(
       runtimeMode: compatibleRuntimeMode,
       runtimeModeChoices,
       onUpdateRuntimeMode: props.onUpdateRuntimeMode,
+      runtimeModeDisabledReason: props.runtimeModeDisabledReason,
       displayedDescriptors,
       displayedModelSelection: pendingModel?.selection ?? props.selectedModel,
       reportedModelSelection: pendingModel ? null : (props.reportedModelSelection ?? null),
@@ -667,6 +671,7 @@ function ThreadSettingsSessionProvider(
       pressModel,
       providerFilter,
       props.onUpdateRuntimeMode,
+      props.runtimeModeDisabledReason,
       providerGroups,
       manageHidden,
       toggleHidden,
@@ -1181,6 +1186,7 @@ function ThreadSettingsChoiceContent(props: {
             id: choice.mode,
             label: choice.label,
             description: choice.description,
+            disabledReason: session.runtimeModeDisabledReason?.(choice.mode),
             selected: choice.mode === session.runtimeMode,
             onPress: () => {
               void Haptics.selectionAsync();
@@ -1195,6 +1201,7 @@ function ThreadSettingsChoiceContent(props: {
               id: choice.id,
               label: choice.label,
               description: undefined,
+              disabledReason: undefined,
               selected:
                 choice.id ===
                 getProviderOptionCurrentValue(
@@ -1236,6 +1243,7 @@ function ThreadSettingsChoiceContent(props: {
           <ChoiceRow
             key={row.id}
             description={row.description}
+            disabledReason={row.disabledReason}
             isLast={index === submenuContent.rows.length - 1}
             label={row.label}
             selected={row.selected}

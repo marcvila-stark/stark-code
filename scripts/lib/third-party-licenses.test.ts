@@ -219,7 +219,7 @@ describe("third-party license generation", () => {
 
     expect(config).toContain(revision.trim());
     expect(config).toContain(
-      "https://github.com/Yash-Singh1/ghostty/tree/starkcode/custom-io-ordered-feed",
+      "https://github.com/Yash-Singh1/ghostty/tree/t3code/custom-io-ordered-feed",
     );
   });
 
@@ -288,7 +288,7 @@ describe("third-party license generation", () => {
     });
 
     expect(manifest.entries.find((entry) => entry.name === "generated-asset")?.noticeText).toBe(
-      "Adapted for T3 Code.\n\nMIT License\n\nCopyright (c) 2026 Example Author\n\nPermission text",
+      "Adapted for Stark Code.\n\nMIT License\n\nCopyright (c) 2026 Example Author\n\nPermission text",
     );
   });
 

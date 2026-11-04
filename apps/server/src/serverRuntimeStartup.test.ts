@@ -3,7 +3,9 @@ import {
   DEFAULT_SERVER_SETTINGS,
   DEFAULT_MODEL,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  type ServerProvider,
 } from "@starkfuture/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -16,11 +18,51 @@ import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as ServerConfig from "./config.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 
-it("uses the canonical Codex model for auto-bootstrap", () => {
-  assert.deepEqual(ServerRuntimeStartup.getAutoBootstrapThreadModelSelection(), {
-    instanceId: ProviderInstanceId.make("codex"),
-    model: DEFAULT_MODEL,
-  });
+const bootProvider = (
+  driver: string,
+  status: ServerProvider["status"],
+  model: string,
+): ServerProvider => ({
+  instanceId: ProviderInstanceId.make(driver),
+  driver: ProviderDriverKind.make(driver),
+  enabled: true,
+  installed: true,
+  version: null,
+  status,
+  auth: { status: status === "ready" ? "authenticated" : "unknown" },
+  checkedAt: "2026-10-28T00:00:00.000Z",
+  models: [{ slug: model, name: model, isCustom: false, isDefault: true, capabilities: null }],
+  slashCommands: [],
+  skills: [],
+});
+
+it("starts the auto-bootstrap thread on Claude when its last known status is ready", () => {
+  assert.deepEqual(
+    ServerRuntimeStartup.getAutoBootstrapThreadModelSelection([
+      bootProvider("codex", "ready", "gpt-5.6"),
+      bootProvider("claudeAgent", "ready", "claude-opus-4-8"),
+    ]),
+    { instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude-opus-4-8" },
+  );
+});
+
+it("starts the auto-bootstrap thread on a ready provider when Claude is not ready", () => {
+  assert.deepEqual(
+    ServerRuntimeStartup.getAutoBootstrapThreadModelSelection([
+      bootProvider("codex", "ready", "gpt-5.6"),
+      bootProvider("claudeAgent", "error", "claude-opus-4-8"),
+    ]),
+    { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6" },
+  );
+});
+
+it("keeps the canonical Codex model when no provider has reported ready", () => {
+  for (const providers of [[], [bootProvider("claudeAgent", "warning", "claude-opus-4-8")]]) {
+    assert.deepEqual(ServerRuntimeStartup.getAutoBootstrapThreadModelSelection(providers), {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: DEFAULT_MODEL,
+    });
+  }
 });
 
 it.effect("starts without scanning or rebuilding projection history", () =>
@@ -30,16 +72,20 @@ it.effect("starts without scanning or rebuilding projection history", () =>
 
     const result = yield* ServerRuntimeStartup.runOrderedV2StartupPhases({
       importLegacyShells: record("import"),
+      freezePermissions: record("freeze"),
       recover: record("recover").pipe(Effect.as({ closedRequests: 2 })),
       recoverDelegatedTasks: record("delegated"),
       startEffectWorker: record("worker"),
       autoBootstrap: record("bootstrap").pipe(Effect.as({ projectId: "project-1" })),
     });
 
+    // The permission freeze covers imported chats and lands before recovery
+    // or the worker can start anything under a stored mode.
     // Delegated recovery reads the runs recovery terminalizes, and settles them
     // before the worker runs restart continuations that would otherwise race it.
     assert.deepEqual(yield* Ref.get(calls), [
       "import",
+      "freeze",
       "recover",
       "delegated",
       "worker",
@@ -49,6 +95,25 @@ it.effect("starts without scanning or rebuilding projection history", () =>
       recovery: { closedRequests: 2 },
       bootstrap: { projectId: "project-1" },
     });
+  }),
+);
+
+it.effect("does not recover or start the worker while saved permissions are unfrozen", () =>
+  Effect.gen(function* () {
+    const calls = yield* Ref.make<ReadonlyArray<string>>([]);
+    const record = (label: string) => Ref.update(calls, (current) => [...current, label]);
+
+    const error = yield* ServerRuntimeStartup.runOrderedV2StartupPhases({
+      importLegacyShells: record("import"),
+      freezePermissions: record("freeze").pipe(Effect.andThen(Effect.fail("unfrozen chats"))),
+      recover: record("recover"),
+      recoverDelegatedTasks: record("delegated"),
+      startEffectWorker: record("worker"),
+      autoBootstrap: record("bootstrap"),
+    }).pipe(Effect.flip);
+
+    assert.equal(error, "unfrozen chats");
+    assert.deepEqual(yield* Ref.get(calls), ["import", "freeze"]);
   }),
 );
 

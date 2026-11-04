@@ -123,6 +123,37 @@ releaseDate: '2026-03-07T10:36:07.540Z'
     assert.equal((serialized.match(/- url:/g) ?? []).length, 4);
   });
 
+  it("refuses to merge manifests that name files outside the feed", () => {
+    const parse = (url: string) =>
+      parsePlatformUpdateManifest(
+        "mac",
+        `version: 0.0.4
+files:
+  - url: ${url}
+    sha512: digest
+    size: 1
+releaseDate: '2026-03-07T10:32:14.587Z'
+`,
+        "latest-mac.yml",
+      );
+    for (const url of [
+      "https://github.com/pingdotgg/t3code/releases/x.zip",
+      "../x.zip",
+      "/x.zip",
+    ]) {
+      assert.throws(() => parse(url), /not a plain name inside the feed/, url);
+    }
+    const arm64 = parse("Stark-Code-0.0.4-arm64.zip");
+    assert.throws(
+      () =>
+        mergePlatformUpdateManifests("mac", arm64, {
+          ...arm64,
+          files: [{ url: "//evil.test/Stark-Code-0.0.4-x64.zip", sha512: "x", size: 1 }],
+        }),
+      /not a plain name inside the feed/,
+    );
+  });
+
   it("rejects mismatched manifest versions", () => {
     const primary = parsePlatformUpdateManifest(
       "win",

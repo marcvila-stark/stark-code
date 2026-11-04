@@ -7,9 +7,20 @@ import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
 import { useRightPanelStore } from "../../rightPanelStore";
 import { useSideChatStore } from "../../sideChatStore";
+import { useThreadHasUnsentDraft } from "../../composerDraftStore";
 import { resolveSidebarThreadStatus } from "../Sidebar.logic";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+
+function SideChatDraftLabel({ chat, id }: { chat: EnvironmentThreadShell; id: string }) {
+  const hasDraft = useThreadHasUnsentDraft(scopeThreadRef(chat.environmentId, chat.id));
+  return hasDraft ? (
+    <span id={id} className="shrink-0 text-2xs font-normal text-sidebar-muted-foreground">
+      Draft
+    </span>
+  ) : null;
+}
 
 export function SidebarSideChats(props: {
   parent: EnvironmentThreadShell;
@@ -65,7 +76,8 @@ export function SidebarSideChats(props: {
         {needsUser || hasError ? (
           <span
             className="size-1.5 rounded-full bg-warning-foreground"
-            title={needsUser ? "Needs you" : "Needs attention"}
+            role="img"
+            aria-label={needsUser ? "Needs you" : "Needs attention"}
           />
         ) : null}
       </Button>
@@ -118,8 +130,8 @@ export function SidebarSideChats(props: {
                   <button
                     type="button"
                     aria-label={`Open side chat: ${chat.title}`}
+                    aria-describedby={`${listId}-draft-${chat.id}`}
                     aria-current={selected ? "true" : undefined}
-                    title={chat.title}
                     className={cn(
                       "flex h-7 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-left text-xs outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                       selected
@@ -140,12 +152,20 @@ export function SidebarSideChats(props: {
                     }}
                   >
                     <MessageCircleIcon aria-hidden className="size-3 shrink-0 opacity-60" />
-                    <span className="min-w-0 flex-1 truncate">{chat.title}</span>
+                    <Tooltip>
+                      <TooltipTrigger render={<span className="min-w-0 flex-1 truncate" />}>
+                        {chat.title}
+                      </TooltipTrigger>
+                      <TooltipPopup side="right">
+                        {chat.title}
+                        {statusLabel ? ` · ${statusLabel}` : ""}
+                      </TooltipPopup>
+                    </Tooltip>
+                    <SideChatDraftLabel chat={chat} id={`${listId}-draft-${chat.id}`} />
                     {statusLabel ? (
                       <span
                         role="status"
                         aria-label={statusLabel}
-                        title={statusLabel}
                         className={cn(
                           "size-1.5 shrink-0 rounded-full",
                           status === "working" ? "bg-current opacity-60" : "bg-warning-foreground",

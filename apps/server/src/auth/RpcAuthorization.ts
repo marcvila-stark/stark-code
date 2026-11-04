@@ -2,6 +2,7 @@ import {
   CLIENT_GUARDED_RPC_SCOPES,
   type DeviceListInput,
   clientRpcRequiredScopes,
+  dispatchNeedsSettingsWrite,
   authScopeRequiredResponse,
   AssetCreateUrlInput,
   AuthAccessReadScope,
@@ -60,11 +61,13 @@ export const RPC_REQUIRED_SCOPES = {
   [ORCHESTRATION_V2_WS_METHODS.subscribeArchivedShell]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: AuthOrchestrationReadScope,
+  [ORCHESTRATION_V2_WS_METHODS.searchThreadHistory]: AuthOrchestrationReadScope,
   [WS_METHODS.projectsMutate]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverProbe]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetConfig]: AuthOrchestrationReadScope,
   [WS_METHODS.providerReadSessionCatalog]: AuthOrchestrationReadScope,
   [WS_METHODS.providerReadPermissionRules]: AuthOrchestrationReadScope,
+  [WS_METHODS.providerReadEffectivePermissions]: AuthOrchestrationReadScope,
   [WS_METHODS.checkpointRollbackPreview]: AuthOrchestrationReadScope,
   [WS_METHODS.checkpointRestoreFiles]: AuthOrchestrationOperateScope,
   [WS_METHODS.checkpointUndoRestore]: AuthOrchestrationOperateScope,
@@ -99,6 +102,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverUpsertKeybinding]: AuthSettingsWriteScope,
   [WS_METHODS.serverRemoveKeybinding]: AuthSettingsWriteScope,
   [WS_METHODS.serverGetStorageCleanupReport]: AuthOrchestrationReadScope,
+  [WS_METHODS.serverGetPreviewBrowserStatus]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetSettings]: AuthOrchestrationReadScope,
   [WS_METHODS.serverUpdateSettings]: AuthSettingsWriteScope,
   [WS_METHODS.serverSearchAcpRegistry]: AuthOrchestrationReadScope,
@@ -133,6 +137,9 @@ export const RPC_REQUIRED_SCOPES = {
   // Delivery logs hold request bodies, so they need the same scope as the URL.
   [WS_METHODS.scheduledTasksListWebhookDeliveries]: AuthOrchestrationOperateScope,
   [WS_METHODS.scheduledTasksGetWebhookDelivery]: AuthOrchestrationOperateScope,
+  // Runs carry no prompt or request data and only fixed error reasons, so
+  // reading them needs no more than reading the task list.
+  [WS_METHODS.scheduledTasksListRuns]: AuthOrchestrationReadScope,
   [WS_METHODS.cloudGetRelayClientStatus]: AuthRelayReadScope,
   [WS_METHODS.cloudInstallRelayClient]: AuthRelayWriteScope,
   [WS_METHODS.pullRequestsList]: AuthOrchestrationReadScope,
@@ -275,15 +282,7 @@ const requiredScopesForRpcCall = (
   method: string,
   payload: unknown,
 ): ReadonlyArray<AuthEnvironmentScope> => {
-  if (
-    method === ORCHESTRATION_V2_WS_METHODS.dispatchCommand &&
-    typeof payload === "object" &&
-    payload !== null &&
-    "type" in payload &&
-    payload.type === "runtime-request.respond" &&
-    "decision" in payload &&
-    payload.decision === "acceptAlways"
-  )
+  if (method === ORCHESTRATION_V2_WS_METHODS.dispatchCommand && dispatchNeedsSettingsWrite(payload))
     return [AuthOrchestrationOperateScope, AuthSettingsWriteScope];
   if (
     method === ORCHESTRATION_V2_WS_METHODS.dispatchCommand &&

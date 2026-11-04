@@ -32,7 +32,7 @@ export function projectGroupingModeFromToggle(
 
 const LAST_ENABLED_PROJECT_GROUPING_MODE_KEY = "starkcode:last-enabled-project-grouping-mode";
 
-export function readLastEnabledProjectGroupingMode(): SidebarProjectGroupingMode {
+function readLastEnabledProjectGroupingMode(): SidebarProjectGroupingMode {
   try {
     return localStorage.getItem(LAST_ENABLED_PROJECT_GROUPING_MODE_KEY) === "repository_path"
       ? "repository_path"
@@ -42,7 +42,7 @@ export function readLastEnabledProjectGroupingMode(): SidebarProjectGroupingMode
   }
 }
 
-export function rememberEnabledProjectGroupingMode(mode: SidebarProjectGroupingMode): void {
+function rememberEnabledProjectGroupingMode(mode: SidebarProjectGroupingMode): void {
   if (mode === "separate") return;
   try {
     localStorage.setItem(LAST_ENABLED_PROJECT_GROUPING_MODE_KEY, mode);

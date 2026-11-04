@@ -24,6 +24,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { isGitImport, parseTurnDiffFilesFromNumstat } from "../checkpointing/Diffs.ts";
+import { attributeCheckpointFiles, type TurnWriteEvidence } from "../checkpointing/FileOrigins.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 
@@ -151,6 +152,8 @@ export interface CheckpointServiceV2Shape {
     readonly appRunOrdinal: number | null;
     readonly capturedAt: DateTime.Utc;
     readonly agentWrittenPaths?: ReadonlyArray<string>;
+    /** What the turn's tool items say about its writes; marks each captured file's origin. */
+    readonly writeEvidence?: TurnWriteEvidence;
   }) => Effect.Effect<OrchestrationV2Checkpoint, CheckpointServiceV2Error>;
   readonly restore: (input: {
     readonly scope: OrchestrationV2CheckpointScope;
@@ -515,6 +518,28 @@ export const layer: Layer.Layer<
               )
             : [];
 
+          // The snapshot holds every change in the folder, so say which ones the agent's tools made.
+          const attributedFiles =
+            input.writeEvidence === undefined || files.length === 0
+              ? files
+              : attributeCheckpointFiles({
+                  files,
+                  cwdSpellings: [
+                    input.scope.cwd,
+                    ...(Option.isSome(nativeFs)
+                      ? [
+                          yield* nativeFs.value
+                            .realPath(input.scope.cwd)
+                            .pipe(Effect.orElseSucceed(() => input.scope.cwd)),
+                        ]
+                      : []),
+                  ],
+                  repositoryRoot: yield* checkpointStore
+                    .repositoryRoot(input.scope.cwd)
+                    .pipe(Effect.orElseSucceed(() => null)),
+                  evidence: input.writeEvidence,
+                });
+
           return makeCheckpoint({
             id: checkpointId,
             scope: input.scope,
@@ -525,7 +550,7 @@ export const layer: Layer.Layer<
             appRunOrdinal: input.appRunOrdinal,
             ref: checkpointRef,
             status: "ready",
-            files,
+            files: attributedFiles,
             agentWrittenPaths: input.agentWrittenPaths ?? [],
             capturedAt: input.capturedAt,
           });

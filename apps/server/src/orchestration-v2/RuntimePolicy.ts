@@ -3,7 +3,7 @@ import {
   OrchestrationV2AppThread,
   ProjectId,
   ProviderInstanceId,
-  type RuntimeMode,
+  permissionSourceOf,
 } from "@starkfuture/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema";
 
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
+import { offeredRuntimeMode, type PermissionCapabilities } from "./PermissionPolicy.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 
 /**
@@ -55,6 +56,10 @@ export interface RuntimePolicyV2Shape {
     readonly thread: OrchestrationV2AppThread;
     readonly modelSelection: ModelSelection;
   }) => Effect.Effect<ProviderAdapter.ProviderAdapterV2RuntimePolicy, RuntimePolicyV2Error>;
+  /** How an instance handles permissions, for storing a chat's effective policy. */
+  readonly permissionCapabilities: (
+    instanceId: ProviderInstanceId,
+  ) => Effect.Effect<PermissionCapabilities>;
 }
 
 export class RuntimePolicyV2 extends Context.Service<RuntimePolicyV2, RuntimePolicyV2Shape>()(
@@ -71,23 +76,13 @@ export const layer: Layer.Layer<RuntimePolicyV2> = Layer.succeed(RuntimePolicyV2
       interactionMode: input.thread.interactionMode,
       cwd: input.thread.worktreePath ?? input.thread.localSession?.cwd ?? null,
     }),
+  permissionCapabilities: () =>
+    Effect.succeed({
+      driver: undefined,
+      supportedRuntimeModes: undefined,
+      nativePermissionInherit: false,
+    }),
 });
-
-/**
- * The mode a provider runs a thread in. A mode the provider does not offer
- * (a thread set before it stopped offering it, or a stale client) runs in
- * Supervised rather than having Stark imitate it.
- */
-function providerRuntimeMode(
-  runtimeMode: RuntimeMode,
-  supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
-): RuntimeMode {
-  return supportedRuntimeModes === undefined ||
-    supportedRuntimeModes.length === 0 ||
-    supportedRuntimeModes.includes(runtimeMode)
-    ? runtimeMode
-    : "approval-required";
-}
 
 export const layerFromProjectStore: Layer.Layer<
   RuntimePolicyV2,
@@ -101,13 +96,35 @@ export const layerFromProjectStore: Layer.Layer<
     const projects = yield* ProjectStore.ProjectStoreV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+    const permissionCapabilities = Effect.fn("RuntimePolicyV2.permissionCapabilities")(function* (
+      instanceId: ProviderInstanceId,
+    ) {
+      const instance = yield* providerInstances.getInstance(instanceId);
+      if (instance === undefined) {
+        return {
+          driver: undefined,
+          supportedRuntimeModes: undefined,
+          nativePermissionInherit: false,
+        } satisfies PermissionCapabilities;
+      }
+      const snapshot = yield* instance.snapshot.getSnapshot;
+      return {
+        driver: instance.driverKind,
+        supportedRuntimeModes: snapshot.supportedRuntimeModes,
+        nativePermissionInherit: snapshot.nativePermissionInherit === true,
+      } satisfies PermissionCapabilities;
+    });
     return RuntimePolicyV2.of({
+      permissionCapabilities,
       resolve: Effect.fn("RuntimePolicyV2.resolve")(function* (input) {
         const instance = yield* providerInstances.getInstance(input.modelSelection.instanceId);
-        const supportedRuntimeModes =
-          instance === undefined
-            ? undefined
-            : (yield* instance.snapshot.getSnapshot).supportedRuntimeModes;
+        const snapshot = instance === undefined ? undefined : yield* instance.snapshot.getSnapshot;
+        const supportedRuntimeModes = snapshot?.supportedRuntimeModes;
+        // Inherit only where the driver omits permission settings for it;
+        // anywhere else the chat runs its stored preset, as before.
+        const inherits =
+          permissionSourceOf(input.thread) === "inherit" &&
+          snapshot?.nativePermissionInherit === true;
         const cwd =
           input.thread.worktreePath ??
           input.thread.localSession?.cwd ??
@@ -150,8 +167,9 @@ export const layerFromProjectStore: Layer.Layer<
           }
         }
         return ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-          runtimeMode: providerRuntimeMode(input.thread.runtimeMode, supportedRuntimeModes),
+          runtimeMode: offeredRuntimeMode(input.thread.runtimeMode, supportedRuntimeModes),
           interactionMode: input.thread.interactionMode,
+          ...(inherits ? { permissionSource: "inherit" as const } : {}),
           cwd,
         });
       }),
@@ -167,6 +185,7 @@ export function layerWithOverride(
     Effect.gen(function* () {
       const base = yield* RuntimePolicyV2;
       return {
+        permissionCapabilities: base.permissionCapabilities,
         resolve: (input) =>
           base.resolve(input).pipe(
             Effect.map((policy) =>

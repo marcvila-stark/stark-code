@@ -1,5 +1,9 @@
 import { type RunId } from "@starkfuture/contracts";
 import { type MouseEvent, memo, useCallback, useMemo, useState } from "react";
+import {
+  describeCheckpointFileGroups,
+  groupCheckpointFilesByOrigin,
+} from "@starkfuture/client-runtime/state/thread-checkpoints";
 import { type TurnDiffFileChange } from "../../types";
 import {
   buildTurnDiffTree,
@@ -40,6 +44,17 @@ export const ChangedFilesCard = memo(function ChangedFilesCard(props: {
     onFileContextMenu,
   } = props;
   const summaryStat = useMemo(() => summarizeTurnDiffStats(files), [files]);
+  const fileSections = useMemo(() => {
+    const groups = groupCheckpointFilesByOrigin(files);
+    const sections = describeCheckpointFileGroups(groups);
+    // Plain agent edits need no label; any other mix says who changed what.
+    const labelled = sections.length > 1 || sections[0]?.origin !== "agent";
+    return sections.map((section) => ({
+      origin: section.origin,
+      label: labelled ? section.label : null,
+      files: groups[section.origin],
+    }));
+  }, [files]);
   const hasDirectories = files.some((file) => /[/\\]/.test(file.path));
 
   return (
@@ -110,15 +125,22 @@ export const ChangedFilesCard = memo(function ChangedFilesCard(props: {
           </Tooltip>
         </div>
       </div>
-      <ChangedFilesTree
-        key={`${runId}:${allDirectoriesExpanded}`}
-        runId={runId}
-        files={files}
-        allDirectoriesExpanded={allDirectoriesExpanded}
-        resolvedTheme={resolvedTheme}
-        onOpenTurnDiff={onOpenTurnDiff}
-        onFileContextMenu={onFileContextMenu}
-      />
+      {fileSections.map((section) => (
+        <section key={section.origin} aria-label={section.label ?? undefined}>
+          {section.label !== null && (
+            <p className="px-3 pt-2 text-2xs text-muted-foreground">{section.label}</p>
+          )}
+          <ChangedFilesTree
+            key={`${runId}:${section.origin}:${allDirectoriesExpanded}`}
+            runId={runId}
+            files={section.files}
+            allDirectoriesExpanded={allDirectoriesExpanded}
+            resolvedTheme={resolvedTheme}
+            onOpenTurnDiff={onOpenTurnDiff}
+            onFileContextMenu={onFileContextMenu}
+          />
+        </section>
+      ))}
     </div>
   );
 });

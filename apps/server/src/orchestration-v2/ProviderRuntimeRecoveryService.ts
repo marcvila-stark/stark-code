@@ -1,4 +1,8 @@
 import { runRanAfter } from "@starkfuture/shared/orchestrationV2ThreadError";
+import {
+  isPersonFacingRuntimeRequest,
+  lostRuntimeRequestLabel,
+} from "@starkfuture/shared/orchestrationV2LostRequests";
 import { resolveProjectSettings } from "@starkfuture/shared/projectSettings";
 import {
   CommandId,
@@ -156,9 +160,24 @@ const cancelledItem = (
   item: OrchestrationV2ThreadProjection["turnItems"][number],
   now: DateTime.Utc,
 ): OrchestrationV2ThreadProjection["turnItems"][number] =>
-  item.type === "secret_request" && item.secretStatus === "pending"
-    ? { ...item, status: "cancelled", secretStatus: "cancelled", completedAt: now, updatedAt: now }
-    : { ...item, status: "cancelled", completedAt: now, updatedAt: now };
+  item.type === "notification" && item.toolNonExecutionKind === "workspace_wait"
+    ? {
+        ...item,
+        status: "cancelled",
+        outcome: "cancelled",
+        summary: "Chat stopped before it could start.",
+        completedAt: now,
+        updatedAt: now,
+      }
+    : item.type === "secret_request" && item.secretStatus === "pending"
+      ? {
+          ...item,
+          status: "cancelled",
+          secretStatus: "cancelled",
+          completedAt: now,
+          updatedAt: now,
+        }
+      : { ...item, status: "cancelled", completedAt: now, updatedAt: now };
 
 /**
  * A provider thread's latest started run: the last turn that provider saw.
@@ -187,6 +206,40 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  // Answers the user gave whose delivery to the provider never settled. The
+  // reconcile commit cancels their outbox rows, so they are read first. They
+  // are read whatever state the runs are in: a question from a settled root's
+  // background work, or one no run owns, loses its answer to the same cancel.
+  const undeliveredAnswers = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const effects = yield* outbox.listUnsettled({
+        threadId,
+        effectTypes: ["runtime-request.respond"],
+      });
+      const answers = [];
+      for (const effect of effects) {
+        if (effect.request.type !== "runtime-request.respond") continue;
+        const context = yield* projections.getRuntimeResponseContext(
+          threadId,
+          effect.request.requestId,
+        );
+        const request = context.request;
+        if (
+          request?.status !== "resolved" ||
+          request.lost !== undefined ||
+          request.responseCapability.type !== "live" ||
+          !isPersonFacingRuntimeRequest(request)
+        )
+          continue;
+        answers.push({ request, item: context.item });
+      }
+      return answers;
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderRuntimeRecoveryError({ operation: "read-projections", threadId, cause }),
+      ),
+    );
   const reconcileProjection = Effect.fn("ProviderRuntimeRecoveryService.reconcileProjection")(
     function* (
       projection: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -230,6 +283,72 @@ export const make = Effect.gen(function* () {
       const requests = projection.runtimeRequests.filter(
         (request) => request.status === "pending" && request.responseCapability.type !== "message",
       );
+      // A request that waited on the user stays open as a lost decision until
+      // they ask again or dismiss it; its timeline row says why it closed.
+      const lost = {
+        cause: trigger === "startup" ? ("server_restart" as const) : ("server_shutdown" as const),
+        lostAt: now,
+      };
+      const lostTitles = new Map(
+        requests
+          .filter(isPersonFacingRuntimeRequest)
+          .map((request) => [
+            request.id,
+            lostRuntimeRequestLabel({ kind: request.kind, cause: lost.cause }),
+          ]),
+      );
+      const withLostTitle = (item: OrchestrationV2ThreadProjection["turnItems"][number]) =>
+        (item.type === "approval_request" || item.type === "user_input_request") &&
+        lostTitles.has(item.requestId)
+          ? { ...item, title: lostTitles.get(item.requestId)! }
+          : item;
+      const unsettledAnswers = yield* undeliveredAnswers(projection.thread.id);
+      // An answer still pending delivery whose respond effect already settled
+      // lost its report (the process died between them, or recording failed).
+      // It may or may not have reached the provider either.
+      const orphanedAnswers = yield* Effect.forEach(
+        projection.runtimeRequests.filter(
+          (request) =>
+            request.status === "resolved" &&
+            request.delivery?.state === "pending" &&
+            request.lost === undefined &&
+            request.responseCapability.type === "live" &&
+            isPersonFacingRuntimeRequest(request) &&
+            !unsettledAnswers.some((answer) => answer.request.id === request.id),
+        ),
+        (request) =>
+          projections.getRuntimeResponseContext(projection.thread.id, request.id).pipe(
+            Effect.map((context) => ({ request, item: context.item })),
+            Effect.mapError(
+              (cause) =>
+                new ProviderRuntimeRecoveryError({
+                  operation: "read-projections",
+                  threadId: projection.thread.id,
+                  cause,
+                }),
+            ),
+          ),
+      );
+      const undelivered = [...unsettledAnswers, ...orphanedAnswers];
+      const uncertainRequests = undelivered.map(({ request }) => ({
+        ...request,
+        status: trigger === "startup" ? ("expired" as const) : ("cancelled" as const),
+        responseCapability: {
+          type: "not_resumable" as const,
+          reason: `The server ${trigger === "startup" ? "restarted" : "shut down"} before this answer was confirmed delivered.`,
+        },
+        lost: { ...lost, deliveryUncertain: true },
+        ...(request.delivery === undefined
+          ? {}
+          : {
+              delivery: {
+                state: "uncertain" as const,
+                attempts: request.delivery.attempts,
+                updatedAt: now,
+                reason: "Stark stopped before it could confirm the answer reached the agent.",
+              },
+            }),
+      }));
       // Delegated task rows, items and nodes stay open: the child settles them.
       const delegatedTaskNodeIds = new Set<string>([
         ...(projection.subagents ?? []).filter(isAppOwnedDelegation).map((subagent) => subagent.id),
@@ -340,6 +459,37 @@ export const make = Effect.gen(function* () {
               reason: `The server ${trigger === "startup" ? "restarted" : "shut down"} before this runtime request was resolved.`,
             },
             resolvedAt: now,
+            ...(lostTitles.has(request.id) ? { lost } : {}),
+          },
+        });
+      }
+      // The answer stays on the request; the item keeps its answered status.
+      for (const [index, { item }] of undelivered.entries()) {
+        const request = uncertainRequests[index]!;
+        events.push({
+          id: yield* allocateEventId(),
+          type: "runtime-request.updated",
+          threadId: projection.thread.id,
+          nodeId: request.nodeId,
+          occurredAt: now,
+          payload: request,
+        });
+        if (item === undefined) continue;
+        events.push({
+          id: yield* allocateEventId(),
+          type: "turn-item.updated",
+          threadId: projection.thread.id,
+          ...(item.runId === null ? {} : { runId: item.runId }),
+          ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+          occurredAt: now,
+          payload: {
+            ...item,
+            title: lostRuntimeRequestLabel({
+              kind: request.kind,
+              cause: lost.cause,
+              deliveryUncertain: true,
+            }),
+            updatedAt: now,
           },
         });
       }
@@ -408,6 +558,43 @@ export const make = Effect.gen(function* () {
             payload: { ...providerTurn, status: "cancelled", completedAt: now },
           });
         }
+        // A turn cut while it worked says so, so its partial reply never reads
+        // as a finished answer. A waiting run's turn had already ended.
+        if (run.status === "preparing" || run.status === "starting" || run.status === "running") {
+          const rootNodeId =
+            projection.attempts.find((attempt) => attempt.id === run.activeAttemptId)?.rootNodeId ??
+            null;
+          events.push({
+            id: yield* allocateEventId(),
+            type: "turn-item.updated",
+            threadId: projection.thread.id,
+            runId: run.id,
+            ...(rootNodeId === null ? {} : { nodeId: rootNodeId }),
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              id: ids.derive.runSignalTurnItem({ runId: run.id, signal: "restart-interrupt" }),
+              threadId: projection.thread.id,
+              runId: run.id,
+              nodeId: rootNodeId,
+              providerThreadId: run.providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: run.ordinal * 100 + 98,
+              status: "interrupted",
+              title: trigger === "startup" ? "Interrupted by restart" : "Interrupted by shutdown",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              type: "run_interrupt_result",
+              message:
+                trigger === "startup"
+                  ? "The server restarted before this turn finished."
+                  : "The server stopped before this turn finished.",
+            },
+          });
+        }
         for (const message of projection.messages.filter(
           (candidate) => candidate.runId === run.id && candidate.streaming,
         )) {
@@ -442,7 +629,7 @@ export const make = Effect.gen(function* () {
             ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
             providerInstanceId: run.providerInstanceId,
             occurredAt: now,
-            payload: cancelledItem(item, now),
+            payload: withLostTitle(cancelledItem(item, now)),
           });
         }
       }
@@ -518,6 +705,23 @@ export const make = Effect.gen(function* () {
             });
           }
         }
+      }
+      // A lost request's item closes with its loss title even when no cut run owns it.
+      const closedItemIds = new Set(
+        events.flatMap((event) => (event.type === "turn-item.updated" ? [event.payload.id] : [])),
+      );
+      for (const item of projection.turnItems ?? []) {
+        const titled = withLostTitle(item);
+        if (titled === item || closedItemIds.has(item.id)) continue;
+        events.push({
+          id: yield* allocateEventId(),
+          type: "turn-item.updated",
+          threadId: projection.thread.id,
+          ...(item.runId === null ? {} : { runId: item.runId }),
+          ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+          occurredAt: now,
+          payload: withLostTitle(cancelledItem(item, now)),
+        });
       }
       // No provider process outlives the server, so a native subagent still open
       // here never reports its end, whatever state its run and item are in.
@@ -611,9 +815,17 @@ export const make = Effect.gen(function* () {
           },
         });
       }
+      // An answer whose delivery is uncertain blocks continuing the turn like an
+      // unanswered request does: the step it decided is never rerun automatically.
       const continuationRun =
         continueAfterRestart && trigger === "startup"
-          ? restartContinuationRun(projection, now)
+          ? restartContinuationRun(
+              {
+                ...projection,
+                runtimeRequests: [...projection.runtimeRequests, ...uncertainRequests],
+              },
+              now,
+            )
           : undefined;
       const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
         ? [
@@ -677,7 +889,7 @@ export const make = Effect.gen(function* () {
       return {
         terminalizedRuns: runs.length,
         stoppedSessions,
-        closedRequests: requests.length,
+        closedRequests: requests.length + uncertainRequests.length,
         retiredEffects,
       };
     },

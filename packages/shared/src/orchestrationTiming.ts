@@ -1,4 +1,9 @@
-import { isOrchestrationV2WorkActive, type OrchestrationV2Subagent } from "@starkfuture/contracts";
+import {
+  isOrchestrationV2WorkActive,
+  type OrchestrationV2Subagent,
+  type OrchestrationV2TurnItem,
+} from "@starkfuture/contracts";
+import * as DateTime from "effect/DateTime";
 
 /** Unknown settled timing must not turn a task's age into its work duration. */
 export function deriveSubagentElapsedMs(
@@ -85,4 +90,93 @@ export function deriveActiveWorkStartedAt(
     return latestRun?.startedAt ?? latestRun?.requestedAt ?? sendStartedAt;
   }
   return sendStartedAt;
+}
+
+/**
+ * A stretch of a turn spent waiting on the user: an approval or a question
+ * card, from when it was shown until it was answered or closed. `endedAtMs`
+ * is null while the card is still open.
+ */
+export interface HumanWait {
+  readonly kind: "approval" | "answer";
+  readonly startedAtMs: number;
+  readonly endedAtMs: number | null;
+}
+
+/** The wait an approval or question item stands for; null for any other item. */
+export function humanWaitFromTurnItem(item: OrchestrationV2TurnItem): HumanWait | null {
+  if (item.type !== "approval_request" && item.type !== "user_input_request") return null;
+  const open = item.status === "pending" || item.status === "running" || item.status === "waiting";
+  return {
+    kind: item.type === "approval_request" ? "approval" : "answer",
+    startedAtMs: DateTime.toEpochMillis(item.startedAt ?? item.updatedAt),
+    endedAtMs: open ? null : DateTime.toEpochMillis(item.completedAt ?? item.updatedAt),
+  };
+}
+
+/**
+ * How much of `[startMs, endMs]` the turn spent waiting on the user. Waits
+ * that overlap count once, and an open wait runs to `endMs`.
+ */
+export function humanWaitMs(
+  waits: ReadonlyArray<HumanWait>,
+  startMs: number,
+  endMs: number,
+): number {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+  // `map` and `filter` copy the array, so sorting in place is safe.
+  const spans = waits
+    .map((wait) => ({
+      from: Math.max(startMs, wait.startedAtMs),
+      to: Math.min(endMs, wait.endedAtMs ?? endMs),
+    }))
+    .filter(({ from, to }) => Number.isFinite(from) && Number.isFinite(to) && to > from)
+    .sort((left, right) => left.from - right.from);
+  let total = 0;
+  let coveredUntil = startMs;
+  for (const { from, to } of spans) {
+    const start = Math.max(from, coveredUntil);
+    if (to > start) total += to - start;
+    coveredUntil = Math.max(coveredUntil, to);
+  }
+  return total;
+}
+
+/** Whole seconds under a minute, so a live counter does not flicker tenths. */
+function formatLiveDuration(durationMs: number): string {
+  const seconds = Math.max(0, Math.floor(durationMs / 1_000));
+  return seconds < 60 ? `${seconds}s` : formatDuration(seconds * 1_000);
+}
+
+/**
+ * The live header of a working turn. While a card waits on the user it says
+ * so and counts that wait; otherwise it counts work time only, leaving out
+ * earlier waits.
+ */
+export function liveTurnLabel(input: {
+  readonly startedAtMs: number;
+  readonly waits: ReadonlyArray<HumanWait>;
+  readonly nowMs: number;
+}): string {
+  const openWait = input.waits
+    .filter((wait) => wait.endedAtMs === null && wait.startedAtMs <= input.nowMs)
+    .sort((left, right) => left.startedAtMs - right.startedAtMs)[0];
+  if (openWait !== undefined) {
+    const waiting = openWait.kind === "approval" ? "your approval" : "your answer";
+    return `Waiting for ${waiting} · ${formatLiveDuration(input.nowMs - Math.max(input.startedAtMs, openWait.startedAtMs))}`;
+  }
+  const elapsedMs = Math.max(0, input.nowMs - input.startedAtMs);
+  const waitedMs = humanWaitMs(input.waits, input.startedAtMs, input.nowMs);
+  return `Working for ${formatLiveDuration(elapsedMs - waitedMs)}`;
+}
+
+/**
+ * The settled fold label: time the agent worked, and how long it waited on
+ * the user when it did, so approval time is not counted as work.
+ */
+export function workedForLabel(elapsedMs: number | null, waitedMs: number): string {
+  if (elapsedMs === null) return "Worked";
+  const waited = Math.min(Math.max(0, waitedMs), elapsedMs);
+  const worked = `Worked for ${formatDuration(elapsedMs - waited)}`;
+  return waited >= 1_000 ? `${worked} · waited ${formatDuration(waited)} for you` : worked;
 }

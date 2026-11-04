@@ -30,6 +30,7 @@ import * as Option from "effect/Option";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { Atom, AsyncResult } from "effect/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import type { EnvironmentConnectionPhase } from "@starkfuture/client-runtime/connection";
 import { environmentThreadDetails } from "../state/threads";
 
 import type { Thread, TurnDiffSummary } from "../types";
@@ -42,6 +43,8 @@ import {
   resolveComposerInteractionMode,
   restorePlanFollowUpComposer,
   resolveComposerProviderSelection,
+  runtimeModeChangeRequest,
+  stopAndApplyPermissionRequest,
   resolveProactiveTurnDiffAction,
   resolveDraftHeroState,
   resolveWorktreeSetupProgress,
@@ -72,6 +75,7 @@ import {
   dismissBranchMismatchForSession,
   getStartedThreadModelChangeBlockReason,
   hasEnvironmentReconnectWarningGraceElapsed,
+  environmentUnavailableBanner,
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
   reconcileMountedTerminalThreadIds,
@@ -79,6 +83,7 @@ import {
   resolveEffectiveInteractionMode,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  resolveDraftSubmissionTitle,
   startNewThreadForProject,
   shouldShowBranchMismatchBanner,
   shouldShowPlanFollowUpPrompt,
@@ -97,6 +102,26 @@ const helloWorldTemplate: CodexArtifactTemplate = {
   skillDirectory: "/Users/test/.codex/skills/artifact-template-hello-world",
   skillName: "artifact-template-hello-world",
 };
+
+describe("first-send draft titles", () => {
+  it("keeps an explicit capture title without requesting automatic title generation", () => {
+    expect(
+      resolveDraftSubmissionTitle("Image research fixture", "Image: captured-region.png"),
+    ).toEqual({
+      title: "Image research fixture",
+    });
+    expect(resolveDraftSubmissionTitle("Text research fixture", "Browser text capture")).toEqual({
+      title: "Text research fixture",
+    });
+  });
+
+  it("keeps automatic title generation for unnamed drafts", () => {
+    expect(resolveDraftSubmissionTitle(undefined, "Explain this code")).toEqual({
+      title: "Explain this code",
+      titleSeed: "Explain this code",
+    });
+  });
+});
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
   return makeThreadFixture({
@@ -1617,6 +1642,46 @@ describe("resolveComposerProviderSelection", () => {
     expect(selection.unavailableProviderInstanceId).toBe(missingInstanceId);
   });
 
+  it("starts a fresh draft on Claude when it is ready", () => {
+    const selection = resolveComposerProviderSelection({
+      entries: [entry("codex"), entry("claudeAgent")],
+      candidateInstanceIds: [null, undefined, NO_PROVIDER_MODEL_SELECTION.instanceId],
+      lockedProvider: null,
+      lockedInstanceId: null,
+    });
+
+    expect(selection.selectedProviderEntry?.instanceId).toBe("claudeAgent");
+    expect(selection.requestedDriverKind).toBe("claudeAgent");
+  });
+
+  it("starts a fresh draft on the first ready provider when Claude is signed out", () => {
+    const selection = resolveComposerProviderSelection({
+      entries: [
+        entry("codex"),
+        entry("claudeAgent", "claudeAgent", {
+          status: "error",
+          auth: { status: "unauthenticated" },
+        }),
+      ],
+      candidateInstanceIds: [NO_PROVIDER_MODEL_SELECTION.instanceId],
+      lockedProvider: null,
+      lockedInstanceId: null,
+    });
+
+    expect(selection.selectedProviderEntry?.instanceId).toBe("codex");
+  });
+
+  it("keeps a remembered or configured provider ahead of the automatic pick", () => {
+    const selection = resolveComposerProviderSelection({
+      entries: [entry("codex"), entry("claudeAgent")],
+      candidateInstanceIds: [null, ProviderInstanceId.make("codex")],
+      lockedProvider: null,
+      lockedInstanceId: null,
+    });
+
+    expect(selection.selectedProviderEntry?.instanceId).toBe("codex");
+  });
+
   it("does not treat the empty draft placeholder as a provider setup target", () => {
     const selection = resolveComposerProviderSelection({
       entries: [entry("antigravity", "antigravity", { enabled: false })],
@@ -1751,6 +1816,27 @@ describe("proactive completed diff guard", () => {
       ).toBe(action);
     },
   );
+
+  it("does not open for edits someone else made in the folder during the turn", () => {
+    const outsideOnly = {
+      status: "ready",
+      files: Array.from({ length: 3 }, (_, index) => ({
+        path: `docs/note-${index}.md`,
+        kind: "modified",
+        additions: 30,
+        deletions: 0,
+        origin: "outside" as const,
+      })),
+    } satisfies Pick<TurnDiffSummary, "status" | "files">;
+
+    expect(
+      resolveProactiveTurnDiffAction({
+        checkpoint: outsideOnly,
+        isGitRepo: true,
+        activeSurfaceKind: null,
+      }),
+    ).toBe("ignore");
+  });
 
   it("waits for definitive checkpoint and repository state", () => {
     const missingCheckpoint = {
@@ -2191,5 +2277,81 @@ describe("waitForRevertedMessage", () => {
     await vi.advanceTimersByTimeAsync(50);
     await settled;
     vi.useRealTimers();
+  });
+});
+
+describe("environment unavailable banner", () => {
+  const banner = (
+    phase: EnvironmentConnectionPhase,
+    options: { readonly error?: string; readonly answersAwaitingReconnect?: number } = {},
+  ) =>
+    environmentUnavailableBanner({
+      label: "Mac mini",
+      connection: { phase, error: options.error ?? null, traceId: null },
+      answersAwaitingReconnect: options.answersAwaitingReconnect ?? 0,
+    });
+
+  it("names what is wrong instead of calling every failure offline", () => {
+    expect(banner("reconnecting")).toEqual({
+      title: "Mac mini is reconnecting",
+      description: null,
+    });
+    expect(banner("offline").title).toBe("This device is offline");
+    expect(banner("available").title).toBe("Mac mini is not connected");
+    expect(banner("error", { error: "handshake timed out" })).toEqual({
+      title: "Can't connect to Mac mini",
+      description: "handshake timed out.",
+    });
+    expect(banner("unsupported", { error: "This client requires a newer server." })).toEqual({
+      title: "This app and Mac mini are not compatible",
+      description: "This client requires a newer server.",
+    });
+  });
+
+  it("says when answers wait for the connection", () => {
+    expect(banner("reconnecting", { answersAwaitingReconnect: 1 }).description).toBe(
+      "Your answer is sent once it reconnects.",
+    );
+    expect(
+      banner("error", { error: "handshake timed out", answersAwaitingReconnect: 2 }).description,
+    ).toBe("handshake timed out. 2 answers are sent once it reconnects.");
+  });
+});
+
+describe("stopAndApplyPermissionRequest", () => {
+  it("asks the server to stop the run and apply the chat's stored settings", () => {
+    const threadId = ThreadId.make("thread-stop-apply");
+    expect(
+      stopAndApplyPermissionRequest({
+        threadId,
+        permissionSource: "override",
+        runtimeMode: "approval-required",
+      }),
+    ).toEqual({
+      threadId,
+      permissionSource: "override",
+      runtimeMode: "approval-required",
+      whileRunning: "stop-and-apply",
+    });
+  });
+});
+
+describe("runtimeModeChangeRequest", () => {
+  it("changes a saved chat on the server now, as an override that waits for a running turn", () => {
+    const threadId = ThreadId.make("thread-mode");
+    expect(
+      runtimeModeChangeRequest({ serverThreadId: threadId, runtimeMode: "approval-required" }),
+    ).toEqual({
+      threadId,
+      permissionSource: "override",
+      runtimeMode: "approval-required",
+      whileRunning: "apply-after-run",
+    });
+  });
+
+  it("leaves a new chat's mode on its draft until the chat is created", () => {
+    expect(
+      runtimeModeChangeRequest({ serverThreadId: null, runtimeMode: "auto-accept-edits" }),
+    ).toBeNull();
   });
 });

@@ -1,10 +1,11 @@
-import type { ProviderInteractionMode } from "@starkfuture/contracts";
+import type { PreviewBrowserStatus, ProviderInteractionMode } from "@starkfuture/contracts";
 import type { V2TurnStartParams__AdditionalContextEntry } from "effect-codex-app-server/schema";
 import { buildRuntimeInstructions } from "@starkfuture/provider-core/server/runtimeInstructions";
 
 import {
   STARK_CODE_BROWSER_TOOL_INSTRUCTIONS,
   STARK_CODE_ORCHESTRATION_INSTRUCTIONS,
+  starkPreviewBrowserNote,
 } from "@starkfuture/provider-core/server/orchestrationInstructions";
 
 const STARK_CODE_DEVICE_TOOL_INSTRUCTIONS = `## Stark Code devices
@@ -211,6 +212,8 @@ export function buildCodexAdditionalContext(
    * setting, so the prompt cannot claim tools the turn doesn't have.
    */
   toolsAvailable: boolean | StarkCodeToolAvailability = true,
+  /** Whether `html_preview` can run this turn; Codex resends it only when it changes. */
+  previewBrowser?: PreviewBrowserStatus,
 ): Record<string, V2TurnStartParams__AdditionalContextEntry> {
   const tools = toolInstructions(toolsAvailable);
   // Separate keys keep each value under Codex's per-entry token cap.
@@ -221,5 +224,13 @@ export function buildCodexAdditionalContext(
       value: buildRuntimeInstructions({ harness: "Codex", ...runtime }),
     },
     ...(tools ? { stark_code_tools: { kind: "application", value: tools } } : {}),
+    ...(previewBrowser === undefined
+      ? {}
+      : {
+          stark_code_preview_browser: {
+            kind: "application",
+            value: starkPreviewBrowserNote(previewBrowser),
+          },
+        }),
   };
 }

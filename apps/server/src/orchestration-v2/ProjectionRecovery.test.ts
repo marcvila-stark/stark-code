@@ -7,6 +7,7 @@ import {
   NodeId,
   type OrchestrationV2AppThread,
   type OrchestrationV2Run,
+  type OrchestrationV2RuntimeRequest,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -758,4 +759,428 @@ it.effect("marks fork descendants unreadable when their source is missing or cor
       new Set([fork, descendant]),
     );
   }).pipe(Effect.provide(layerTest)),
+);
+
+const seedRequest = Effect.fn(function* (input: {
+  readonly threadId: ThreadId;
+  readonly runId: RunId | null;
+  readonly name: string;
+  readonly kind: OrchestrationV2RuntimeRequest["kind"];
+  readonly answered?: OrchestrationV2RuntimeRequest["decision"];
+  readonly delivery?: "pending" | "delivered";
+}) {
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const now = yield* DateTime.now;
+  const nodeId = NodeId.make(`node:${input.name}`);
+  const requestId = RuntimeRequestId.make(`request:${input.name}`);
+  const question = input.kind === "user_input";
+  const runScope = input.runId === null ? {} : { runId: input.runId };
+  yield* projections.apply({
+    id: EventId.make(`event:${input.name}:node`),
+    type: "node.updated",
+    threadId: input.threadId,
+    ...runScope,
+    nodeId,
+    occurredAt: now,
+    payload: {
+      id: nodeId,
+      threadId: input.threadId,
+      runId: input.runId,
+      parentNodeId: null,
+      rootNodeId: nodeId,
+      kind: question ? "user_input_request" : "approval_request",
+      status: input.answered === undefined ? "waiting" : "completed",
+      countsForRun: false,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      runtimeRequestId: requestId,
+      checkpointScopeId: null,
+      startedAt: now,
+      completedAt: input.answered === undefined ? null : now,
+    },
+  });
+  yield* projections.apply({
+    id: EventId.make(`event:${input.name}:request`),
+    type: "runtime-request.updated",
+    threadId: input.threadId,
+    nodeId,
+    occurredAt: now,
+    payload: {
+      id: requestId,
+      nodeId,
+      providerTurnId: null,
+      nativeRequestRef: null,
+      kind: input.kind,
+      status: input.answered === undefined ? "pending" : "resolved",
+      responseCapability: {
+        type: "live",
+        providerSessionId: ProviderSessionId.make("session:recovery:lost"),
+      },
+      createdAt: now,
+      resolvedAt: input.answered === undefined ? null : now,
+      ...(input.answered === undefined ? {} : { decision: input.answered }),
+      ...(input.delivery === undefined
+        ? {}
+        : { delivery: { state: input.delivery, attempts: 0, updatedAt: now } }),
+    },
+  });
+  const itemBase = {
+    id: TurnItemId.make(`item:${input.name}`),
+    threadId: input.threadId,
+    runId: input.runId,
+    nodeId,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 10,
+    status: input.answered === undefined ? ("waiting" as const) : ("completed" as const),
+    title: null,
+    startedAt: now,
+    completedAt: input.answered === undefined ? null : now,
+    updatedAt: now,
+    requestId,
+  };
+  yield* projections.apply({
+    id: EventId.make(`event:${input.name}:item`),
+    type: "turn-item.updated",
+    threadId: input.threadId,
+    ...runScope,
+    nodeId,
+    occurredAt: now,
+    payload: question
+      ? {
+          ...itemBase,
+          type: "user_input_request",
+          questions: [{ id: "q", header: "Q", question: "Which branch?", options: [] }],
+        }
+      : { ...itemBase, type: "approval_request", requestKind: "command" },
+  });
+  return { requestId, itemId: itemBase.id };
+});
+
+const requestState = Effect.fn(function* (threadId: ThreadId, requestId: RuntimeRequestId) {
+  const projection = yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProjection(
+    threadId,
+  );
+  const request = projection.runtimeRequests.find((candidate) => candidate.id === requestId);
+  const item = projection.turnItems.find(
+    (candidate) =>
+      (candidate.type === "approval_request" || candidate.type === "user_input_request") &&
+      candidate.requestId === requestId,
+  );
+  return { projection, request, item };
+});
+
+// Invariant (crash path): after a crash, startup recovery leaves no run working
+// and no request answerable. A cut turn says Interrupted, an approval it waited
+// on is a lost decision the user can ask again for, held queues stay held, and
+// recovering twice changes nothing.
+it.effect("startup recovery turns a decision cut by a crash into a lost one, once", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+    const threadId = yield* createThread("lost:crash");
+    const runId = yield* createRun(threadId, "running");
+    const queuedRunId = yield* createRun(threadId, "queued", {
+      ordinal: 2,
+      startedAt: null,
+      queuePosition: 1,
+    });
+    const approval = yield* seedRequest({
+      threadId,
+      runId,
+      name: "crash-approval",
+      kind: "command",
+    });
+    const tool = yield* seedRequest({
+      threadId,
+      runId,
+      name: "crash-tool",
+      kind: "dynamic_tool_call",
+    });
+
+    const first = yield* recovery.reconcile("startup");
+    assert.equal(first.terminalizedRuns, 1);
+
+    const { projection, request, item } = yield* requestState(threadId, approval.requestId);
+    assert.isFalse(
+      projection.runs.some((run) => ["preparing", "starting", "running"].includes(run.status)),
+    );
+    const cut = projection.runs.find((run) => run.id === runId);
+    assert.equal(cut?.status, "cancelled");
+    assert.deepEqual(
+      projection.turnItems
+        .filter((candidate) => candidate.type === "run_interrupt_result")
+        .map((candidate) => candidate.title),
+      ["Interrupted by restart"],
+    );
+    assert.isFalse(
+      projection.runtimeRequests.some(
+        (candidate) =>
+          candidate.status === "pending" && candidate.responseCapability.type === "live",
+      ),
+    );
+    assert.equal(request?.status, "expired");
+    assert.equal(request?.lost?.cause, "server_restart");
+    assert.equal(item?.status, "cancelled");
+    assert.equal(item?.title, "Approval lost: Stark Code restarted");
+    const toolRequest = projection.runtimeRequests.find(
+      (candidate) => candidate.id === tool.requestId,
+    );
+    assert.equal(toolRequest?.status, "expired");
+    assert.isUndefined(toolRequest?.lost);
+    const queued = projection.runs.find((run) => run.id === queuedRunId);
+    assert.equal(queued?.status, "queued");
+    assert.isTrue(queued?.queueHeld);
+    assert.equal(
+      (yield* projections.getThreadShell(threadId))?.lostRuntimeRequest?.id,
+      approval.requestId,
+    );
+
+    const second = yield* recovery.reconcile("startup");
+    assert.equal(second.terminalizedRuns, 0);
+    assert.equal(second.closedRequests, 0);
+  }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+// Invariant (graceful path): a shutdown marks the decision lost to the
+// shutdown, and the startup after it neither re-marks it nor cuts the turn again.
+it.effect("a graceful restart marks a cut question lost to the shutdown exactly once", () =>
+  Effect.gen(function* () {
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+    const threadId = yield* createThread("lost:graceful");
+    const runId = yield* createRun(threadId, "running");
+    const question = yield* seedRequest({
+      threadId,
+      runId,
+      name: "graceful-question",
+      kind: "user_input",
+    });
+
+    yield* recovery.reconcile("shutdown");
+    yield* recovery.reconcile("startup");
+
+    const { projection, request, item } = yield* requestState(threadId, question.requestId);
+    assert.equal(request?.status, "cancelled");
+    assert.equal(request?.lost?.cause, "server_shutdown");
+    assert.equal(item?.title, "Question lost: Stark Code shut down");
+    assert.deepEqual(
+      projection.turnItems
+        .filter((candidate) => candidate.type === "run_interrupt_result")
+        .map((candidate) => candidate.title),
+      ["Interrupted by shutdown"],
+    );
+  }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect("titles a lost request whose item no cut run owns", () =>
+  Effect.gen(function* () {
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+    const threadId = yield* createThread("lost:runless");
+    const approval = yield* seedRequest({
+      threadId,
+      runId: null,
+      name: "runless-approval",
+      kind: "permission",
+    });
+
+    yield* recovery.reconcile("startup");
+
+    const { request, item } = yield* requestState(threadId, approval.requestId);
+    assert.equal(request?.lost?.cause, "server_restart");
+    assert.equal(item?.status, "cancelled");
+    assert.equal(item?.title, "Approval lost: Stark Code restarted");
+  }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+// An answer committed before the crash whose provider delivery never settled is
+// kept, marked uncertain, and never rerun: the turn waits on the user.
+it.effect("keeps an answer whose delivery the crash interrupted as an uncertain lost one", () =>
+  Effect.gen(function* () {
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = yield* createThread("lost:undelivered");
+    const runId = yield* createRun(threadId, "running");
+    const answered = yield* seedRequest({
+      threadId,
+      runId,
+      name: "undelivered-approval",
+      kind: "command",
+      answered: "accept",
+    });
+    const delivered = yield* seedRequest({
+      threadId,
+      runId,
+      name: "delivered-approval",
+      kind: "command",
+      answered: "decline",
+    });
+    yield* outbox.enqueue([
+      {
+        id: "effect:undelivered-answer",
+        commandId: CommandId.make("command:undelivered-answer"),
+        threadId,
+        request: {
+          type: "runtime-request.respond",
+          providerSessionId: ProviderSessionId.make("session:recovery:lost"),
+          requestId: answered.requestId,
+          decision: "accept",
+        },
+      },
+      {
+        id: "effect:delivered-answer",
+        commandId: CommandId.make("command:delivered-answer"),
+        threadId,
+        request: {
+          type: "runtime-request.respond",
+          providerSessionId: ProviderSessionId.make("session:recovery:lost"),
+          requestId: delivered.requestId,
+          decision: "decline",
+        },
+      },
+    ]);
+    yield* sql`
+      UPDATE orchestration_v2_effect_outbox SET status = 'succeeded'
+      WHERE effect_id = 'effect:delivered-answer'
+    `;
+
+    const summary = yield* recovery.reconcile("startup");
+    assert.equal(summary.closedRequests, 1);
+
+    const { projection, request, item } = yield* requestState(threadId, answered.requestId);
+    assert.equal(request?.status, "expired");
+    assert.equal(request?.decision, "accept");
+    assert.deepEqual(request?.lost?.cause, "server_restart");
+    assert.isTrue(request?.lost?.deliveryUncertain);
+    assert.equal(item?.status, "completed");
+    assert.equal(item?.title, "Answer may not have reached the agent: Stark Code restarted");
+    const settled = projection.runtimeRequests.find(
+      (candidate) => candidate.id === delivered.requestId,
+    );
+    assert.equal(settled?.status, "resolved");
+    assert.isUndefined(settled?.lost);
+    assert.deepEqual(
+      yield* outbox.listUnsettled({ threadId, effectTypes: ["runtime-request.respond"] }),
+      [],
+    );
+  }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect("turns an answer whose delivery report never landed into an uncertain one, once", () =>
+  Effect.gen(function* () {
+    const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = yield* createThread("lost:orphaned-delivery");
+    const runId = yield* createRun(threadId, "running");
+    // The respond effect failed for good, but its report never reached the request.
+    const orphaned = yield* seedRequest({
+      threadId,
+      runId,
+      name: "orphaned-delivery",
+      kind: "command",
+      answered: "accept",
+      delivery: "pending",
+    });
+    const delivered = yield* seedRequest({
+      threadId,
+      runId,
+      name: "reported-delivery",
+      kind: "command",
+      answered: "accept",
+      delivery: "delivered",
+    });
+    yield* outbox.enqueue([
+      {
+        id: "effect:orphaned-delivery",
+        commandId: CommandId.make("command:orphaned-delivery"),
+        threadId,
+        request: {
+          type: "runtime-request.respond",
+          providerSessionId: ProviderSessionId.make("session:recovery:lost"),
+          requestId: orphaned.requestId,
+          decision: "accept",
+        },
+      },
+    ]);
+    yield* sql`
+      UPDATE orchestration_v2_effect_outbox SET status = 'failed'
+      WHERE effect_id = 'effect:orphaned-delivery'
+    `;
+
+    yield* recovery.reconcile("startup");
+    const { request, item } = yield* requestState(threadId, orphaned.requestId);
+    assert.equal(request?.delivery?.state, "uncertain");
+    assert.isTrue(request?.lost?.deliveryUncertain);
+    assert.equal(request?.decision, "accept");
+    assert.equal(item?.title, "Answer may not have reached the agent: Stark Code restarted");
+    const kept = yield* requestState(threadId, delivered.requestId);
+    assert.equal(kept.request?.delivery?.state, "delivered");
+    assert.isUndefined(kept.request?.lost);
+
+    // A second restart changes nothing.
+    const before = request;
+    yield* recovery.reconcile("startup");
+    assert.deepEqual((yield* requestState(threadId, orphaned.requestId)).request, before);
+  }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+// No run needs cutting here, yet the restart still cancels the undelivered
+// answer: a question from a settled root's background work, or one no run owns.
+it.effect.each(["a completed root turn", "no run"] as const)(
+  "keeps an undelivered answer on %s as an uncertain lost one",
+  (owner) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const name = owner === "no run" ? "runless" : "completed";
+      const threadId = yield* createThread(`lost:undelivered-${name}`);
+      const runId = owner === "no run" ? null : yield* createRun(threadId, "completed");
+      const answered = yield* seedRequest({
+        threadId,
+        runId,
+        name: `undelivered-${name}-approval`,
+        kind: "permission",
+        answered: "accept",
+      });
+      yield* outbox.enqueue([
+        {
+          id: `effect:undelivered-${name}-answer`,
+          commandId: CommandId.make(`command:undelivered-${name}-answer`),
+          threadId,
+          request: {
+            type: "runtime-request.respond",
+            providerSessionId: ProviderSessionId.make("session:recovery:lost"),
+            requestId: answered.requestId,
+            decision: "accept",
+          },
+        },
+      ]);
+
+      const summary = yield* recovery.reconcile("startup");
+      assert.equal(summary.terminalizedRuns, 0);
+      assert.equal(summary.closedRequests, 1);
+
+      const { projection, request, item } = yield* requestState(threadId, answered.requestId);
+      assert.equal(request?.status, "expired");
+      assert.equal(request?.decision, "accept");
+      assert.equal(request?.lost?.cause, "server_restart");
+      assert.isTrue(request?.lost?.deliveryUncertain);
+      assert.equal(item?.status, "completed");
+      assert.equal(item?.title, "Answer may not have reached the agent: Stark Code restarted");
+      if (runId !== null) {
+        assert.equal(projection.runs.find((run) => run.id === runId)?.status, "completed");
+      }
+      assert.isTrue(
+        (yield* projections.getThreadShell(threadId))?.lostRuntimeRequest?.deliveryUncertain,
+      );
+      assert.deepEqual(
+        yield* outbox.listUnsettled({ threadId, effectTypes: ["runtime-request.respond"] }),
+        [],
+      );
+    }).pipe(Effect.provide(layerRecoveryTest)),
 );

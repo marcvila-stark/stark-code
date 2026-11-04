@@ -90,6 +90,7 @@ export interface ThreadSnoozeShell extends QueuedThreadShell {
   readonly snoozedAt?: string | null;
   readonly hasPendingApprovals: boolean;
   readonly hasPendingUserInput: boolean;
+  readonly hasLostRuntimeRequest?: boolean;
 }
 
 /**
@@ -102,6 +103,8 @@ export interface ThreadSnoozeShell extends QueuedThreadShell {
  */
 export function threadRaisedHandWhileSnoozed(shell: ThreadSnoozeShell): boolean {
   if (shell.hasPendingApprovals || shell.hasPendingUserInput) return true;
+  // A decision lost to a restart is owed like a pending one (server isSnoozed).
+  if (shell.hasLostRuntimeRequest === true) return true;
   const runtime = shell.runtime ?? shell.session ?? null;
   const latestRun = shell.latestRun ?? shell.latestTurn ?? null;
   // Only a FRESH failure raises the hand: a thread snoozed while already

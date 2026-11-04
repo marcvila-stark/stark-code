@@ -178,6 +178,7 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     ipcRenderer.invoke(IpcChannels.CHECK_SNAP_SHOT_SHORTCUT_CHANNEL, shortcut),
   setSnapShotShortcutSuppressed: (suppressed) =>
     ipcRenderer.invoke(IpcChannels.SET_SNAP_SHOT_SHORTCUT_SUPPRESSED_CHANNEL, suppressed),
+  browserCapture: (command) => ipcRenderer.invoke(IpcChannels.BROWSER_CAPTURE_CHANNEL, command),
   listPendingSnapShots: () => ipcRenderer.invoke(IpcChannels.LIST_PENDING_SNAP_SHOTS_CHANNEL),
   readSnapShot: (id) => ipcRenderer.invoke(IpcChannels.READ_SNAP_SHOT_CHANNEL, id),
   setSnapShotAnimationDestination: (destination) =>
@@ -320,6 +321,11 @@ contextBridge.exposeInMainWorld("desktopBridge", {
       ipcRenderer.removeListener(IpcChannels.MENU_ACTION_CHANNEL, wrappedListener);
     };
   },
+  onBrowserCapturePending: (listener) => {
+    const wrapped = () => listener();
+    ipcRenderer.on(IpcChannels.BROWSER_CAPTURE_PENDING_CHANNEL, wrapped);
+    return () => ipcRenderer.removeListener(IpcChannels.BROWSER_CAPTURE_PENDING_CHANNEL, wrapped);
+  },
   onSnapShotEvent: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, event: unknown) => {
       if (!isSnapShotEvent(event)) return;
@@ -371,6 +377,33 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   checkForUpdate: () => ipcRenderer.invoke(IpcChannels.UPDATE_CHECK_CHANNEL),
   downloadUpdate: () => ipcRenderer.invoke(IpcChannels.UPDATE_DOWNLOAD_CHANNEL),
   installUpdate: () => ipcRenderer.invoke(IpcChannels.UPDATE_INSTALL_CHANNEL),
+  cancelUpdateDownload: () => ipcRenderer.invoke(IpcChannels.UPDATE_CANCEL_DOWNLOAD_CHANNEL),
+  setUpdatePostponed: (postponed) =>
+    ipcRenderer.invoke(IpcChannels.UPDATE_SET_POSTPONED_CHANNEL, postponed),
+  updateRestart: {
+    onPrepare: (listener) => {
+      const wrappedListener = (_event: Electron.IpcRendererEvent, request: unknown) => {
+        if (typeof request !== "object" || request === null) return;
+        listener(request as Parameters<typeof listener>[0]);
+      };
+      ipcRenderer.on(IpcChannels.UPDATE_RESTART_PREPARE_CHANNEL, wrappedListener);
+      void ipcRenderer.invoke(IpcChannels.UPDATE_RESTART_REGISTER_CHANNEL, true);
+      return () => {
+        ipcRenderer.removeListener(IpcChannels.UPDATE_RESTART_PREPARE_CHANNEL, wrappedListener);
+        void ipcRenderer.invoke(IpcChannels.UPDATE_RESTART_REGISTER_CHANNEL, false);
+      };
+    },
+    acknowledge: (ack) => ipcRenderer.invoke(IpcChannels.UPDATE_RESTART_ACK_CHANNEL, ack),
+    onRelease: (listener) => {
+      const wrappedListener = (_event: Electron.IpcRendererEvent, requestId: unknown) => {
+        if (typeof requestId === "string") listener(requestId);
+      };
+      ipcRenderer.on(IpcChannels.UPDATE_RESTART_RELEASE_CHANNEL, wrappedListener);
+      return () => {
+        ipcRenderer.removeListener(IpcChannels.UPDATE_RESTART_RELEASE_CHANNEL, wrappedListener);
+      };
+    },
+  },
   cliCommand: {
     getState: () => ipcRenderer.invoke(IpcChannels.CLI_COMMAND_GET_STATE_CHANNEL),
     install: () => ipcRenderer.invoke(IpcChannels.CLI_COMMAND_INSTALL_CHANNEL),

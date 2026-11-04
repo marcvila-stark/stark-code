@@ -111,7 +111,7 @@ export function PagesWebsiteView({
         if (!cancelled && !receivedEvent) setState(next);
       },
       () => {
-        if (!cancelled) setError("Could not open the Pages website. Try again.");
+        if (!cancelled && !receivedEvent) setError("Could not open the Pages website. Try again.");
       },
     );
     return () => {
@@ -258,7 +258,15 @@ export function PagesWebsiteView({
           <ExternalLinkIcon aria-hidden />
         </WebsiteControl>
       </div>
-      {state?.signInRequired && !failure ? (
+      {state?.loading && !failure && !importOpen ? (
+        <div
+          role="status"
+          className="shrink-0 border-b border-border px-3 py-2 text-xs text-muted-foreground"
+        >
+          Waiting for Pages to respond… You can keep working in chat.
+        </div>
+      ) : null}
+      {state?.signInRequired && !state.loading && !failure ? (
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3 py-2">
           <p className="min-w-0 flex-1 text-xs text-muted-foreground">
             Already signed in in your browser? Import that sign-in, or sign in below.
@@ -293,6 +301,7 @@ export function PagesWebsiteView({
         ) : null}
         {failure ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+            <h3 className="text-sm font-medium">Pages couldn’t load</h3>
             <p className="max-w-sm text-sm text-muted-foreground" role="alert">
               {failure}
             </p>

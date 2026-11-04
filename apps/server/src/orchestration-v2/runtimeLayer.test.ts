@@ -24,10 +24,12 @@ import {
   PullRequestOperationError,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RunId,
   ThreadId,
+  USER_SHELL_CHECK_SUPERSEDED_CODE,
 } from "@starkfuture/contracts";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
@@ -829,6 +831,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
             .dispatch({
               type: "checkpoint.rollback",
               commandId: overlapCommandId,
+              restoreScope: "checkout",
               threadId,
               checkpointId,
               scopeId: scope.id,
@@ -849,6 +852,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
             .dispatch({
               type: "checkpoint.rollback",
               commandId: sharedCommandId,
+              restoreScope: "checkout",
               threadId,
               checkpointId,
               scopeId: scope.id,
@@ -5988,5 +5992,573 @@ it.layer(Layer.merge(layerTest, layerRuntimeSettingsTest))(
         assert.deepEqual((yield* orchestrator.getThreadProjection(ThreadId.make(id))).runs, []);
       }),
     );
+    const work = (
+      id: string,
+      suffix: string,
+      mode: "start_immediately" | "queue_after_active",
+    ) => ({
+      type: "message.dispatch" as const,
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      commandId: CommandId.make(`${id}:${suffix}`),
+      threadId: ThreadId.make(id),
+      messageId: MessageId.make(`${id}:${suffix}`),
+      text: suffix,
+      attachments: [],
+      modelSelection,
+      dispatchMode: { type: mode },
+    });
+    // Ends a run the way a provider would report it, without a provider.
+    const settleRun = (run: OrchestrationV2Run, second: number) =>
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const at = DateTime.makeUnsafe(`2026-10-29T12:00:${String(second).padStart(2, "0")}Z`);
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`${run.id}:completed`),
+              type: "run.updated",
+              threadId: run.threadId,
+              runId: run.id,
+              ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: at,
+              payload: { ...run, status: "completed", startedAt: at, completedAt: at },
+            },
+          ],
+        });
+      });
+    const runForMessage = (id: string, suffix: string) =>
+      Effect.map(
+        Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+          orchestrator.getThreadProjection(ThreadId.make(id)),
+        ),
+        ({ runs }) => {
+          const run = runs.find(
+            (candidate) => candidate.userMessageId === MessageId.make(`${id}:${suffix}`),
+          );
+          assert.isDefined(run);
+          return run;
+        },
+      );
+    it.effect("records the turn a check runs after and refuses any other turn", () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const id = "human-shell-check";
+        const threadId = ThreadId.make(id);
+        // The layer's settings persist across tests, including the off-switch test.
+        yield* (yield* ServerSettings.ServerSettingsService).updateSettings({
+          allowUserShellCommands: true,
+        });
+        yield* orchestrator.dispatch(create(id));
+        yield* orchestrator.dispatch(work(id, "work", "start_immediately"));
+        const subject = yield* runForMessage(id, "work");
+        const early = yield* orchestrator
+          .dispatch({ ...shell(id, "early"), check: { subjectRunId: subject.id } })
+          .pipe(Effect.flip);
+        assert.include(JSON.stringify(early), "after the turn finishes");
+        yield* settleRun(subject, 1);
+
+        const check = { subjectRunId: subject.id, scriptId: "test", scriptName: "Test" };
+        yield* orchestrator.dispatch({ ...shell(id, "check"), check });
+        // A second check queues behind the first; checks never supersede each other.
+        yield* orchestrator.dispatch({ ...shell(id, "again"), check });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(
+          projection.runs.map((run) => run.status),
+          ["completed", "starting", "queued"],
+        );
+        assert.deepEqual(
+          projection.messages.find((message) => message.id === MessageId.make(`${id}:check`))
+            ?.userShell,
+          {
+            commandId: CommandId.make(`${id}:check`),
+            command: "pwd",
+            respond: false,
+            timeoutMs: 600_000,
+            check,
+          },
+        );
+        const item = projection.turnItems.find(
+          (candidate) =>
+            candidate.type === "user_message" &&
+            candidate.messageId === MessageId.make(`${id}:check`),
+        );
+        assert.isTrue(item?.type === "user_message");
+        if (item?.type === "user_message") assert.deepEqual(item.userShell?.check, check);
+
+        const other = "human-shell-check-other";
+        yield* orchestrator.dispatch(create(other));
+        yield* orchestrator.dispatch(work(other, "work", "start_immediately"));
+        const foreign = yield* runForMessage(other, "work");
+        yield* settleRun(foreign, 2);
+        const checkRun = yield* runForMessage(id, "check");
+        for (const [subjectRunId, cause] of [
+          [foreign.id, "not in this thread"],
+          [RunId.make("missing"), "not in this thread"],
+          [checkRun.id, "not after another check"],
+        ] as const) {
+          const failure = yield* orchestrator
+            .dispatch({ ...shell(id, `refused-${cause}-${subjectRunId}`), check: { subjectRunId } })
+            .pipe(Effect.flip);
+          assert.include(JSON.stringify(failure), cause);
+        }
+        // The queued check is still valid when the first one ends, so it starts.
+        const started = yield* Queue.unbounded<RunId>();
+        yield* (yield* EventSink.EventSinkV2)
+          .stream({ threadId, afterSequence: yield* orchestrator.getThreadEventSequence(threadId) })
+          .pipe(
+            Stream.runForEach((stored) =>
+              stored.event.type === "run.updated" && stored.event.payload.status === "starting"
+                ? Queue.offer(started, stored.event.payload.id)
+                : Effect.void,
+            ),
+            Effect.forkScoped,
+          );
+        yield* Effect.yieldNow;
+        yield* settleRun(checkRun, 3);
+        assert.equal(yield* Queue.take(started), (yield* runForMessage(id, "again")).id);
+        yield* orchestrator.dispatch(work(id, "next", "queue_after_active"));
+        const superseded = yield* orchestrator
+          .dispatch({ ...shell(id, "superseded"), check })
+          .pipe(Effect.flip);
+        assert.include(JSON.stringify(superseded), "latest turn only");
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(
+          after.messages.map((message) => message.id),
+          [...projection.messages.map((message) => message.id), MessageId.make(`${id}:next`)],
+        );
+        assert.lengthOf(after.runs, projection.runs.length + 1);
+      }),
+    );
+    it.effect("skips a queued check when reordered work runs in the folder first", () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const id = "human-shell-check-reordered";
+        const threadId = ThreadId.make(id);
+        // The layer's settings persist across tests, including the off-switch test.
+        yield* (yield* ServerSettings.ServerSettingsService).updateSettings({
+          allowUserShellCommands: true,
+        });
+        yield* orchestrator.dispatch(create(id));
+        yield* orchestrator.dispatch(work(id, "work", "start_immediately"));
+        const subject = yield* runForMessage(id, "work");
+        yield* settleRun(subject, 1);
+        const check = { subjectRunId: subject.id, scriptName: "Test" };
+        yield* orchestrator.dispatch({ ...shell(id, "running-check"), check });
+        yield* orchestrator.dispatch({ ...shell(id, "queued-check"), check });
+        yield* orchestrator.dispatch(work(id, "fix", "queue_after_active"));
+        const fix = yield* runForMessage(id, "fix");
+        const queuedCheck = yield* runForMessage(id, "queued-check");
+        yield* orchestrator.dispatch({
+          type: "queued-run.reorder",
+          commandId: CommandId.make(`${id}:reorder`),
+          threadId,
+          runId: fix.id,
+          beforeRunId: queuedCheck.id,
+        });
+        // Work queued behind the check still starts once the check is skipped.
+        yield* orchestrator.dispatch(work(id, "later", "queue_after_active"));
+        const later = yield* runForMessage(id, "later");
+
+        const started = yield* Queue.unbounded<RunId>();
+        const cancelled = yield* Queue.unbounded<RunId>();
+        const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+        yield* eventSink.stream({ threadId, afterSequence }).pipe(
+          Stream.runForEach((stored) =>
+            stored.event.type !== "run.updated"
+              ? Effect.void
+              : stored.event.payload.status === "starting"
+                ? Queue.offer(started, stored.event.payload.id)
+                : stored.event.payload.status === "cancelled"
+                  ? Queue.offer(cancelled, stored.event.payload.id)
+                  : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+
+        yield* settleRun(yield* runForMessage(id, "running-check"), 2);
+        assert.equal(yield* Queue.take(started), fix.id);
+        yield* settleRun(yield* runForMessage(id, "fix"), 3);
+        assert.equal(yield* Queue.take(cancelled), queuedCheck.id);
+        assert.equal(yield* Queue.take(started), later.id);
+
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const skipped = projection.runs.find((run) => run.id === queuedCheck.id);
+        assert.equal(skipped?.status, "cancelled");
+        assert.isNull(skipped?.startedAt);
+        const items = projection.turnItems.filter((item) => item.runId === queuedCheck.id);
+        assert.deepEqual(
+          items.map((item) => item.type),
+          ["user_message", "error"],
+        );
+        const [userItem, errorItem] = items;
+        if (userItem?.type === "user_message") assert.deepEqual(userItem.userShell?.check, check);
+        assert.isTrue(errorItem?.type === "error");
+        if (errorItem?.type === "error") {
+          assert.equal(errorItem.failure.code, USER_SHELL_CHECK_SUPERSEDED_CODE);
+          assert.include(errorItem.failure.message, `after Turn ${subject.ordinal}`);
+        }
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        assert.isFalse(
+          (yield* outbox.listByCommandId(
+            CommandId.make(`command:system:start-queued:${queuedCheck.id}`),
+          )).some((effect) => effect.request.type === "provider-turn.start"),
+        );
+      }),
+    );
   },
 );
+
+it.layer(layerTest)("lost runtime requests", (it) => {
+  /**
+   * A thread whose approvals were lost to a restart, each hanging off the
+   * command it would have run, the way recovery leaves them.
+   */
+  const seedLostApprovals = Effect.fn("runtimeLayerTest.seedLostApprovals")(function* (
+    name: string,
+    commands: ReadonlyArray<string>,
+    options: { readonly pending?: boolean } = {},
+  ) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make(`${name}-thread`);
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`${name}-create`),
+      createdBy: "user",
+      creationSource: "web",
+      threadId,
+      projectId: ProjectId.make(`${name}-project`),
+      title: "Lost decisions",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: process.cwd(),
+    });
+    const base = {
+      threadId,
+      runId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      startedAt: now,
+      updatedAt: now,
+    };
+    const requests = commands.map((command, index) => ({
+      command,
+      requestId: RuntimeRequestId.make(`${name}-request-${index}`),
+      nodeId: NodeId.make(`${name}-approval-node-${index}`),
+      commandNodeId: NodeId.make(`${name}-command-node-${index}`),
+    }));
+    const lostAt = DateTime.add(now, { seconds: 1 });
+    yield* eventSink.write({
+      commandId: CommandId.make(`${name}-seed`),
+      events: requests.flatMap(({ command, requestId, nodeId, commandNodeId }, index) => [
+        {
+          id: EventId.make(`${name}-node-${index}`),
+          type: "node.updated" as const,
+          threadId,
+          nodeId,
+          occurredAt: now,
+          payload: {
+            ...base,
+            id: nodeId,
+            parentNodeId: commandNodeId,
+            rootNodeId: commandNodeId,
+            kind: "approval_request" as const,
+            status: "cancelled" as const,
+            countsForRun: false,
+            runtimeRequestId: requestId,
+            checkpointScopeId: null,
+            completedAt: lostAt,
+          },
+        },
+        {
+          id: EventId.make(`${name}-command-${index}`),
+          type: "turn-item.updated" as const,
+          threadId,
+          nodeId: commandNodeId,
+          occurredAt: now,
+          payload: {
+            ...base,
+            id: TurnItemId.make(`${name}-command-item-${index}`),
+            type: "command_execution" as const,
+            nodeId: commandNodeId,
+            ordinal: index * 2,
+            status: "cancelled" as const,
+            title: null,
+            completedAt: lostAt,
+            input: command,
+          },
+        },
+        {
+          id: EventId.make(`${name}-request-${index}`),
+          type: "runtime-request.updated" as const,
+          threadId,
+          nodeId,
+          occurredAt: now,
+          payload: {
+            id: requestId,
+            nodeId,
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "command" as const,
+            status: "expired" as const,
+            responseCapability: {
+              type: "not_resumable" as const,
+              reason: "The server restarted before this runtime request was resolved.",
+            },
+            createdAt: DateTime.add(now, { milliseconds: index }),
+            resolvedAt: lostAt,
+            lost: { cause: "server_restart" as const, lostAt },
+          },
+        },
+        {
+          id: EventId.make(`${name}-item-${index}`),
+          type: "turn-item.updated" as const,
+          threadId,
+          nodeId,
+          occurredAt: now,
+          payload: {
+            ...base,
+            id: TurnItemId.make(`${name}-item-${index}`),
+            type: "approval_request" as const,
+            nodeId,
+            ordinal: index * 2 + 1,
+            status: "cancelled" as const,
+            title: "Approval lost: Stark Code restarted",
+            completedAt: lostAt,
+            requestId,
+            requestKind: "command" as const,
+          },
+        },
+      ]),
+    });
+    if (options.pending === true) {
+      const pendingNodeId = NodeId.make(`${name}-pending-node`);
+      yield* eventSink.write({
+        commandId: CommandId.make(`${name}-pending`),
+        events: [
+          {
+            id: EventId.make(`${name}-pending-request`),
+            type: "runtime-request.updated",
+            threadId,
+            nodeId: pendingNodeId,
+            occurredAt: now,
+            payload: {
+              id: RuntimeRequestId.make(`${name}-pending-request`),
+              nodeId: pendingNodeId,
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind: "file-change",
+              status: "pending",
+              responseCapability: {
+                type: "live",
+                providerSessionId: ProviderSessionId.make(`${name}-session`),
+              },
+              createdAt: now,
+              resolvedAt: null,
+            },
+          },
+        ],
+      });
+    }
+    return { threadId, requestIds: requests.map(({ requestId }) => requestId) };
+  });
+
+  it.effect("asks again for one lost approval in a user turn and leaves the others open", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const { threadId, requestIds } = yield* seedLostApprovals("lost-ask-one", [
+        "npm test",
+        "git push",
+      ]);
+      const before = yield* orchestrator.getThreadShell(threadId);
+      assert.equal(before?.lostRuntimeRequest?.id, requestIds[1]);
+
+      const command = {
+        type: "runtime-request.ask-again" as const,
+        commandId: CommandId.make("lost-ask-one-command"),
+        threadId,
+        requestIds: [requestIds[0]!],
+      };
+      const accepted = yield* orchestrator.dispatch(command);
+      assert.equal((yield* orchestrator.dispatch(command)).sequence, accepted.sequence);
+
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const [asked, untouched] = requestIds.map((id) =>
+        projection.runtimeRequests.find((request) => request.id === id),
+      );
+      assert.isDefined(asked?.lost?.askedAgainAt);
+      assert.isUndefined(untouched?.lost?.askedAgainAt);
+      assert.lengthOf(projection.runs, 1);
+      assert.lengthOf(projection.messages, 1);
+      const message = projection.messages[0]!;
+      assert.equal(message.role, "user");
+      assert.equal(message.createdBy, "user");
+      assert.equal(
+        message.text,
+        "Stark Code restarted before I answered your request to run `npm test`, so that request was lost. If the step is still needed, try it again and ask me again.",
+      );
+      assert.equal(projection.runs[0]?.userMessageId, message.id);
+      assert.deepEqual(
+        (yield* outbox.listByCommandId(command.commandId)).map((effect) => effect.request.type),
+        ["provider-turn.start"],
+      );
+      // The newer run does not clear the decision the user has not acted on.
+      assert.equal(
+        (yield* orchestrator.getThreadShell(threadId))?.lostRuntimeRequest?.id,
+        requestIds[1],
+      );
+
+      const again = yield* orchestrator
+        .dispatch({ ...command, commandId: CommandId.make("lost-ask-one-again") })
+        .pipe(Effect.flip);
+      assert.include(JSON.stringify(again), "already asked again or dismissed");
+    }),
+  );
+
+  it.effect("asks again for all named lost approvals in one turn", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, requestIds } = yield* seedLostApprovals("lost-ask-all", [
+        "npm test",
+        "git push",
+      ]);
+      yield* orchestrator.dispatch({
+        type: "runtime-request.ask-again",
+        commandId: CommandId.make("lost-ask-all-command"),
+        threadId,
+        requestIds: [requestIds[1]!, requestIds[0]!],
+      });
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.isTrue(projection.runtimeRequests.every((request) => request.lost?.askedAgainAt));
+      assert.lengthOf(projection.runs, 1);
+      const lines = projection.messages[0]!.text.split("\n");
+      assert.equal(lines[0], "These requests were lost before my answers reached you:");
+      assert.include(lines[1], "`npm test`");
+      assert.include(lines[2], "`git push`");
+      assert.isNull((yield* orchestrator.getThreadShell(threadId))?.lostRuntimeRequest);
+    }),
+  );
+
+  it.effect("dismisses a lost approval without starting a turn", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, requestIds } = yield* seedLostApprovals("lost-dismiss", ["npm test"]);
+      yield* orchestrator.dispatch({
+        type: "runtime-request.lost.dismiss",
+        commandId: CommandId.make("lost-dismiss-command"),
+        threadId,
+        requestIds,
+      });
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.isDefined(projection.runtimeRequests[0]?.lost?.dismissedAt);
+      assert.deepEqual(projection.runs, []);
+      assert.deepEqual(projection.messages, []);
+      assert.equal(
+        projection.turnItems.find((item) => item.type === "approval_request")?.title,
+        "Approval lost: Stark Code restarted",
+      );
+      assert.isNull((yield* orchestrator.getThreadShell(threadId))?.lostRuntimeRequest);
+      const askAfterDismiss = yield* orchestrator
+        .dispatch({
+          type: "runtime-request.ask-again",
+          commandId: CommandId.make("lost-dismiss-then-ask"),
+          threadId,
+          requestIds,
+        })
+        .pipe(Effect.flip);
+      assert.include(JSON.stringify(askAfterDismiss), "already asked again or dismissed");
+    }),
+  );
+
+  it.effect("refuses an answer to a lost approval and points to Ask again", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, requestIds } = yield* seedLostApprovals("lost-late-answer", ["npm test"]);
+      const failure = yield* orchestrator
+        .dispatch({
+          type: "runtime-request.respond",
+          commandId: CommandId.make("lost-late-answer-command"),
+          threadId,
+          requestId: requestIds[0]!,
+          decision: "accept",
+        })
+        .pipe(Effect.flip);
+      assert.include(
+        JSON.stringify(failure),
+        "This request was lost. Choose Ask again or Dismiss.",
+      );
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(projection.runtimeRequests[0]?.status, "expired");
+      assert.isUndefined(projection.runtimeRequests[0]?.decision);
+      assert.deepEqual(projection.runs, []);
+    }),
+  );
+
+  it.effect("asks the user to answer an open request first", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, requestIds } = yield* seedLostApprovals("lost-pending", ["npm test"], {
+        pending: true,
+      });
+      const failure = yield* orchestrator
+        .dispatch({
+          type: "runtime-request.ask-again",
+          commandId: CommandId.make("lost-pending-command"),
+          threadId,
+          requestIds,
+        })
+        .pipe(Effect.flip);
+      assert.include(JSON.stringify(failure), "Answer the open request first.");
+      assert.deepEqual((yield* orchestrator.getThreadProjection(threadId)).runs, []);
+    }),
+  );
+
+  it.effect("rejects requests that were not lost, repeats, and archived threads", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, requestIds } = yield* seedLostApprovals("lost-rejects", ["npm test"]);
+      const unknown = yield* orchestrator
+        .dispatch({
+          type: "runtime-request.lost.dismiss",
+          commandId: CommandId.make("lost-rejects-unknown"),
+          threadId,
+          requestIds: [RuntimeRequestId.make("lost-rejects-missing")],
+        })
+        .pipe(Effect.flip);
+      assert.include(JSON.stringify(unknown), "This request was not lost.");
+      const repeated = yield* orchestrator
+        .dispatch({
+          type: "runtime-request.lost.dismiss",
+          commandId: CommandId.make("lost-rejects-repeated"),
+          threadId,
+          requestIds: [requestIds[0]!, requestIds[0]!],
+        })
+        .pipe(Effect.flip);
+      assert.include(JSON.stringify(repeated), "Name each lost request once.");
+      yield* orchestrator.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("lost-rejects-archive"),
+        threadId,
+      });
+      const archived = yield* orchestrator
+        .dispatch({
+          type: "runtime-request.ask-again",
+          commandId: CommandId.make("lost-rejects-archived"),
+          threadId,
+          requestIds,
+        })
+        .pipe(Effect.flip);
+      assert.include(JSON.stringify(archived), "is not active");
+    }),
+  );
+});

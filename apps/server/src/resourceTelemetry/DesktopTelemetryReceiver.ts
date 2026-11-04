@@ -8,7 +8,9 @@ import {
   type DesktopHostTelemetryMessage as DesktopHostTelemetryMessageValue,
   type DesktopHostTelemetrySnapshot,
   DesktopTelemetryControlMessage,
+  type DesktopMaintenanceRequest,
   type DesktopUpdateStatusReport,
+  type MaintenanceStatus,
   type ResourceTelemetrySourceStatus,
 } from "@starkfuture/contracts";
 import { resolveServerBackgroundActivitySettings } from "@starkfuture/shared/backgroundActivitySettings";
@@ -185,6 +187,17 @@ export class DesktopTelemetryReceiver extends Context.Service<
     readonly cancelDesktopUpdate: (
       requestId: string,
     ) => Effect.Effect<void, DesktopTelemetryControlError>;
+    /** Maintenance gate requests from the desktop app supervising this server. */
+    readonly maintenanceRequests: Effect.Effect<
+      Stream.Stream<DesktopMaintenanceRequest>,
+      never,
+      Scope.Scope
+    >;
+    /** Answers a maintenance request, or reports a change when `replyTo` is null. */
+    readonly sendMaintenanceStatus: (input: {
+      readonly replyTo: string | null;
+      readonly status: MaintenanceStatus;
+    }) => Effect.Effect<void, DesktopTelemetryControlError>;
     /** Latest desktop update state report plus subsequent reports. The
         desktop replays its latest report when the backend attaches, so this
         is populated shortly after startup on desktop-managed servers. */
@@ -350,6 +363,7 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
   const healthChanges = yield* PubSub.sliding<DesktopTelemetryReceiverHealth>(4);
   const latestUpdateReport = yield* Ref.make(Option.none<DesktopUpdateStatusReport>());
   const updateReportChanges = yield* PubSub.sliding<DesktopUpdateStatusReport>(16);
+  const maintenanceRequests = yield* PubSub.sliding<DesktopMaintenanceRequest>(16);
   const controlMutex = yield* Semaphore.make(1);
   const snapshotMutex = yield* Semaphore.make(1);
   const health = yield* Ref.make<DesktopTelemetryReceiverHealth>({
@@ -527,6 +541,13 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
           );
         }
 
+        if (message.type === "maintenanceRequest") {
+          return recordContact.pipe(
+            Effect.andThen(PubSub.publish(maintenanceRequests, message)),
+            Effect.asVoid,
+          );
+        }
+
         // Not a resource sample: do not touch `latest` or sample health.
         if (message.type === "desktopUpdateStatus") {
           return recordContact.pipe(
@@ -655,6 +676,11 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
       sendControlMessage({ version: 1, type: "commitDesktopUpdate", requestId }),
     cancelDesktopUpdate: (requestId) =>
       sendControlMessage({ version: 1, type: "cancelDesktopUpdate", requestId }),
+    maintenanceRequests: PubSub.subscribe(maintenanceRequests).pipe(
+      Effect.map(Stream.fromSubscription),
+    ),
+    sendMaintenanceStatus: ({ replyTo, status }) =>
+      sendControlMessage({ version: 1, type: "maintenanceStatus", replyTo, status }),
     desktopUpdates: Effect.gen(function* () {
       const subscription = yield* PubSub.subscribe(updateReportChanges);
       const initial = yield* Ref.get(latestUpdateReport);
@@ -706,6 +732,8 @@ export const layerTest = (
       requestDesktopUpdate: () => Effect.void,
       commitDesktopUpdate: () => Effect.void,
       cancelDesktopUpdate: () => Effect.void,
+      maintenanceRequests: Effect.succeed(Stream.empty),
+      sendMaintenanceStatus: () => Effect.void,
       desktopUpdates:
         overrides.desktopUpdates ??
         Effect.succeed({

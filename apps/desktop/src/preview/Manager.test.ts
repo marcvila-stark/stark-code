@@ -2877,6 +2877,15 @@ describe("PreviewManager", () => {
 
   effectIt.effect("tells the server when a tab it renders natively closes", () =>
     Effect.gen(function* () {
+      const agentSession = {} as Electron.Session;
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi
+            .spyOn(BrowserSession, "isAgentBrowserSession")
+            .mockImplementation((session) => session === agentSession),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
       const host = yield* DesktopBrowserHost.DesktopBrowserHost;
       const serverTab = { threadId: "thread-1", tabId: "server-tab-1" };
       const lines = yield* Queue.unbounded<string>();
@@ -2894,6 +2903,7 @@ describe("PreviewManager", () => {
       }));
       fromId.mockReturnValue(
         Object.assign(makeTestPreviewWebContents(capturePage, 42), {
+          session: agentSession,
           isDevToolsOpened: () => false,
           getUserAgent: () => "Electron",
         }),

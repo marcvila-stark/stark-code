@@ -58,6 +58,7 @@ import {
   sortSidebarV2ProjectGroups,
   shouldCreateNewThreadInCurrentProject,
   shouldNavigateAfterThreadPark,
+  threadHandoffProviderNames,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
   type SidebarListItem,
   type SidebarListMarker,
@@ -1435,6 +1436,27 @@ describe("resolveThreadStatusPill", () => {
       }),
     ).toMatchObject({ label: "Completed", pulse: false });
   });
+
+  it.each(["cancelled", "interrupted"] as const)(
+    "says interrupted, not completed, when an unseen %s run ended before its work finished",
+    (status) => {
+      expect(
+        resolveThreadStatusPill({
+          thread: {
+            ...baseThread,
+            interactionMode: "default",
+            latestRun: { ...makeLatestRun(), status },
+            lastVisitedAt: "2026-03-09T10:04:00.000Z",
+            runtime: {
+              ...baseThread.runtime,
+              status,
+              activeRunId: null,
+            },
+          },
+        }),
+      ).toMatchObject({ label: "Interrupted", pulse: false });
+    },
+  );
 });
 
 describe("resolveProjectStatusIndicator", () => {
@@ -2452,5 +2474,17 @@ describe("one recent chats list", () => {
       selectVisibleSidebarChats(chats, 1, "other-environment:third").map((thread) => thread.id),
     ).toEqual(["first"]);
     expect(selectVisibleSidebarChats(chats, 50, null)).toEqual(chats);
+  });
+});
+
+describe("threadHandoffProviderNames", () => {
+  it("names earlier providers by their configured name, else by brand, never by raw driver id", () => {
+    expect(
+      threadHandoffProviderNames(
+        ["claudeAgent", "codex_work", "custom_agent", "codex"],
+        "codex",
+        new Map([["codex_work", { displayName: "Codex Work" }]]),
+      ),
+    ).toEqual(["Claude", "Codex Work", "custom_agent"]);
   });
 });

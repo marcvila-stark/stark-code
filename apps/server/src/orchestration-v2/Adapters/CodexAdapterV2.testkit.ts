@@ -1,5 +1,6 @@
 import * as OtelEnvironment from "@starkfuture/shared/otelEnvironment";
 import { DEFAULT_SIGNAL_EXPORT } from "@starkfuture/shared/observability";
+import { CODEX_PRIVACY_CONFIG } from "@starkfuture/shared/providerPrivacy";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { type ProviderReplayTranscript } from "@starkfuture/contracts";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -66,8 +67,25 @@ export function withCodexReplayChildMetadata(
         : [];
     }),
   );
+  const recordedMcpStatus = transcript.entries.some(
+    (entry) =>
+      entry.type === "expect_outbound" &&
+      Predicate.isObject(entry.frame) &&
+      entry.frame.method === "mcpServerStatus/list",
+  );
   return {
     ...client,
+    // Historical transcripts did not observe MCP health. Their fixture has no
+    // status snapshot, so answer the additive diagnostic probe with no servers
+    // without consuming a turn/request frame. Recordings that include status
+    // stay strict, and adapter health tests exercise real status responses.
+    request: (method, params) =>
+      !recordedMcpStatus && method === "mcpServerStatus/list"
+        ? (Effect.succeed({ data: [], nextCursor: null }) as unknown as Effect.Effect<
+            CodexClient.ClientRequestResponse<typeof method>,
+            CodexError.CodexAppServerError
+          >)
+        : client.request(method, params),
     raw: {
       ...client.raw,
       request: (method, params) =>
@@ -243,6 +261,63 @@ export const CodexOrchestratorReplayHarness: OrchestratorV2ProviderReplayHarness
   driver: CodexAdapterV2.CODEX_DRIVER_KIND,
   decodeTranscript: (transcript) =>
     decodeCodexAppServerReplayTranscript(transcript).pipe(
+      // Historical recordings predate mandatory privacy overrides. Add only
+      // missing defaults to expected thread config; explicit recorded values
+      // and all permission/execution settings still have to match exactly.
+      Effect.map((decoded) => ({
+        ...decoded,
+        entries: decoded.entries.map((entry) => {
+          if (entry.type !== "expect_outbound" || !Predicate.isObject(entry.frame)) return entry;
+          const { frame } = entry;
+          // These pre-permissions recordings exercised orchestration in Full
+          // access. Derive a Supervised expectation for today's orchestrator;
+          // keep the wire comparison strict against that narrower policy.
+          // Inbound recordings prove lifecycle handling, not a fresh CLI run.
+          if (
+            frame.method === "turn/start" &&
+            Predicate.isObject(frame.params) &&
+            ["0.156.1", "0.120.0", "0.124.0-alpha.3"].includes(decoded.version)
+          ) {
+            return {
+              ...entry,
+              frame: {
+                ...frame,
+                params: {
+                  ...frame.params,
+                  approvalPolicy: "untrusted",
+                  approvalsReviewer: "user",
+                  sandboxPolicy: {
+                    type: "readOnly",
+                    ...(Predicate.isObject(frame.params.sandboxPolicy) &&
+                    frame.params.sandboxPolicy.type === "readOnly" &&
+                    frame.params.sandboxPolicy.networkAccess === false
+                      ? { networkAccess: false }
+                      : {}),
+                  },
+                },
+              },
+            };
+          }
+          if (
+            !["thread/start", "thread/resume", "thread/fork"].includes(String(frame.method)) ||
+            !Predicate.isObject(frame.params)
+          )
+            return entry;
+          return {
+            ...entry,
+            frame: {
+              ...frame,
+              params: {
+                ...frame.params,
+                config: {
+                  ...CODEX_PRIVACY_CONFIG,
+                  ...(Predicate.isObject(frame.params.config) ? frame.params.config : {}),
+                },
+              },
+            },
+          };
+        }),
+      })),
       Effect.mapError(
         (cause) =>
           new CodexReplayTranscriptDecodeError({

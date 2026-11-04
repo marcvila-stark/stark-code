@@ -38,6 +38,7 @@ import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import { threadHasQueuedTurnStart } from "./orchestration-v2/ThreadSettlementService.ts";
+import * as MaintenanceGate from "./maintenance/MaintenanceGate.ts";
 import { forkParked } from "./serverActivation.ts";
 import * as Settings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
@@ -111,6 +112,8 @@ export function storageCleanupThreadIdle(thread: OrchestrationV2ThreadShell, now
       thread.status === "rolled_back") &&
     (thread.pendingBackgroundTasks?.length ?? 0) === 0 &&
     thread.pendingRuntimeRequest === null &&
+    // Ask again for a lost decision runs in this worktree.
+    (thread.lostRuntimeRequest ?? null) === null &&
     !threadHasQueuedTurnStart(thread, now)
   );
 }
@@ -765,21 +768,21 @@ const make = Effect.gen(function* () {
     yield* SubscriptionRef.set(reportRef, latestReport);
     return latestReport;
   });
+  const maintenance = yield* MaintenanceGate.MaintenanceGate;
   const worker = yield* makeDrainableWorker(
     (completion: Deferred.Deferred<StorageCleanupReport, ServerSettingsError> | undefined) =>
-      sweep(completion === undefined ? "automatic" : "manual").pipe(
-        Effect.exit,
-        Effect.flatMap((exit) =>
-          completion === undefined
-            ? exit.pipe(
-                Effect.asVoid,
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("storage cleanup failed", { cause }),
-                ),
-              )
-            : Deferred.done(completion, exit).pipe(Effect.asVoid),
-        ),
-      ),
+      completion === undefined
+        ? // Automatic sweeps wait out an update and a recovery hold; a restore
+          // may still need what they would delete.
+          maintenance.guard("storage-cleanup", sweep("automatic")).pipe(
+            Effect.asVoid,
+            Effect.catchCause((cause) => Effect.logWarning("storage cleanup failed", { cause })),
+          )
+        : sweep("manual").pipe(
+            Effect.exit,
+            Effect.flatMap((exit) => Deferred.done(completion, exit)),
+            Effect.asVoid,
+          ),
   );
   const runNow = Effect.gen(function* () {
     const completion = yield* Deferred.make<StorageCleanupReport, ServerSettingsError>();

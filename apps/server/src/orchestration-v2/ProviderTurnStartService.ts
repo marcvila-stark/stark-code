@@ -43,6 +43,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import { makeProviderFailure } from "@starkfuture/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
+import { continuesImportedAgentSession } from "./AgentSessionContinuation.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
   isRestartNoteContinuation,
@@ -671,6 +672,16 @@ export const layer: Layer.Layer<
             }),
           );
         }
+        // The first Stark turn on an imported CLI session resumes history no
+        // Stark turn has opened; later turns resume what Stark itself ran.
+        const resumesImportedHistory =
+          continuesImportedAgentSession({ threadId: projection.thread.id, providerThread }) &&
+          !projection.attempts.some(
+            (source) =>
+              source.providerThreadId === providerThread.id &&
+              source.nativeThreadId === providerThread.nativeThreadRef?.nativeId &&
+              projection.providerTurns.some((turn) => turn.runAttemptId === source.id),
+          );
         const uncertainDelivery = projection.contextHandoffs.some(
           (handoff) =>
             handoff.toProviderThreadId === providerThread.id &&
@@ -693,6 +704,7 @@ export const layer: Layer.Layer<
                 threadId: projection.thread.id,
                 modelSelection: run.modelSelection,
                 runtimePolicy: resolvedRuntimePolicy,
+                ...(resumesImportedHistory ? { importedNativeHistory: true } : {}),
               }),
         );
         if (resumed._tag === "Success") {
@@ -1271,11 +1283,16 @@ export const layer: Layer.Layer<
           ) + 1,
         // Legacy accepted attempts have no native id. They count only before
         // a replacement, while no accepted attempt records a native identity.
+        // An imported CLI session holds the imported turns natively.
         nativeThreadHasTurns:
           nativeInputRunIds.size > 0 ||
           (legacyInputRunIds.size > 0 &&
             sameNativeThread &&
-            !acceptedAttempts.some((source) => source.nativeThreadId !== undefined)),
+            !acceptedAttempts.some((source) => source.nativeThreadId !== undefined)) ||
+          continuesImportedAgentSession({
+            threadId: projection.thread.id,
+            providerThread: runningProviderThread,
+          }),
         shouldStartProviderTurn: runControls.shouldStartProviderTurn,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,

@@ -8,8 +8,8 @@ to keep a terminal open.
 Install the `stark-code` CLI first ([Install Stark Code](./install.md#command-line)), then
 run these commands on the machine that will host Stark Code:
 
-| Task                            | Command                |
-| ------------------------------- | ---------------------- |
+| Task                            | Command                        |
+| ------------------------------- | ------------------------------ |
 | Install and start               | `stark-code service install`   |
 | Inspect status and log location | `stark-code service status`    |
 | Move to a newer release         | `stark-code update`            |
@@ -84,8 +84,8 @@ that session open.
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `linger-unavailable`                    | Run `loginctl show-user "$(id -un)" --property=Linger` and check that systemd-logind is available.                             |
 | `user-manager-unavailable`              | Run `systemctl --user status` in a login session for the service user; check your distribution's systemd user-session support. |
-| `service-disabled` or `service-stopped` | Read the log and `systemctl --user status starkcode.service`, then use the repair command printed by Stark Code.                     |
-| `restart-pending`                       | A newer version is installed but the service still runs the previous one. Run `stark-code service restart`.                            |
+| `service-disabled` or `service-stopped` | Read the log and `systemctl --user status starkcode.service`, then use the repair command printed by Stark Code.               |
+| `restart-pending`                       | A newer version is installed but the service still runs the previous one. Run `stark-code service restart`.                    |
 
 On macOS, check **System Settings → General → Login Items** if the service no
 longer starts at login. If agent work cannot access Desktop, Documents, or
@@ -93,5 +93,5 @@ Downloads, it may need Full Disk Access for the `stark-code` executable listed i
 `ProgramArguments` in
 `~/Library/LaunchAgents/com.starkfuture.starkcode.service.plist`.
 
-For failures after signing in to Stark Connect, see
-[connection troubleshooting](./remote-access.md#stark-connect-troubleshooting).
+If other devices cannot reach the host, see
+[remote access troubleshooting](./remote-access.md#troubleshooting).

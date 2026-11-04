@@ -19,6 +19,7 @@
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
+    "@starkfuture/contracts": "workspace:*",
     "@types/plist": "catalog:",
     "@types/pngjs": "6.0.5",
     "typescript": "catalog:",

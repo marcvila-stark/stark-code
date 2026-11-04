@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  findHtmlRenderLocalImages,
   HTML_RENDER_MAX_HEIGHT,
   htmlRenderFrameHeight,
   htmlRenderReferencesEqual,
@@ -17,6 +18,16 @@ import { STARK_CODE_DARK_THEME_COLORS, STARK_CODE_LIGHT_THEME_COLORS } from "./t
 import { htmlRenderFromToolItem } from "./toolOutput.ts";
 
 const reference = { attachmentId: "thread-abc-123.html", title: "Chart", height: 420 };
+
+describe("findHtmlRenderLocalImages", () => {
+  it("finds the exact span of each absolute image path, quoted or in a CSS url()", () => {
+    const html = `<img src="/a/b.PNG"><i style="background:url(  C:/x/y.webp )"></i>
+<script>const s = '/c/d.svg';</script><img src="//cdn/e.png"><img src="f.png"><img src="https://g/h.jpg">`;
+    const found = findHtmlRenderLocalImages(html);
+    expect(found.map((image) => image.path)).toEqual(["/a/b.PNG", "C:/x/y.webp", "/c/d.svg"]);
+    for (const image of found) expect(html.slice(image.start, image.end)).toBe(image.path);
+  });
+});
 
 describe("injectHtmlRenderBootstrap", () => {
   it("puts the theme ahead of the page's own head content", () => {

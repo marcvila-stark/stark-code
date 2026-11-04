@@ -16,6 +16,7 @@ import {
   type ProviderInteractionMode,
   ProjectId,
   type RunId,
+  type PermissionSource,
   type RuntimeMode,
   type ScheduledTaskId,
   ThreadId,
@@ -86,6 +87,8 @@ export interface ThreadLaunchInput {
   readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
+  /** Missing means `override`; used only when the launch creates the thread. */
+  readonly permissionSource?: PermissionSource;
   readonly workspaceStrategy: ThreadLaunchWorkspaceStrategy;
   readonly localSession?: OrchestrationV2LocalSession;
   readonly initialMessage?: ThreadLaunchInitialMessage;
@@ -933,6 +936,9 @@ const make = Effect.gen(function* () {
                 modelSelection: input.modelSelection,
                 runtimeMode: input.runtimeMode,
                 interactionMode: input.interactionMode,
+                ...(input.permissionSource === undefined
+                  ? {}
+                  : { permissionSource: input.permissionSource }),
                 branch: initialBranch,
                 worktreePath: initialWorktreePath,
                 ...(input.localSession === undefined ? {} : { localSession: input.localSession }),

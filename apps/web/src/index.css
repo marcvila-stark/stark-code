@@ -443,6 +443,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(stark-mo
   }
 }
 
+/* Also honours --scroll-end-cover (see scroll-end-cover) below the top fade. */
 @utility topbar-scroll-fade {
   -webkit-mask-image:
     linear-gradient(
@@ -455,7 +456,12 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(stark-mo
       rgb(0 0 0 / 96%) 82%,
       black 100%
     ),
-    linear-gradient(black, black), linear-gradient(black, black);
+    linear-gradient(
+      to bottom,
+      black calc(100% - var(--scroll-end-cover, 0px) - min(0.5rem, var(--scroll-end-cover, 0px))),
+      transparent calc(100% - var(--scroll-end-cover, 0px))
+    ),
+    linear-gradient(black, black);
   -webkit-mask-position: top, bottom, right;
   -webkit-mask-repeat: no-repeat;
   -webkit-mask-size:
@@ -473,12 +479,48 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(stark-mo
       rgb(0 0 0 / 96%) 82%,
       black 100%
     ),
-    linear-gradient(black, black), linear-gradient(black, black);
+    linear-gradient(
+      to bottom,
+      black calc(100% - var(--scroll-end-cover, 0px) - min(0.5rem, var(--scroll-end-cover, 0px))),
+      transparent calc(100% - var(--scroll-end-cover, 0px))
+    ),
+    linear-gradient(black, black);
   mask-position: top, bottom, right;
   mask-repeat: no-repeat;
   mask-size:
     100% calc(var(--workspace-titlebar-scroll-fade-height) + 1px),
     100% calc(100% - var(--workspace-titlebar-scroll-fade-height)),
+    var(--app-scrollbar-width) 100%;
+}
+
+/* Something floating over the end of a scroller (the chat composer over the
+   transcript) covers --scroll-end-cover pixels of it. Content stops, with a
+   short fade, where that cover begins, so nothing reads through the cover or
+   the strip under it. The scrollbar lane stays whole. Unset, nothing is cut. */
+@utility scroll-end-cover {
+  -webkit-mask-image:
+    linear-gradient(
+      to bottom,
+      black calc(100% - var(--scroll-end-cover, 0px) - min(0.5rem, var(--scroll-end-cover, 0px))),
+      transparent calc(100% - var(--scroll-end-cover, 0px))
+    ),
+    linear-gradient(black, black);
+  -webkit-mask-position: left, right;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size:
+    100% 100%,
+    var(--app-scrollbar-width) 100%;
+  mask-image:
+    linear-gradient(
+      to bottom,
+      black calc(100% - var(--scroll-end-cover, 0px) - min(0.5rem, var(--scroll-end-cover, 0px))),
+      transparent calc(100% - var(--scroll-end-cover, 0px))
+    ),
+    linear-gradient(black, black);
+  mask-position: left, right;
+  mask-repeat: no-repeat;
+  mask-size:
+    100% 100%,
     var(--app-scrollbar-width) 100%;
 }
 
@@ -727,30 +769,9 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(stark-mo
     display: none;
   }
 
-  /* Each maintainer palette gives the same line art its own material: rose
-     vellum, forest drafting paper, marine cyanotype, copper, and violet ink.
-     These colors stay deliberately deep at the top edge so the white stage
-     wordmark and controls retain contrast in both appearance modes. */
-  html[data-theme-id="stark-chat"] {
-    --stage-art-top: oklch(0.760675 0.141361 348.019);
-    --stage-art-mid: oklch(0.588093 0.188832 353.138);
-    --stage-art-bottom: oklch(0.383959 0.135096 348.656);
-    --stage-art-highlight: oklch(0.949689 0.034241 339.171);
-    --stage-art-secondary: oklch(0.763402 0.163836 352.525);
-    --stage-art-tertiary: oklch(0.70819 0.180285 311.949);
-    --stage-art-line: oklch(0.952158 0.034194 336.179);
-
-    @variant dark {
-      --stage-art-top: oklch(0.540689 0.143665 347.587);
-      --stage-art-mid: oklch(0.396586 0.126592 347.6);
-      --stage-art-bottom: oklch(0.249959 0.079694 340.523);
-      --stage-art-highlight: oklch(0.921297 0.051708 343.229);
-      --stage-art-secondary: oklch(0.667398 0.165674 352.549);
-      --stage-art-tertiary: oklch(0.609315 0.163722 306.315);
-      --stage-art-line: oklch(0.945349 0.036045 341.433);
-    }
-  }
-
+  /* Stark keeps the original blue blueprint. Other maintainer palettes give
+     the line art their own material: forest paper, marine cyanotype, copper,
+     and violet ink, with contrast for the white wordmark in both modes. */
   html[data-theme-id="grove"] {
     --stage-art-top: oklch(0.751465 0.112731 157.313);
     --stage-art-mid: oklch(0.567105 0.11099 158.859);

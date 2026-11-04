@@ -1,9 +1,4 @@
-import {
-  Outlet,
-  createFileRoute,
-  redirect,
-  useLocation,
-} from "@tanstack/react-router";
+import { Outlet, createFileRoute, redirect, useLocation } from "@tanstack/react-router";
 import { useState, type ReactNode } from "react";
 import { RotateCcwIcon } from "lucide-react";
 import { Button } from "../components/ui/button";
@@ -33,13 +28,8 @@ import {
   isSettingsSearchScopeAvailable,
 } from "../components/settings/settingsSearch";
 
-function RestoreDeviceDefaultsButton({
-  onRestored,
-}: {
-  onRestored: () => void;
-}) {
-  const { changedSettingLabels, restoreDefaults } =
-    useSettingsRestore(onRestored);
+function RestoreDeviceDefaultsButton({ onRestored }: { onRestored: () => void }) {
+  const { changedSettingLabels, restoreDefaults } = useSettingsRestore(onRestored);
   return (
     <Button
       size="xs"
@@ -53,13 +43,7 @@ function RestoreDeviceDefaultsButton({
   );
 }
 
-function SettingsScopeBoundary({
-  pathname,
-  children,
-}: {
-  pathname: string;
-  children: ReactNode;
-}) {
+function SettingsScopeBoundary({ pathname, children }: { pathname: string; children: ReactNode }) {
   const { scope, connectedEnvironments } = useSettingsScope();
   const { environments } = useEnvironments();
   const hash = useLocation({ select: (location) => location.hash });
@@ -77,9 +61,7 @@ function SettingsScopeBoundary({
       <SettingsScopeNotice
         target="environment"
         targetId={hash}
-        eligibleEnvironmentIds={
-          autoSettlementAvailability.eligibleEnvironmentIds
-        }
+        eligibleEnvironmentIds={autoSettlementAvailability.eligibleEnvironmentIds}
       >
         {autoSettlementAvailability.eligibleEnvironmentIds.length > 0
           ? `${searchTarget.title} requires a supporting environment. Choose one to continue.`
@@ -106,10 +88,7 @@ function SettingsScopeBoundary({
   }
   // Device-local pages ignore the scope entirely; the project page follows
   // remembered members while a grouping change replaces its URL key.
-  if (
-    SETTINGS_DEVICE_ONLY_PATHS.has(pathname) ||
-    pathname === "/settings/projects"
-  ) {
+  if (SETTINGS_DEVICE_ONLY_PATHS.has(pathname) || pathname === "/settings/projects") {
     return children;
   }
   // Keep the scope sentence on screen so the selection can be changed back.
@@ -137,8 +116,7 @@ function SettingsContentLayout() {
   useEscapeToGoBack(navigateToMainApp);
   const { search, environment } = useSettingsScope();
   const contentScopeKey =
-    location.pathname === "/settings/diagnostics" ||
-    location.pathname === "/settings/providers"
+    location.pathname === "/settings/diagnostics" || location.pathname === "/settings/providers"
       ? environment?.environmentId
       : JSON.stringify(search);
   const [restoreSignal, setRestoreSignal] = useState(0);
@@ -160,10 +138,7 @@ function SettingsContentLayout() {
             </div>
           </WorkspacePageHeader>
 
-          <div
-            key={`${contentScopeKey}:${restoreSignal}`}
-            className="min-h-0 flex flex-1 flex-col"
-          >
+          <div key={`${contentScopeKey}:${restoreSignal}`} className="min-h-0 flex flex-1 flex-col">
             <SettingsScopeBoundary pathname={location.pathname}>
               <Outlet />
             </SettingsScopeBoundary>
@@ -182,8 +157,7 @@ function SettingsRouteLayout() {
     <SettingsScopeProvider
       search={rawSearch}
       singleEnvironment={
-        pathname === "/settings/providers" ||
-        pathname === "/settings/existing-integrations"
+        pathname === "/settings/providers" || pathname === "/settings/existing-integrations"
       }
       onChange={(next) => {
         // Send every axis so the retain middleware sees an explicit target

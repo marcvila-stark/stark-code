@@ -1,5 +1,8 @@
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -9,6 +12,7 @@ import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 
 import * as Electron from "electron";
 
@@ -103,10 +107,14 @@ export function makeDesktopContentSecurityPolicy(input: DesktopProtocolRegistrat
   ].join("; ");
 }
 
-function withContentSecurityPolicy(response: Response, policy: string): Response {
+function withContentSecurityPolicy(
+  response: Response,
+  policy: string,
+  body: ReadableStream<Uint8Array> | null = response.body,
+): Response {
   const headers = new Headers(response.headers);
   headers.set("Content-Security-Policy", policy);
-  return new Response(response.body, {
+  return new Response(body, {
     status: response.status,
     statusText: response.statusText,
     headers,
@@ -157,7 +165,8 @@ class ElectronProtocolFetchError extends Schema.TaggedError<ElectronProtocolFetc
 
 const netFetch = (url: string, init: RequestInit) =>
   Effect.tryPromise({
-    try: () => Electron.net.fetch(url, init),
+    // Interruption (the renderer aborting the request) aborts the upstream fetch.
+    try: (signal) => Electron.net.fetch(url, { ...init, signal }),
     catch: (cause) => new ElectronProtocolFetchError({ cause }),
   });
 
@@ -168,10 +177,96 @@ const fetchWithTransientRetry = (url: string, init: RequestInit) =>
     Effect.retry({ schedule: Schedule.exponential("50 millis", 3), times: 2 }),
   );
 
+// Each forwarded request keeps a main-process `net.fetch` loader open until its
+// body is read to the end or cancelled. A cold unbundled Vite start requests
+// the module graph as fast as the renderer discovers imports, and those fetches
+// failed with net::ERR_INSUFFICIENT_RESOURCES. Requests past this bound wait
+// here instead of opening more loaders.
+const MAX_IN_FLIGHT_PROXY_REQUESTS = 64;
+
+// Nothing guarantees that a body the renderer abandons (a reload mid-load) is
+// ever cancelled, so a body that neither ends nor is cancelled returns its slot
+// after this lease. Local Vite bodies settle in milliseconds.
+const PROXY_BODY_LEASE = "2 seconds";
+
+// Passes the body through and calls `onSettled` once it ends, errors, or is
+// cancelled by the renderer.
+function notifyWhenBodySettles(
+  body: ReadableStream<Uint8Array>,
+  onSettled: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  let cancelled = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        onSettled();
+        controller.error(error);
+        return;
+      }
+      // A cancel during the read resolves it as done; the stream is already closed.
+      if (cancelled) return;
+      if (chunk.done) {
+        onSettled();
+        controller.close();
+      } else {
+        controller.enqueue(chunk.value);
+      }
+    },
+    cancel(reason) {
+      cancelled = true;
+      onSettled();
+      return reader.cancel(reason);
+    },
+  });
+}
+
+// The permit outlives the handler, which returns once headers arrive, so a
+// separate fiber holds it from queueing through fetch and body. Interrupting
+// the handler (the renderer aborting) interrupts that fiber wherever it is:
+// queued, fetching, or waiting on the body.
+const forwardWithinBound = Effect.fnUntraced(function* (
+  permits: Semaphore.Semaphore,
+  forward: Effect.Effect<Response, ElectronProtocolFetchError>,
+  contentSecurityPolicy: string,
+) {
+  const response = yield* Deferred.make<Response, ElectronProtocolFetchError>();
+  const bodySettled = yield* Deferred.make<void>();
+  const settle = () => Deferred.doneUnsafe(bodySettled, Effect.void);
+  const holder = yield* Effect.gen(function* () {
+    const exit = yield* Effect.exit(
+      Effect.map(forward, (upstream) => {
+        if (upstream.body === null) {
+          settle();
+          return withContentSecurityPolicy(upstream, contentSecurityPolicy);
+        }
+        return withContentSecurityPolicy(
+          upstream,
+          contentSecurityPolicy,
+          notifyWhenBodySettles(upstream.body, settle),
+        );
+      }),
+    );
+    yield* Deferred.done(response, exit);
+    if (Exit.isSuccess(exit)) {
+      yield* Effect.timeoutOption(Deferred.await(bodySettled), PROXY_BODY_LEASE);
+    }
+  }).pipe(
+    permits.withPermits(1),
+    Effect.ensuring(Deferred.interrupt(response)),
+    Effect.forkDetach({ startImmediately: true }),
+  );
+  return yield* Deferred.await(response).pipe(Effect.onInterrupt(() => Fiber.interrupt(holder)));
+});
+
 const proxyRequest = Effect.fn("desktop.protocol.proxyRequest")(function* (
   request: Request,
   targetOrigin: URL,
   contentSecurityPolicy: string,
+  permits: Semaphore.Semaphore,
 ) {
   const requestUrl = new URL(request.url);
   if (requestUrl.host !== DESKTOP_HOST) {
@@ -206,11 +301,13 @@ const proxyRequest = Effect.fn("desktop.protocol.proxyRequest")(function* (
     init.body = request.body;
     (init as RequestInit & { duplex: "half" }).duplex = "half";
   }
-  const response =
+  return yield* forwardWithinBound(
+    permits,
     request.method === "GET" || request.method === "HEAD"
-      ? yield* fetchWithTransientRetry(targetUrl.toString(), init)
-      : yield* netFetch(targetUrl.toString(), init);
-  return withContentSecurityPolicy(response, contentSecurityPolicy);
+      ? fetchWithTransientRetry(targetUrl.toString(), init)
+      : netFetch(targetUrl.toString(), init),
+    contentSecurityPolicy,
+  );
 });
 
 // Serves the packaged web client without a backend: files resolve within the
@@ -257,6 +354,7 @@ const serveDesktopAsset = Effect.fn("desktop.protocol.serveAsset")(function* (
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const registered = yield* Ref.make(false);
+  const proxyPermits = yield* Semaphore.make(MAX_IN_FLIGHT_PROXY_REQUESTS);
   const context = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
   const runPromise = Effect.runPromiseWith(context);
 
@@ -278,11 +376,12 @@ export const make = Effect.gen(function* () {
               }
               // Reject with net.fetch's own error, as an unproxied fetch would.
               return runPromise(
-                proxyRequest(request, input.targetOrigin, contentSecurityPolicy).pipe(
+                proxyRequest(request, input.targetOrigin, contentSecurityPolicy, proxyPermits).pipe(
                   Effect.catchTags({
                     ElectronProtocolFetchError: (error) => Effect.die(error.cause),
                   }),
                 ),
+                { signal: request.signal },
               );
             });
           },

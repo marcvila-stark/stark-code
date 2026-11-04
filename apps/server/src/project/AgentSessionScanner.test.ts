@@ -2449,6 +2449,94 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }
     }
 
+    it.effect("leaves out sessions Stark ran, before reading them when the file name tells", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("starkcode-ran-in-stark-claude-");
+        const codexHomePath = yield* makeTempDir("starkcode-ran-in-stark-codex-");
+        const workspace = yield* makeTempDir("starkcode-ran-in-stark-workspace-");
+        const claudeStarkSession = "6f1c2f0e-3b7a-4c55-9d7e-1a2b3c4d5e6f";
+        const codexStarkSession = "0199a3c1-7d2e-7f00-8a11-2b3c4d5e6f70";
+        const codexStarkSessionInside = "codex-session-from-stark";
+        const claudeDirectory = path.join(claudeHomePath, "projects", "-workspace");
+        const codexDirectory = path.join(codexHomePath, "sessions", "2026", "08", "24");
+        // No user message: a full read would report it skipped.
+        yield* writeTranscript({
+          filePath: path.join(claudeDirectory, `${claudeStarkSession}.jsonl`),
+          contents: `${encodeTranscriptRecord({ type: "system", cwd: workspace, sessionId: claudeStarkSession })}\n`,
+          mtimeMs: nowMs,
+        });
+        yield* writeTranscript({
+          filePath: path.join(
+            codexDirectory,
+            `rollout-2026-08-24T11-00-00-${codexStarkSession}.jsonl`,
+          ),
+          contents: `${encodeTranscriptRecord({ type: "session_meta", payload: { id: codexStarkSession, cwd: workspace } })}\n`,
+          mtimeMs: nowMs - 1_000,
+        });
+        // The id is only inside the transcript, so it is read and then left out.
+        yield* writeTranscript({
+          filePath: path.join(codexDirectory, "rollout-stark.jsonl"),
+          contents: [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: codexStarkSessionInside, cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: "Prompt sent from Stark" },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs - 2_000,
+        });
+        yield* writeTranscript({
+          filePath: path.join(codexDirectory, "rollout-cli.jsonl"),
+          contents: [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: "codex-session-from-cli", cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: "Prompt typed in the CLI" },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs - 3_000,
+        });
+
+        const asked: Array<string> = [];
+        const outcomes = yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          return yield* scanner
+            .recentThreads(workspace, [], (session) => {
+              asked.push(`${session.provider}:${session.providerSessionId}`);
+              return [claudeStarkSession, codexStarkSession, codexStarkSessionInside].includes(
+                session.providerSessionId,
+              );
+            })
+            .pipe(Stream.runCollect);
+        }).pipe(Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })));
+
+        expect(outcomes.map((outcome) => outcome._tag)).toEqual([
+          "RanInStark",
+          "RanInStark",
+          "RanInStark",
+          "Importable",
+        ]);
+        expect(outcomes[3]).toMatchObject({
+          thread: { providerSessionId: "codex-session-from-cli" },
+        });
+        expect(asked).toEqual([
+          `claudeAgent:${claudeStarkSession}`,
+          `codex:${codexStarkSession}`,
+          `codex:${codexStarkSessionInside}`,
+          "codex:codex-session-from-cli",
+        ]);
+      }),
+    );
+
     it.effect("checks file identity and provider before skipping completed history", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
@@ -3737,6 +3825,78 @@ describe("parseAgentSessionTranscript", () => {
     });
 
     expect(thread?.messages.map((message) => message.text)).toEqual([quoted]);
+  });
+
+  it("names a Claude session after the person's prompt, not Stark's context", () => {
+    const context =
+      "<stark_code_preview_browser>Stark's preview browser is not installed, so `html_preview` cannot screenshot pages.</stark_code_preview_browser>";
+    const record = (timestamp: string, type: "user" | "assistant", content: unknown) =>
+      JSON.stringify({
+        type,
+        sessionId: "claude-session",
+        timestamp,
+        message: { role: type, content },
+      });
+    const parse = (...lines: ReadonlyArray<string>) =>
+      AgentSessionScanner.parseAgentSessionTranscript({
+        contents: lines.join("\n"),
+        source: "claudeAgent",
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        fallbackSessionId: "claude-session",
+        lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+      });
+
+    // Stark sends its context as the first block of the person's message.
+    const sameMessage = parse(
+      record("2026-08-24T10:00:00.000Z", "user", [
+        { type: "text", text: context },
+        { type: "text", text: "Update the farewell greeting" },
+      ]),
+      record("2026-08-24T10:01:00.000Z", "assistant", [{ type: "text", text: "Updated" }]),
+    );
+    expect(sameMessage?.title).toBe("Update the farewell greeting");
+    expect(sameMessage?.messages.map((message) => message.text)).toEqual([
+      "Update the farewell greeting",
+      "Updated",
+    ]);
+
+    const onlyContext = parse(
+      record("2026-08-24T10:00:00.000Z", "user", context),
+      record("2026-08-24T10:01:00.000Z", "assistant", [{ type: "text", text: "Noted" }]),
+    );
+    expect(onlyContext?.title).toBe("Untitled session");
+    expect(onlyContext?.messages.map((message) => message.text)).toEqual(["Noted"]);
+
+    // Only Stark's own tag prefix counts as context.
+    const otherMarkup = parse(
+      record("2026-08-24T10:00:00.000Z", "user", "<context>Fix the login page</context>"),
+    );
+    expect(otherMarkup?.title).toBe("<context>Fix the login page</context>");
+  });
+
+  it("names a Codex session after the person's prompt, not Stark's context", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        encodeTranscriptRecord({ type: "session_meta", payload: { id: "codex-session" } }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "<stark_code_runtime>Running inside Stark Code.</stark_code_runtime>",
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: { type: "user_message", message: "Rename the farewell helper" },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "unused",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+    expect(thread?.title).toBe("Rename the farewell helper");
+    expect(thread?.messages.map((message) => message.text)).toEqual(["Rename the farewell helper"]);
   });
 
   it("skips sessions without a visible user message", () => {

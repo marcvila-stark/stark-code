@@ -38,7 +38,7 @@ export class ServerSelfUpdate extends Context.Service<
   }
 >()("stark-code/cloud/selfUpdate/ServerSelfUpdate") {}
 
-export const withRunningThreadContinuation = Effect.fn(
+const withRunningThreadContinuation = Effect.fn(
   "cloud.server_self_update.withRunningThreadContinuation",
 )(function* (input: {
   readonly mode: ServerConfig.RuntimeMode;

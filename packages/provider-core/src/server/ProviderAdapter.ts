@@ -18,7 +18,9 @@ import {
   OrchestrationV2RuntimeRequest,
   OrchestrationV2Subagent,
   OrchestrationV2TurnItem,
+  PermissionSource,
   ProviderApprovalDecision,
+  ProviderApprovalOptionId,
   ProviderInteractionMode,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -36,6 +38,7 @@ import {
   McpServerSignInStart,
   McpServersReloadResult,
   ProviderContextBreakdown,
+  PreviewBrowserStatus,
   ThreadId,
 } from "@starkfuture/contracts";
 import * as Context from "effect/Context";
@@ -52,6 +55,12 @@ import type {
 export const ProviderAdapterV2RuntimePolicy = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  /**
+   * `inherit`: send no permission settings, so the provider applies its own
+   * configuration. Set only for a driver that reports `nativePermissionInherit`;
+   * missing means `override`, and `runtimeMode` is sent as today.
+   */
+  permissionSource: Schema.optional(PermissionSource),
   cwd: Schema.NullOr(Schema.String),
   approvalPolicy: Schema.optional(Schema.Unknown),
   sandboxPolicy: Schema.optional(Schema.Unknown),
@@ -135,6 +144,12 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     threadId: Schema.optional(ThreadId),
     runtimeRequest: OrchestrationV2RuntimeRequest,
+    /**
+     * The provider closed the request itself (Codex `serverRequest/resolved`).
+     * The adapter stopped waiting without answering; the orchestrator expires
+     * an unanswered request or marks an answered one `not_needed`.
+     */
+    closedByProvider: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("plan.updated"),
@@ -332,6 +347,11 @@ export class ProviderAdapterRuntimeRequestResponseError extends Schema.TaggedErr
   {
     driver: ProviderDriverKind,
     requestId: RuntimeRequestId,
+    /**
+     * The adapter proved nothing was waiting for this answer, so the provider
+     * never received it and nothing ran. Absent means delivery is uncertain.
+     */
+    nothingWaiting: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -429,6 +449,12 @@ export interface ProviderAdapterV2TurnInput {
    * application context; others never receive any.
    */
   readonly appContext?: ReadonlyArray<{ readonly key: string; readonly text: string }>;
+  /**
+   * Whether Stark's preview browser can serve `html_preview` right now. Adapters
+   * with a per-turn context channel tell the agent when it changes, so it picks
+   * a diagram or page tool knowing what will work.
+   */
+  readonly previewBrowser?: PreviewBrowserStatus;
 }
 
 export interface ProviderAdapterV2SteerInput {
@@ -446,8 +472,39 @@ export interface ProviderAdapterV2InterruptInput {
   readonly requestRuntimeRestart?: boolean;
 }
 
+/**
+ * A chat's requested permissions changed outside a turn, for one provider
+ * thread. `now` stops running work first (Stop and apply now); `after-run`
+ * lets it finish but starts no continuation under the earlier settings.
+ */
+export interface ProviderAdapterV2RuntimePolicyChange {
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
+  readonly timing: "now" | "after-run";
+}
+
+/**
+ * When a permission change takes effect: `unchanged` (the provider already
+ * runs it), `next-turn` (idle; the next turn sends it), `stopped` (running work
+ * was stopped so it applies now), `after-run` (requested and active differ
+ * until the current run stops).
+ */
+export type ProviderAdapterV2RuntimePolicyApplication =
+  | "unchanged"
+  | "next-turn"
+  | "stopped"
+  | "after-run";
+
 export interface ProviderAdapterV2RuntimeRequestResponseInput {
   readonly requestId: RuntimeRequestId;
+  /**
+   * The offered option the user chose. An adapter that issued option ids sends
+   * exactly that option's native response; `decision` stays for adapters that
+   * do not issue ids yet.
+   */
+  readonly optionId?: ProviderApprovalOptionId;
+  /** A reason for the agent, set only for an option that accepts one. */
+  readonly feedback?: string;
   readonly decision?: ProviderApprovalDecision;
   readonly answers?: ProviderUserInputAnswers;
   readonly response?: unknown;
@@ -618,6 +675,14 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly threadId?: ThreadId;
     readonly modelSelection?: ModelSelection;
     readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
+    /**
+     * The native thread holds history made outside Stark (an imported CLI
+     * session) that no Stark turn has resumed yet. An adapter that only opens
+     * the native thread at turn start confirms here that the history still
+     * exists, and fails otherwise, so the caller starts a fresh native thread
+     * with the history as context instead of failing the first turn.
+     */
+    readonly importedNativeHistory?: boolean;
   }) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
   /** False means the native protocol explicitly does not support history injection. */
   readonly injectHistory?: (
@@ -644,6 +709,15 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly interruptTurn: (
     input: ProviderAdapterV2InterruptInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /**
+   * Applies a chat's changed permissions to a live provider thread outside a
+   * turn. Absent means the adapter applies them with the next turn only. The
+   * session runtime does not restart the provider session: a narrowing that
+   * must drop provider-held grants needs the caller to detach the session.
+   */
+  readonly applyRuntimePolicy?: (
+    change: ProviderAdapterV2RuntimePolicyChange,
+  ) => Effect.Effect<ProviderAdapterV2RuntimePolicyApplication, ProviderAdapterV2Error>;
   /** Stops one native child through its owning runtime; the owner keeps running. */
   readonly stopSubagent?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;

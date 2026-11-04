@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import { LocalStarkPage } from "@starkfuture/contracts";
 import type { IpcMainInvokeEvent } from "electron";
 import * as DesktopEnvironment from "../../app/DesktopEnvironment.ts";
+import { DESKTOP_HOST, getDesktopScheme } from "../../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
 import * as DesktopIpc from "../DesktopIpc.ts";
 import * as IpcChannels from "../channels.ts";
@@ -24,15 +25,14 @@ const authorizedCatalog = Effect.fn("desktop.starkPages.authorizedCatalog")(func
     frame !== window.value.webContents.mainFrame
   )
     return false;
+  // The main window always loads getDesktopUrl, so only this build's app scheme is trusted.
   return yield* Effect.try(() => {
     const url = new URL(frame.url);
     return (
       !url.username &&
       !url.password &&
-      ((url.protocol === "starkcode:" && url.hostname === "app") ||
-        (environment.isDevelopment &&
-          Option.isSome(environment.devServerUrl) &&
-          url.origin === environment.devServerUrl.value.origin))
+      url.protocol === `${getDesktopScheme(environment.isDevelopment)}:` &&
+      url.host === DESKTOP_HOST
     );
   }).pipe(Effect.orElseSucceed(() => false));
 });

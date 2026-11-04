@@ -33,6 +33,8 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
    * open menu closes when its trigger hides.
    */
   hidden?: boolean;
+  /** Without the settings-write grant, modes above the narrowest are disabled. */
+  canWriteSettings: boolean;
   onToggleInteractionMode: () => void;
   onRuntimeModeChange: ConfirmRuntimeModeChange;
 }) {
@@ -40,10 +42,10 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
   const size = props.size ?? "sm";
   const [open, setOpen] = useComposerMenuState(props.hidden);
 
-  const options = composerModeOptions(
-    props.runtimeModeOptions,
-    props.combinePlanMode && props.showInteractionModeToggle,
-  );
+  const options = composerModeOptions(props.runtimeModeOptions, {
+    includePlan: props.combinePlanMode && props.showInteractionModeToggle,
+    canWriteSettings: props.canWriteSettings,
+  });
   const selectedMode =
     props.combinePlanMode && props.showInteractionModeToggle && props.interactionMode === "plan"
       ? "plan"
@@ -95,6 +97,7 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
           value={selectedMode}
           onValueChange={(value) => {
             if (!value || value === selectedMode) return;
+            if (options.find((option) => option.mode === value)?.disabledReason) return;
             void applyComposerModeSelection(value as ComposerMode, {
               ...props,
               combinePlanMode: props.combinePlanMode && props.showInteractionModeToggle,
@@ -102,8 +105,19 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
           }}
         >
           {options.map((option) => (
-            <MenuRadioItem key={option.mode} value={option.mode}>
-              {option.label}
+            <MenuRadioItem
+              key={option.mode}
+              value={option.mode}
+              disabled={option.disabledReason !== undefined}
+            >
+              {option.disabledReason ? (
+                <span className="flex min-w-0 flex-col">
+                  <span>{option.label}</span>
+                  <span className="text-muted-foreground text-xs">{option.disabledReason}</span>
+                </span>
+              ) : (
+                option.label
+              )}
             </MenuRadioItem>
           ))}
         </MenuRadioGroup>

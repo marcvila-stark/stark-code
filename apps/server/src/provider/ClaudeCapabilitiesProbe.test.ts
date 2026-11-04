@@ -14,6 +14,8 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
@@ -437,6 +439,51 @@ it.layer(NodeServices.layer)("Claude capability probe SDK boundary", (it) => {
       };
       assert.equal(flagSettings.disableAllHooks, true);
     }).pipe(Effect.scoped),
+  );
+});
+
+it.effect("logs bounded initialization failures without disclosing the SDK error", () => {
+  const messages: unknown[] = [];
+  const logger = Logger.make<unknown, void>(({ message }) => {
+    messages.push(message);
+  });
+  return Effect.gen(function* () {
+    const privateError = "https://user:secret@example.invalid/private?token=credential";
+    const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(
+      () =>
+        ({
+          initializationResult: async () => {
+            throw new Error(privateError);
+          },
+        }) as unknown as ReturnType<typeof ClaudeSdk.query>,
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
+    const result = yield* probeClaudeCapabilities(decodeClaudeSettings({ binaryPath: "claude" }));
+    assert.equal(result, undefined);
+    assert.include(JSON.stringify(messages), "initialization_failed");
+    assert.notInclude(JSON.stringify(messages), privateError);
+    const started = yield* Deferred.make<void>();
+    query.mockImplementation(
+      () =>
+        ({
+          initializationResult: () => {
+            Deferred.doneUnsafe(started, Effect.void);
+            return new Promise(() => {});
+          },
+        }) as unknown as ReturnType<typeof ClaudeSdk.query>,
+    );
+    const probe = yield* probeClaudeCapabilities(
+      decodeClaudeSettings({ binaryPath: "claude" }),
+    ).pipe(Effect.forkChild);
+    yield* Deferred.await(started);
+    yield* TestClock.adjust("25 seconds");
+    assert.equal(yield* Fiber.join(probe), undefined);
+    assert.include(JSON.stringify(messages), '"reason":"timeout"');
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(NodeServices.layer, Logger.layer([logger], { mergeWithExisting: false })),
+    ),
   );
 });
 

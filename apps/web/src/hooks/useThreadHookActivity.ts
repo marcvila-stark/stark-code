@@ -4,7 +4,7 @@ import type { ScopedThreadRef } from "@starkfuture/contracts";
 const listeners = new Set<() => void>();
 const keyFor = (thread: ScopedThreadRef) =>
   `stark-code:hook-activity:${thread.environmentId}:${thread.threadId}`;
-export function readThreadHookActivity(thread: ScopedThreadRef | null): boolean {
+function readThreadHookActivity(thread: ScopedThreadRef | null): boolean {
   if (thread === null) return false;
   try {
     return localStorage.getItem(keyFor(thread)) === "true";
@@ -12,7 +12,7 @@ export function readThreadHookActivity(thread: ScopedThreadRef | null): boolean 
     return false;
   }
 }
-export function setThreadHookActivity(thread: ScopedThreadRef, value: boolean): void {
+function setThreadHookActivity(thread: ScopedThreadRef, value: boolean): void {
   try {
     localStorage.setItem(keyFor(thread), String(value));
   } catch {

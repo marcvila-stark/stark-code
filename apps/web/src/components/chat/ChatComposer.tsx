@@ -14,9 +14,22 @@ import {
   runtimeModeConfig,
   runtimeModeOptionsForProvider,
   composerModeOptions,
+  resolveRuntimeModeDisplay,
   type RuntimeModeOption,
   type ComposerMode,
 } from "./runtimeModeConfig";
+import type { ApprovalResponseInput } from "@starkfuture/client-runtime/approvals/permission-presentation";
+import { PermissionSourcePopover } from "./PermissionSourcePopover";
+import {
+  currentEffectivePermissions,
+  composerPermissionProvider,
+  effectivePermissionsFromThread,
+  effectivePermissionsKey,
+  permissionProviderName,
+  runtimeModeNote,
+  type EffectivePermissionsExpectation,
+  type ThreadPermissionValues,
+} from "./permissionsPresentation.logic";
 import { applyComposerModeSelection, type ConfirmRuntimeModeChange } from "./composerModeSelection";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
@@ -45,6 +58,7 @@ import type {
   PullRequestListInput,
   PreviewAnnotationPayload,
   ProviderApprovalDecision,
+  PermissionSource,
   ThreadContextRecord,
   ProviderInteractionMode,
   ResolvedKeybindingsConfig,
@@ -59,6 +73,7 @@ import type {
 } from "@starkfuture/contracts";
 import {
   AuthOrchestrationOperateScope,
+  newChatPermissionSourceFor,
   ProviderDriverKind,
   ProviderInstanceId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
@@ -301,7 +316,14 @@ import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
+import { useToolApprovalInput } from "./useToolApprovalInput";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
+import { RuntimeRequestResponseNotice } from "./RuntimeRequestResponseNotice";
+import {
+  canAnswerRuntimeRequest,
+  isSendingRuntimeResponse,
+  type RuntimeRequestResponseState,
+} from "@starkfuture/client-runtime/state/runtime-request-response";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
 import {
   ComposerControl,
@@ -1276,16 +1298,25 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
   runtimeModeOptions: ReadonlyArray<RuntimeModeOption>;
   size?: "sm" | "xs";
   hidden?: boolean;
+  /** The permission source chip and its popover, beside the mode picker. */
+  permissionSource?: ReactNode;
+  /**
+   * The tooltip's note from `runtimeModeNote`: a change waiting for the run to stop, or why the
+   * picker shows a mode other than the saved one.
+   */
+  modeNote?: string | undefined;
+  /** Without the settings-write grant, modes above the narrowest are disabled. */
+  canWriteSettings: boolean;
   onToggleInteractionMode: () => void;
   onRuntimeModeChange: ConfirmRuntimeModeChange;
 }) {
   const size = props.size ?? "sm";
   const composerFloatingLayerProps = useComposerMenuProps();
   const [open, setOpen] = useComposerMenuState(props.hidden);
-  const options = composerModeOptions(
-    props.runtimeModeOptions,
-    props.combinePlanMode && props.showInteractionModeToggle,
-  );
+  const options = composerModeOptions(props.runtimeModeOptions, {
+    includePlan: props.combinePlanMode && props.showInteractionModeToggle,
+    canWriteSettings: props.canWriteSettings,
+  });
   const selectedMode =
     props.combinePlanMode && props.showInteractionModeToggle && props.interactionMode === "plan"
       ? "plan"
@@ -1346,6 +1377,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
           value={selectedMode}
           onValueChange={(value) => {
             if (!value) return;
+            if (options.find((option) => option.mode === value)?.disabledReason) return;
             void applyComposerModeSelection(value as ComposerMode, {
               ...props,
               combinePlanMode: props.combinePlanMode && props.showInteractionModeToggle,
@@ -1372,6 +1404,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
                   key={option.mode}
                   value={option.mode}
                   hideIndicator
+                  disabled={option.disabledReason !== undefined}
                   className="min-w-64"
                 >
                   <div className="flex min-w-0 items-center gap-3">
@@ -1381,7 +1414,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
                         {option.label}
                       </span>
                       <span className="text-muted-foreground text-xs leading-4">
-                        {option.description}
+                        {option.disabledReason ?? option.description}
                       </span>
                     </div>
                   </div>
@@ -1390,8 +1423,9 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
             })}
           </SelectPopup>
         </Select>
-        <TooltipPopup side="top">{runtimeModeOption.description}</TooltipPopup>
+        <TooltipPopup side="top">{props.modeNote ?? runtimeModeOption.description}</TooltipPopup>
       </Tooltip>
+      {props.permissionSource}
 
       {interactionModeToggle}
     </>
@@ -1639,6 +1673,12 @@ export interface ChatComposerProps {
   activePendingDraftAnswers: Record<string, PendingUserInputDraftAnswer>;
   activePendingQuestionIndex: number;
   respondingRequestIds: RuntimeRequestId[];
+  /** Whether the shown approval can take an answer now; null keeps the old gating. */
+  activePendingApprovalResponseState?: RuntimeRequestResponseState | null;
+  /** The same for the shown question. */
+  activePendingUserInputResponseState?: RuntimeRequestResponseState | null;
+  /** Sends an unconfirmed answer again under its original command. */
+  onRetryRuntimeResponse?: (requestId: RuntimeRequestId) => void;
 
   // Plan
   showPlanFollowUpPrompt: boolean;
@@ -1650,6 +1690,31 @@ export interface ChatComposerProps {
   // Mode
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
+  /** A saved chat's stored permission source; null for a new chat, which reads its draft. */
+  threadPermissionSource: PermissionSource | null;
+  /** The saved chat's `permissionChangePending`: a change waits for the running turn to stop. */
+  permissionChangePending: boolean;
+  /**
+   * A permission change sent from this client hasn't come back as an event yet; the source and
+   * mode props already show it (`threadPermissionDisplay`).
+   */
+  permissionChangeSaving?: boolean;
+  /** `permissionChangePending.running`: what the session runs until the waiting change applies. */
+  permissionChangeRunning?: ThreadPermissionValues | undefined;
+  /** Asks the server to stop the run and apply the waiting change (`stop-and-apply`). */
+  onStopAndApplyPermissions?: (() => void) | undefined;
+  /**
+   * The saved chat's live provider session (`liveProviderSession`), null when none runs and
+   * undefined before the projection loads; a new or detached session refreshes the popover.
+   */
+  liveProviderSessionId?: string | null | undefined;
+  /**
+   * When that session last reported its live permission settings (`provider_session.updated`);
+   * a new report refreshes the permission popover.
+   */
+  activePermissionsReportedAt?: string | null | undefined;
+  /** Changes where the chat's permissions come from, with the preset an override sends. */
+  onChangePermissionSource?: (permissionSource: PermissionSource, runtimeMode: RuntimeMode) => void;
 
   // Provider / model
   lockedProvider: ProviderDriverKind | null;
@@ -1728,6 +1793,7 @@ export interface ChatComposerProps {
   onRespondToApproval: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
+    response?: ApprovalResponseInput,
   ) => Promise<unknown>;
   onSelectActivePendingUserInputOption: (questionId: string, optionValue: string) => void;
   onAdvanceActivePendingUserInput: () => void;
@@ -1782,7 +1848,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activeThreadEnvironmentId: _activeThreadEnvironmentId,
     activeThread,
     promptHistoryMessages,
-    isServerThread: _isServerThread,
+    isServerThread,
     isLocalDraftThread: _isLocalDraftThread,
     forceExpandedOnMobile,
     projectSelectionRequired,
@@ -1890,7 +1956,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     : false;
   const pendingUserInputs = holdingUserInput ? [] : incomingPendingUserInputs;
   const activePendingProgress = holdingUserInput ? null : incomingPendingProgress;
-  const activePendingIsResponding = !holdingUserInput && incomingPendingIsResponding;
+  const pendingApprovalResponseState = props.activePendingApprovalResponseState ?? null;
+  const toolApprovalInput = useToolApprovalInput(activePendingApproval, environmentId);
+  const pendingUserInputResponseState = props.activePendingUserInputResponseState ?? null;
+  // Offline or still syncing: the question stays visible but takes no answer.
+  const pendingUserInputBlocked =
+    pendingUserInputResponseState !== null &&
+    !canAnswerRuntimeRequest(pendingUserInputResponseState) &&
+    !isSendingRuntimeResponse(pendingUserInputResponseState);
+  const activePendingIsResponding =
+    !holdingUserInput &&
+    (incomingPendingIsResponding ||
+      (pendingUserInputResponseState !== null &&
+        isSendingRuntimeResponse(pendingUserInputResponseState)));
   const isLiteralPendingAnswer = activePendingProgress?.activeQuestion?.initialAnswer !== undefined;
   // Opening a running thread resyncs for a few frames. Show the sync row, and
   // hide the tasks row for it, only when the sync lasts. Logic that depends on
@@ -2276,20 +2354,115 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // disabled.
   const selectedProvider: ProviderDriverKind =
     selectedProviderEntry?.driverKind ?? requestedDriverKind;
-  const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
-  const runtimeModeOptions = runtimeModeOptionsForProvider(selectedProvider);
+  const permissionProviderStatus = composerPermissionProvider({
+    savedInstanceId: isServerThread ? (activeThreadModelSelection?.instanceId ?? null) : null,
+    selectedInstanceId,
+    providers: providerStatuses,
+  });
+  const permissionInstanceId = isServerThread
+    ? (activeThreadModelSelection?.instanceId ?? selectedInstanceId)
+    : selectedInstanceId;
+  const permissionDriver = permissionProviderStatus?.driver ?? ProviderDriverKind.make("unknown");
+  const supportedRuntimeModes = permissionProviderStatus?.supportedRuntimeModes;
+  const runtimeModeOptions = runtimeModeOptionsForProvider(permissionDriver);
   const compatibleRuntimeModeOptions =
     supportedRuntimeModes && supportedRuntimeModes.length > 0
       ? runtimeModeOptions.filter((option) => supportedRuntimeModes.includes(option.mode))
       : runtimeModeOptions;
-  // Older threads can contain a mode their current provider no longer offers.
-  // Display the provider's first supported mode, which is also its safe legacy
-  // fallback, without mutating persisted state until the user makes a choice.
-  const compatibleRuntimeMode = compatibleRuntimeModeOptions.some(
-    (option) => option.mode === runtimeMode,
-  )
-    ? runtimeMode
-    : (compatibleRuntimeModeOptions[0]?.mode ?? runtimeMode);
+  // Older threads can contain a mode their current provider no longer offers. They run as
+  // the provider's first supported mode; the picker selects that mode and says what was saved,
+  // without mutating persisted state until the user makes a choice.
+  const runtimeModeDisplay = resolveRuntimeModeDisplay(
+    compatibleRuntimeModeOptions,
+    runtimeMode,
+    permissionDriver,
+  );
+  const compatibleRuntimeMode = runtimeModeDisplay.mode;
+  const canInheritProviderPermissions = permissionProviderStatus?.nativePermissionInherit === true;
+  // A saved chat's stored source; a new chat's draft choice, else its instance's new-chat
+  // default. The server stores `override` wherever the provider can't inherit.
+  const draftPermissionSource = useComposerDraftStore(
+    (store) => store.getComposerDraft(composerDraftTarget)?.permissionSource,
+  );
+  const requestedPermissionSource =
+    props.threadPermissionSource ??
+    draftPermissionSource ??
+    newChatPermissionSourceFor({
+      driver: permissionDriver,
+      newChatPermissionSource: Object.hasOwn(settings.providerInstances, permissionInstanceId)
+        ? settings.providerInstances[permissionInstanceId]?.newChatPermissionSource
+        : undefined,
+    });
+  const composerPermissionSource: PermissionSource =
+    requestedPermissionSource === "inherit" && canInheritProviderPermissions
+      ? "inherit"
+      : "override";
+  // The server's report for a saved chat: requested, live and configured settings. Until it
+  // answers, or on a server without it, the chat's stored source and preset stand in.
+  const effectivePermissionsThreadId =
+    routeKind === "server" && activeThreadId !== null ? activeThreadId : null;
+  const effectivePermissionsQuery = useEnvironmentQuery(
+    effectivePermissionsThreadId === null
+      ? null
+      : serverEnvironment.readEffectivePermissions({
+          environmentId,
+          input: { threadId: effectivePermissionsThreadId },
+        }),
+  );
+  const refreshEffectivePermissions = effectivePermissionsQuery.refresh;
+  // The chat as the composer shows it. The query caches by thread alone, so its answer is shown
+  // only while it still describes this; otherwise the stored settings stand in until a refresh.
+  const effectivePermissionsExpectation: EffectivePermissionsExpectation | null =
+    effectivePermissionsThreadId === null
+      ? null
+      : {
+          threadId: effectivePermissionsThreadId,
+          providerInstanceId: permissionInstanceId,
+          permissionSource: props.threadPermissionSource ?? composerPermissionSource,
+          runtimeMode,
+          changePending: props.permissionChangePending,
+          providerSessionId: props.liveProviderSessionId,
+          activeReportedAt: props.activePermissionsReportedAt,
+        };
+  // Another chat, a permission change from any client, a pending change starting or settling, a
+  // new or detached provider session, a run starting or stopping, or the provider reporting new
+  // live settings can change what the server reports. The first render refreshes too, so a
+  // remount never trusts an answer cached for an earlier state of the chat. A change sent from
+  // here shows its values before its event lands, so the read made meanwhile describes the old
+  // chat; its landing refreshes again.
+  const effectivePermissionsRevision =
+    effectivePermissionsExpectation === null
+      ? null
+      : [
+          effectivePermissionsKey(effectivePermissionsExpectation),
+          requestedInteractionMode,
+          phase,
+          props.permissionChangeSaving === true ? "saving" : "saved",
+        ].join(":");
+  const reportedEffectivePermissionsRevision = useRef<string | null>(null);
+  useEffect(() => {
+    if (reportedEffectivePermissionsRevision.current === effectivePermissionsRevision) return;
+    reportedEffectivePermissionsRevision.current = effectivePermissionsRevision;
+    if (effectivePermissionsRevision !== null) refreshEffectivePermissions();
+  }, [effectivePermissionsRevision, refreshEffectivePermissions]);
+  const reportedPermissions =
+    effectivePermissionsExpectation === null
+      ? null
+      : currentEffectivePermissions(
+          effectivePermissionsQuery.data,
+          effectivePermissionsExpectation,
+        );
+  const composerPermissions =
+    reportedPermissions !== null
+      ? reportedPermissions
+      : effectivePermissionsFromThread({
+          threadId: routeThreadRef.threadId,
+          providerInstanceId: permissionInstanceId,
+          driver: permissionDriver,
+          permissionSource: composerPermissionSource,
+          runtimeMode: compatibleRuntimeMode,
+          interactionMode: requestedInteractionMode,
+        });
 
   const { modelOptions: composerModelOptions, selectedModel } = useEffectiveComposerModelState({
     threadRef: composerDraftTarget,
@@ -2335,23 +2508,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     reportFailure: false,
   });
   const usageProviderInstanceId = selectedProviderStatus?.instanceId;
-  const refreshSelectedUsage = useCallback(async () => {
-    if (!usageProviderInstanceId) return;
-    const result = await refreshProviders({
-      environmentId,
-      input: { instanceId: usageProviderInstanceId },
-    });
-    const refreshed =
-      result._tag === "Success"
-        ? result.value.providers.find((provider) => provider.instanceId === usageProviderInstanceId)
-        : undefined;
-    if (
-      !refreshed?.usageLimits ||
-      refreshed.usageLimits.unavailable?.reason === "probeFailed" ||
-      refreshed.usageLimits.refreshError
-    )
-      throw new Error("Usage could not be refreshed.");
-  }, [environmentId, refreshProviders, usageProviderInstanceId]);
+  const refreshSelectedUsage = useCallback(
+    async ({ fresh }: { fresh: boolean }) => {
+      if (!usageProviderInstanceId) return;
+      const result = await refreshProviders({
+        environmentId,
+        input: { instanceId: usageProviderInstanceId, fresh },
+      });
+      const refreshed =
+        result._tag === "Success"
+          ? result.value.providers.find(
+              (provider) => provider.instanceId === usageProviderInstanceId,
+            )
+          : undefined;
+      if (
+        !refreshed?.usageLimits ||
+        refreshed.usageLimits.unavailable?.reason === "probeFailed" ||
+        refreshed.usageLimits.refreshError
+      )
+        throw new Error("Usage could not be refreshed.");
+    },
+    [environmentId, refreshProviders, usageProviderInstanceId],
+  );
   // The last scan this composer asked for. A request inside the TTL is not
   // repeated, so a client clock ahead of the server's cannot loop rescans.
   const workspaceRefreshKeyRef = useRef<{ key: string; requestedAt: number } | null>(null);
@@ -3160,10 +3338,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               !attachmentBlockReason &&
               !(questionPreparations[attachmentTargetKey] ?? 0),
             isResponding: activePendingIsResponding,
-            isComplete: Boolean(activePendingResolvedAnswers),
+            isComplete: Boolean(activePendingResolvedAnswers) && !pendingUserInputBlocked,
           }
         : null,
     [
+      pendingUserInputBlocked,
       activePendingIsResponding,
       activePendingProgress,
       activePendingResolvedAnswers,
@@ -5677,12 +5856,54 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       content: (
         <ComposerFooterModeControls
           showInteractionModeToggle={planModeUiEnabled}
-          combinePlanMode={selectedProvider === "claudeAgent"}
+          combinePlanMode={permissionDriver === "claudeAgent"}
           interactionMode={interactionMode}
           runtimeMode={compatibleRuntimeMode}
           runtimeModeOptions={compatibleRuntimeModeOptions}
           size={composerControlsCollapsed ? "xs" : "sm"}
           hidden={composerControlsHidden || restingHiddenBlockCount > 0}
+          modeNote={runtimeModeNote({
+            changePending: props.permissionChangePending,
+            saving: props.permissionChangeSaving,
+            savedModeNote: runtimeModeDisplay.saved?.note,
+          })}
+          canWriteSettings={canRememberApproval}
+          permissionSource={
+            <PermissionSourcePopover
+              permissions={composerPermissions}
+              providerDisplayName={permissionProviderStatus?.displayName}
+              runActive={phase === "running"}
+              changePending={props.permissionChangePending}
+              changeSaving={props.permissionChangeSaving}
+              canInherit={canInheritProviderPermissions}
+              canWriteSettings={canRememberApproval}
+              onChangeSource={
+                props.onChangePermissionSource && canOperateThread
+                  ? (target) =>
+                      props.onChangePermissionSource?.(
+                        target,
+                        // Overriding a saved chat at anything but the narrowest preset needs the
+                        // settings grant (O12); without it the chat takes the narrowest.
+                        target === "override" &&
+                          props.threadPermissionSource !== null &&
+                          !canRememberApproval
+                          ? "approval-required"
+                          : compatibleRuntimeMode,
+                      )
+                  : undefined
+              }
+              pendingRunning={props.permissionChangeRunning}
+              onStopAndApply={props.onStopAndApplyPermissions}
+              savedMode={runtimeModeDisplay.saved}
+              runsAsLabel={
+                compatibleRuntimeModeOptions.find((option) => option.mode === compatibleRuntimeMode)
+                  ?.label
+              }
+              size={composerControlsCollapsed ? "xs" : "sm"}
+              hidden={composerControlsHidden || restingHiddenBlockCount > 0}
+              onKeepRunningMode={() => void handleRuntimeModeChange(compatibleRuntimeMode)}
+            />
+          }
           onToggleInteractionMode={toggleInteractionMode}
           onRuntimeModeChange={handleRuntimeModeChange}
         />
@@ -5870,7 +6091,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         )}
       >
         <CompactComposerControlsMenu
-          combinePlanMode={selectedProvider === "claudeAgent"}
+          combinePlanMode={permissionDriver === "claudeAgent"}
           interactionMode={interactionMode}
           runtimeMode={compatibleRuntimeMode}
           runtimeModeOptions={compatibleRuntimeModeOptions}
@@ -5878,8 +6099,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           hidden={composerControlsHidden || hiddenRestingBlockIds.length === 0}
           showInteractionModeToggle={
             planModeUiEnabled &&
-            (selectedProvider === "claudeAgent" || hiddenRestingBlockIds.includes("mode"))
+            (permissionDriver === "claudeAgent" || hiddenRestingBlockIds.includes("mode"))
           }
+          canWriteSettings={canRememberApproval}
           onToggleInteractionMode={toggleInteractionMode}
           onRuntimeModeChange={handleRuntimeModeChange}
         />
@@ -7215,7 +7437,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             <ComposerBanner.Attachment>
               <ComposerBanner.Root
                 data-chat-composer-top-drawer="true"
-                variant={activePendingApproval ? "warning" : "info"}
+                variant="info"
                 density={activePendingApproval ? "spacious" : "default"}
               >
                 {activePendingApproval ? (
@@ -7229,19 +7451,47 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     <ComposerBanner.Content>
                       <ComposerPendingApprovalPanel
                         approval={activePendingApproval}
+                        cwd={gitCwd ?? undefined}
                         pendingCount={pendingApprovals.length}
+                        toolCallInput={toolApprovalInput}
+                        scope={activePendingApproval.scope}
                       />
                     </ComposerBanner.Content>
                     <ComposerBanner.Actions>
+                      {pendingApprovalResponseState ? (
+                        // Its own row above the buttons; empty in the ready state. Inline-size
+                        // containment keeps the caption from widening the actions column, which
+                        // squeezed the proposed diff beside it.
+                        <span className="flex basis-full justify-end text-end contain-inline-size empty:hidden">
+                          <RuntimeRequestResponseNotice
+                            state={pendingApprovalResponseState}
+                            onRetry={() =>
+                              props.onRetryRuntimeResponse?.(activePendingApproval.requestId)
+                            }
+                            delivery={activePendingApproval.delivery}
+                            providerName={permissionProviderName(
+                              selectedProvider,
+                              selectedProviderEntry?.snapshot.displayName,
+                            )}
+                          />
+                        </span>
+                      ) : null}
                       <ComposerPendingApprovalActions
                         requestId={activePendingApproval.requestId}
                         disabled={!canOperateThread}
-                        isResponding={respondingRequestIds.includes(
-                          activePendingApproval.requestId,
-                        )}
+                        isResponding={
+                          respondingRequestIds.includes(activePendingApproval.requestId) ||
+                          (pendingApprovalResponseState !== null &&
+                            isSendingRuntimeResponse(pendingApprovalResponseState))
+                        }
                         options={activePendingApproval.options}
-                        canRespond={activePendingApproval.responseCapability === "live"}
+                        canRespond={
+                          activePendingApproval.responseCapability === "live" &&
+                          (pendingApprovalResponseState === null ||
+                            canAnswerRuntimeRequest(pendingApprovalResponseState))
+                        }
                         canRemember={canRememberApproval && canOperateThread}
+                        defaultToNo={activePendingApproval.scope?.defaultToNo}
                         onRespondToApproval={onRespondToApproval}
                       />
                     </ComposerBanner.Actions>
@@ -7251,7 +7501,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     pendingUserInputs={pendingUserInputs}
                     cwd={gitCwd ?? undefined}
                     threadRef={routeThreadRef}
-                    disabled={!canOperateThread}
+                    disabled={!canOperateThread || pendingUserInputBlocked}
+                    responseState={pendingUserInputResponseState}
+                    onRetryResponse={props.onRetryRuntimeResponse}
                     respondingRequestIds={
                       activePendingIsResponding && activePendingUserInput
                         ? [...respondingRequestIds, activePendingUserInput.requestId]
@@ -7274,7 +7526,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       pendingUserInputs={pendingUserInputs}
                       cwd={gitCwd ?? undefined}
                       threadRef={routeThreadRef}
-                      disabled={!canOperateThread}
+                      disabled={!canOperateThread || pendingUserInputBlocked}
+                      responseState={pendingUserInputResponseState}
+                      onRetryResponse={props.onRetryRuntimeResponse}
                       respondingRequestIds={
                         activePendingIsResponding && activePendingUserInput
                           ? [...respondingRequestIds, activePendingUserInput.requestId]

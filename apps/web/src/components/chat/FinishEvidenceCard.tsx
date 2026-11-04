@@ -1,9 +1,17 @@
 import { ListIcon, XIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { Popover, PopoverClose, PopoverPopup, PopoverTitle, PopoverTrigger } from "../ui/popover";
-import type { FinishCommandEvidence, FinishEvidence } from "./finishEvidence";
+import {
+  finishApprovalDeliveryNotes,
+  finishApprovalDeliverySummary,
+  type FinishCheckEvidence,
+  type FinishCommandEvidence,
+  type FinishEvidence,
+} from "./finishEvidence";
+import { checkRanAfterLabel, turnCheckNeedsFix, turnCheckResultLabel } from "./turnChecks";
 
 function commandResult(command: FinishCommandEvidence): string {
+  if (command.outcome === "declined") return "Declined: did not run";
   if (command.outcome === "tool-completed") return "Tool completed · exit code not reported";
   if (command.outcome === "unfinished") return "Completion not recorded";
   if (command.outcome === "failed")
@@ -13,11 +21,44 @@ function commandResult(command: FinishCommandEvidence): string {
   return command.exitCode === null ? "Exit code not reported" : `Exit ${command.exitCode}`;
 }
 
-/** Recorded details only; opening this never runs a command or calls a model. */
-export function FinishEvidenceCard({ evidence }: { readonly evidence: FinishEvidence | null }) {
-  if (!evidence) return null;
+function checkNeedsAttention(check: FinishCheckEvidence): boolean {
   return (
-    <div className="my-1 flex items-center">
+    turnCheckNeedsFix(check.check) ||
+    check.outcome === "unknown" ||
+    check.outcome === "stopped" ||
+    check.outcome === "skipped" ||
+    check.freshness === "later-work"
+  );
+}
+
+/** Recorded details only; opening this never runs a command or calls a model. */
+export function FinishEvidenceCard({
+  evidence,
+  onOpenCheckOutput,
+  onAskForFix,
+}: {
+  readonly evidence: FinishEvidence | null;
+  /** Opens a check's saved full-output log. */
+  readonly onOpenCheckOutput?: (path: string) => void;
+  /** Drafts a correction request for a failed check into the composer. */
+  readonly onAskForFix?: (check: FinishCheckEvidence) => void;
+}) {
+  if (!evidence) return null;
+  const turnLabel =
+    evidence.turnOrdinal === undefined ? "this turn" : `Turn ${evidence.turnOrdinal}`;
+  const deliverySummary = finishApprovalDeliverySummary(evidence);
+  const declinedSummary = [
+    evidence.declinedCount
+      ? `${evidence.declinedCount} ${evidence.declinedCount === 1 ? "command" : "commands"} declined`
+      : null,
+    evidence.declinedFileChanges
+      ? `${evidence.declinedFileChanges} ${evidence.declinedFileChanges === 1 ? "file change" : "file changes"} declined`
+      : null,
+  ]
+    .filter((part) => part !== null)
+    .join(" · ");
+  return (
+    <div className="my-1 flex flex-wrap items-center gap-2">
       <Popover key={evidence.runId}>
         <PopoverTrigger
           aria-label="Reply details"
@@ -50,6 +91,19 @@ export function FinishEvidenceCard({ evidence }: { readonly evidence: FinishEvid
               {evidence.captureIncomplete ? (
                 <p className="text-muted-foreground">
                   Some activity could not be captured. Missing results are unknown.
+                </p>
+              ) : null}
+              {declinedSummary ? <p className="text-muted-foreground">{declinedSummary}</p> : null}
+              {finishApprovalDeliveryNotes(evidence).map((note) => (
+                <p key={note} className="text-warning-foreground">
+                  {note}
+                </p>
+              ))}
+              {evidence.declinedFileChanges ? (
+                <p className="text-muted-foreground">
+                  {evidence.declinedFileChanges === 1
+                    ? "1 declined file change was not written."
+                    : `${evidence.declinedFileChanges} declined file changes were not written.`}
                 </p>
               ) : null}
               {evidence.runStatus !== "completed" ? <p>Reply {evidence.runStatus}.</p> : null}
@@ -125,6 +179,74 @@ export function FinishEvidenceCard({ evidence }: { readonly evidence: FinishEvid
                   </li>
                 ))}
               </ol>
+              {evidence.checks?.length || evidence.checksIncomplete ? (
+                <section aria-label={`Checks after ${turnLabel}`} className="space-y-2">
+                  <p className="font-medium">Checks after {turnLabel}</p>
+                  <p className="text-muted-foreground">
+                    Each command {checkRanAfterLabel(turnLabel)}. It shows what the command returned
+                    then, not whether {turnLabel}'s own changes are correct. Changes made outside
+                    this thread are not tracked.
+                  </p>
+                  {evidence.checksIncomplete ? (
+                    <p className="text-muted-foreground">
+                      Older history is not loaded, so some checks may be missing.
+                    </p>
+                  ) : null}
+                  <ol className="divide-y divide-border/60">
+                    {(evidence.checks ?? []).map((check) => (
+                      <li key={check.runId} className="space-y-1 py-2 first:pt-0 last:pb-0">
+                        <p className="line-clamp-2 whitespace-pre-wrap break-all font-mono">
+                          {check.command}
+                        </p>
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
+                          <span
+                            className={checkNeedsAttention(check) ? "text-warning-foreground" : ""}
+                          >
+                            {check.name}: {turnCheckResultLabel(check.check)}
+                          </span>
+                          {check.completedAt ? (
+                            <span>
+                              Finished{" "}
+                              <time dateTime={check.completedAt}>
+                                {new Date(check.completedAt).toLocaleTimeString()}
+                              </time>
+                            </span>
+                          ) : null}
+                          {check.fullOutputPath && onOpenCheckOutput ? (
+                            <Button
+                              size="micro"
+                              variant="link"
+                              onClick={() => onOpenCheckOutput(check.fullOutputPath!)}
+                            >
+                              Full output
+                            </Button>
+                          ) : null}
+                          {turnCheckNeedsFix(check.check) && onAskForFix ? (
+                            <Button
+                              size="micro"
+                              variant="outline"
+                              onClick={() => onAskForFix(check)}
+                            >
+                              Ask for a fix
+                            </Button>
+                          ) : null}
+                        </div>
+                        {check.skipReason ? (
+                          <p className="text-muted-foreground">{check.skipReason}</p>
+                        ) : check.freshness === "later-work" ? (
+                          <p className="text-warning-foreground">
+                            Later work ran in this folder, so this result may be out of date.
+                          </p>
+                        ) : check.freshness === "unknown" ? (
+                          <p className="text-muted-foreground">
+                            Cannot tell whether later work ran in this folder.
+                          </p>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+              ) : null}
               {evidence.files.length ? (
                 <details>
                   <summary className="cursor-pointer rounded-sm text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
@@ -141,6 +263,9 @@ export function FinishEvidenceCard({ evidence }: { readonly evidence: FinishEvid
           </div>
         </PopoverPopup>
       </Popover>
+      {deliverySummary ? (
+        <span className="text-xs text-warning-foreground">{deliverySummary}</span>
+      ) : null}
     </div>
   );
 }

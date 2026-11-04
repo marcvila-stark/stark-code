@@ -1,7 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { useNavigate } from "@tanstack/react-router";
-import { CalendarClockIcon, PencilIcon, PlayIcon, Settings2Icon } from "lucide-react";
+import { CalendarClockIcon, HistoryIcon, PencilIcon, PlayIcon, Settings2Icon } from "lucide-react";
 import { useState } from "react";
 import {
   AuthOrchestrationOperateScope,
@@ -13,10 +13,21 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@starkfuture/client-runtime/state/runtime";
+import {
+  runScheduledTaskNowOnce,
+  scheduledTaskRunStateLabel,
+  scheduledTaskRunTone,
+  type ScheduledTaskRunTone,
+} from "@starkfuture/client-runtime/scheduled-task-runs";
 
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { cn } from "../../lib/utils";
 import { relativeLabel, scheduleLabel } from "../settings/ScheduledTasksSettings";
+import { ScheduledTaskRunsDialog } from "../settings/ScheduledTaskRunsDialog";
+import {
+  scheduledTaskRunNowClickIds,
+  useEnvironmentKeepsRunHistory,
+} from "../../state/scheduledTaskRuns";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -36,6 +47,20 @@ const STATUS_DOT_CLASS: Record<ScheduledTask["lastRunStatus"], string> = {
   succeeded: "bg-emerald-500",
   failed: "bg-destructive",
 };
+
+const RUN_TONE_DOT_CLASS: Record<ScheduledTaskRunTone, string> = {
+  muted: STATUS_DOT_CLASS.never,
+  active: STATUS_DOT_CLASS.running,
+  success: STATUS_DOT_CLASS.succeeded,
+  error: STATUS_DOT_CLASS.failed,
+};
+
+/** The task's newest run as a dot colour, or its last dispatch on servers without run history. */
+function statusDotClass(task: ScheduledTask): string {
+  return task.latestRun === undefined
+    ? STATUS_DOT_CLASS[task.lastRunStatus]
+    : RUN_TONE_DOT_CLASS[scheduledTaskRunTone(task.latestRun.state)];
+}
 
 /**
  * Thread details panel section listing the automations (scheduled tasks) bound
@@ -61,6 +86,8 @@ export function ThreadAutomationsPanel(props: {
   });
   const navigate = useNavigate();
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const keepsRunHistory = useEnvironmentKeepsRunHistory(props.environmentId);
+  const [runsTask, setRunsTask] = useState<ScheduledTask | null>(null);
 
   const boundTasks = (tasksQuery.data?.tasks ?? []).filter(
     (task) => task.threadId === props.threadId,
@@ -106,9 +133,12 @@ export function ThreadAutomationsPanel(props: {
     )
       return;
     setBusyTaskId(task.id);
-    const result = await runTaskNow({
+    const result = await runScheduledTaskNowOnce({
+      clickIds: scheduledTaskRunNowClickIds,
       environmentId: props.environmentId,
-      input: { id: task.id },
+      taskId: task.id,
+      keepsRunHistory,
+      run: runTaskNow,
     });
     setBusyTaskId(null);
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -165,7 +195,7 @@ export function ThreadAutomationsPanel(props: {
               <span
                 className={cn(
                   "absolute -right-1 -top-1 size-1.5 rounded-full",
-                  STATUS_DOT_CLASS[task.lastRunStatus],
+                  statusDotClass(task),
                 )}
                 aria-hidden
               />
@@ -181,8 +211,29 @@ export function ThreadAutomationsPanel(props: {
                   : task.enabled
                     ? ""
                     : " · paused"}
+                {task.latestRun !== undefined
+                  ? ` · last run ${scheduledTaskRunStateLabel(task.latestRun.state).toLowerCase()}`
+                  : ""}
               </p>
             </div>
+            {keepsRunHistory ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <ThreadDetailsControl
+                      size="icon-xs"
+                      variant="ghost"
+                      part="icon"
+                      aria-label={`Runs of ${task.title}`}
+                      onClick={() => setRunsTask(task)}
+                    >
+                      <HistoryIcon className="size-3.5" />
+                    </ThreadDetailsControl>
+                  }
+                />
+                <TooltipPopup>Runs</TooltipPopup>
+              </Tooltip>
+            ) : null}
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -235,6 +286,13 @@ export function ThreadAutomationsPanel(props: {
           </li>
         ))}
       </ul>
+      {runsTask !== null ? (
+        <ScheduledTaskRunsDialog
+          environmentId={props.environmentId}
+          task={runsTask}
+          onClose={() => setRunsTask(null)}
+        />
+      ) : null}
     </ThreadDetailsSection>
   );
 }

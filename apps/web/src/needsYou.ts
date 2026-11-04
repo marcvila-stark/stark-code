@@ -2,6 +2,7 @@ import type {
   EnvironmentProject,
   EnvironmentThreadShell,
 } from "@starkfuture/client-runtime/state/models";
+import { providerKindDisplayName } from "@starkfuture/client-runtime/state/provider-instance-display";
 import {
   ThreadId,
   type NativeAgentAttention,
@@ -20,8 +21,12 @@ export interface NeedsYouEntry {
   readonly title: string;
   readonly folder: string;
   readonly provider: string;
-  readonly kind: "approval" | "question" | "sign-in" | "input";
+  readonly kind: "approval" | "question" | "sign-in" | "input" | "lost";
   readonly requestedAt: number;
+}
+
+function threadProviderLabel(thread: EnvironmentThreadShell): string {
+  return providerKindDisplayName(thread.runtime?.providerName ?? thread.providerInstanceId);
 }
 
 /** Shell summaries already stream across all folders; no per-chat inspection or polling. */
@@ -47,7 +52,7 @@ export function collectNeedsYou(
         requestId: request.id,
         title: thread.title || "Untitled chat",
         folder: folders.get(JSON.stringify([thread.environmentId, thread.projectId])) ?? "Folder",
-        provider: thread.runtime?.providerName ?? String(thread.providerInstanceId),
+        provider: threadProviderLabel(thread),
         kind:
           request.kind === "user_input"
             ? "question"
@@ -55,6 +60,26 @@ export function collectNeedsYou(
               ? "sign-in"
               : "approval",
         requestedAt: DateTime.toEpochMillis(request.createdAt),
+      },
+    ];
+  });
+  // A decision lost to a restart stays here until the user asks again or dismisses it.
+  const lost = threads.flatMap((thread): NeedsYouEntry[] => {
+    const request = thread.source.lostRuntimeRequest;
+    if (!request || thread.deletedAt !== null) return [];
+    const key = JSON.stringify([thread.environmentId, thread.id, request.id, "lost"]);
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [
+      {
+        key,
+        threadRef: { environmentId: thread.environmentId, threadId: thread.id },
+        requestId: request.id,
+        title: thread.title || "Untitled chat",
+        folder: folders.get(JSON.stringify([thread.environmentId, thread.projectId])) ?? "Folder",
+        provider: threadProviderLabel(thread),
+        kind: "lost",
+        requestedAt: DateTime.toEpochMillis(request.lostAt),
       },
     ];
   });
@@ -94,7 +119,7 @@ export function collectNeedsYou(
       },
     ];
   });
-  return [...chats, ...shells].sort(
+  return [...chats, ...lost, ...shells].sort(
     (left, right) => left.requestedAt - right.requestedAt || left.key.localeCompare(right.key),
   );
 }

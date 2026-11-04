@@ -13,6 +13,10 @@ import {
 } from "@starkfuture/client-runtime/state/subagentRuntime";
 import { formatSubagentDisplayTitle } from "@starkfuture/client-runtime/state/subagent-display";
 import {
+  deriveThreadWorkers,
+  workerStopInput,
+} from "@starkfuture/client-runtime/state/thread-workers";
+import {
   deriveThreadRelationshipGraph,
   immediateThreadRelationships,
   isParentThreadRelationship,
@@ -51,6 +55,7 @@ import {
 import { useMemo, useState, type ReactNode } from "react";
 
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
+import { useRightPanelStore } from "../../rightPanelStore";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import {
   useProjects,
@@ -380,10 +385,7 @@ export function ThreadRelationshipsPanel(props: {
     setStoppingId(childThreadId);
     const result = await interruptTurn({
       environmentId: props.environmentId,
-      input:
-        agent.origin === "provider_native"
-          ? { threadId: agent.threadId, subagentId: agent.id }
-          : { threadId: childThreadId },
+      input: workerStopInput({ childThreadId, origin: agent.origin, latestTask: agent }),
     });
     setStoppingId(null);
     if (result._tag === "Failure") {
@@ -408,6 +410,10 @@ export function ThreadRelationshipsPanel(props: {
     mergeTargetThreadId === null
       ? null
       : (graph.nodes.get(mergeTargetThreadId)?.thread?.title ?? null);
+  // Delegated children are also listed together, with Retry, in the side chat panel.
+  // Rows come from tasks alone, so no shells are needed to know the list is non-empty.
+  const hasWorkers =
+    projection !== null && deriveThreadWorkers({ projection, shells: [] }).length > 0;
 
   return (
     <ThreadDetailsSection
@@ -415,28 +421,53 @@ export function ThreadRelationshipsPanel(props: {
       title={runningCount > 0 ? `Lineage · ${runningCount} running` : "Lineage"}
       data-thread-relationships-panel
       actions={
-        canDetach ? (
-          <Menu>
-            <MenuTrigger
-              render={
-                <ThreadDetailsControl
-                  size="icon-xs"
-                  variant="ghost"
-                  part="icon"
-                  aria-label="More thread actions"
-                  disabled={busyAction !== null}
-                />
-              }
-            >
-              <MoreHorizontalIcon className="size-3.5" />
-            </MenuTrigger>
-            <MenuPopup align="end" className="min-w-60 max-w-(--available-width)">
-              <MenuItem onClick={() => void detach()}>
-                <UnplugIcon className="size-3.5" />
-                Disconnect agent session
-              </MenuItem>
-            </MenuPopup>
-          </Menu>
+        hasWorkers || canDetach ? (
+          <>
+            {hasWorkers ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <ThreadDetailsControl
+                      size="sm"
+                      variant="ghost"
+                      part="meta"
+                      onClick={() =>
+                        useRightPanelStore.getState().requestSideWorkTab(ref, "workers")
+                      }
+                    />
+                  }
+                >
+                  Workers
+                </TooltipTrigger>
+                <TooltipPopup side="left">
+                  Open this chat's workers in the side chat panel
+                </TooltipPopup>
+              </Tooltip>
+            ) : null}
+            {canDetach ? (
+              <Menu>
+                <MenuTrigger
+                  render={
+                    <ThreadDetailsControl
+                      size="icon-xs"
+                      variant="ghost"
+                      part="icon"
+                      aria-label="More thread actions"
+                      disabled={busyAction !== null}
+                    />
+                  }
+                >
+                  <MoreHorizontalIcon className="size-3.5" />
+                </MenuTrigger>
+                <MenuPopup align="end" className="min-w-60 max-w-(--available-width)">
+                  <MenuItem onClick={() => void detach()}>
+                    <UnplugIcon className="size-3.5" />
+                    Disconnect agent session
+                  </MenuItem>
+                </MenuPopup>
+              </Menu>
+            ) : null}
+          </>
         ) : null
       }
     >

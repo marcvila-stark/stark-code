@@ -69,7 +69,7 @@ const safeError = (text: string) => {
   return catalogText(redacted, 1000);
 };
 
-export class McpServerRequests extends Context.Service<
+class McpServerRequests extends Context.Service<
   McpServerRequests,
   {
     readonly list: (

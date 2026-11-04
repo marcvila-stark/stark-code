@@ -6,6 +6,7 @@ import {
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2Run,
   type OrchestrationV2ProviderTurn,
+  type OrchestrationV2RuntimeRequest,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type ModelSelection,
@@ -18,6 +19,7 @@ import {
   RawEventId,
   RunAttemptId,
   RunId,
+  type RuntimeRequestId,
   ThreadId,
 } from "@starkfuture/contracts";
 import * as Context from "effect/Context";
@@ -27,6 +29,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { AgentScope } from "@starkfuture/shared/AgentScope";
+import { closeDeliveryLoss } from "@starkfuture/shared/orchestrationV2LostRequests";
 import {
   getModelSelectionStringOptionValue,
   modelSelectionsEqual,
@@ -39,7 +42,7 @@ import * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdap
 import { makeProviderFailureTurnItem } from "@starkfuture/provider-core/server/failure";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { stripUnservedToolOutputImageBytes } from "./toolOutputImageBytes.ts";
-import { boundFileChangeForStorage } from "./WireProjection.ts";
+import { boundFileChangeForStorage, dropResolvedApprovalPreview } from "./WireProjection.ts";
 
 export class ProviderEventNormalizeError extends Schema.TaggedError<ProviderEventNormalizeError>()(
   "ProviderEventNormalizeError",
@@ -306,6 +309,34 @@ function compactUndefined<T extends Record<string, unknown>>(record: T): T {
 
 const decodeDomainEvent = Schema.decodeUnknownEffect(OrchestrationV2DomainEvent);
 
+/**
+ * A request as an adapter re-emits it, keeping what Stark recorded on it:
+ * the user's choice, how delivering it went, and why it was lost. An answered
+ * request also keeps its answer, so a refreshed copy cannot reopen it.
+ */
+function keepStarkRecord(
+  incoming: OrchestrationV2RuntimeRequest,
+  existing: OrchestrationV2RuntimeRequest | undefined,
+): OrchestrationV2RuntimeRequest {
+  if (existing === undefined) return incoming;
+  const answered = existing.status !== "pending" && incoming.status === "pending";
+  return {
+    ...incoming,
+    ...(answered
+      ? {
+          status: existing.status,
+          resolvedAt: existing.resolvedAt,
+          responseCapability: existing.responseCapability,
+          ...(existing.decision === undefined ? {} : { decision: existing.decision }),
+          ...(existing.answers === undefined ? {} : { answers: existing.answers }),
+        }
+      : {}),
+    ...(existing.chosen === undefined ? {} : { chosen: existing.chosen }),
+    ...(existing.delivery === undefined ? {} : { delivery: existing.delivery }),
+    ...(existing.lost === undefined ? {} : { lost: existing.lost }),
+  };
+}
+
 export const layer: Layer.Layer<
   ProviderEventIngestorV2,
   never,
@@ -536,6 +567,106 @@ export const layer: Layer.Layer<
       return events;
     });
 
+    /**
+     * Requests a provider closed before Stark stored them: a closure can be
+     * published while the request itself is still on its way (Codex resolving
+     * a request while the adapter publishes it). The request is then stored
+     * already closed, never as a pending card. Bounded, oldest first out.
+     */
+    const closedBeforeShown = new Set<string>();
+    const closedBeforeShownKey = (threadId: ThreadId, requestId: RuntimeRequestId) =>
+      `${threadId}\u0000${requestId}`;
+    const rememberClosedBeforeShown = (threadId: ThreadId, requestId: RuntimeRequestId) => {
+      closedBeforeShown.add(closedBeforeShownKey(threadId, requestId));
+      if (closedBeforeShown.size > 512) {
+        const [oldest] = closedBeforeShown;
+        if (oldest !== undefined) closedBeforeShown.delete(oldest);
+      }
+    };
+
+    /**
+     * The provider closed a request on its own (Codex `serverRequest/resolved`):
+     * an unanswered one expires with its node and card, and an answered one
+     * needed no delivery. A request whose answer was already delivered, or
+     * that is already closed, is left alone. The same rules as the
+     * orchestrator's runtime-request.provider-closed, applied under the
+     * thread's command lock.
+     */
+    const providerClosedEvents = (
+      input: ProviderEventIngestInput,
+      threadId: ThreadId,
+      context: ProjectionStore.ProjectionRuntimeResponseContext,
+    ) =>
+      Effect.gen(function* () {
+        const request = context.request;
+        if (request === undefined) return [];
+        const now = yield* DateTime.now;
+        if (request.status === "pending") {
+          return [
+            yield* makeDomainEvent(input, {
+              type: "runtime-request.updated",
+              threadId,
+              payload: { ...request, status: "expired", resolvedAt: now },
+              nodeId: request.nodeId,
+              occurredAt: now,
+            }),
+            ...(context.node === undefined
+              ? []
+              : [
+                  yield* makeDomainEvent(input, {
+                    type: "node.updated",
+                    threadId,
+                    payload: { ...context.node, status: "cancelled", completedAt: now },
+                    runId: context.node.runId,
+                    nodeId: context.node.id,
+                    occurredAt: now,
+                  }),
+                ]),
+            ...(context.item === undefined
+              ? []
+              : [
+                  yield* makeDomainEvent(input, {
+                    type: "turn-item.updated",
+                    threadId,
+                    payload: {
+                      ...context.item,
+                      status: "cancelled",
+                      completedAt: now,
+                      updatedAt: now,
+                    },
+                    runId: context.item.runId,
+                    nodeId: context.item.nodeId,
+                    occurredAt: now,
+                  }),
+                ]),
+          ];
+        }
+        const delivery = request.delivery?.state;
+        if (
+          request.status !== "resolved" ||
+          (delivery !== undefined && delivery !== "pending" && delivery !== "uncertain")
+        ) {
+          return [];
+        }
+        return [
+          yield* makeDomainEvent(input, {
+            type: "runtime-request.updated",
+            threadId,
+            payload: {
+              ...request,
+              delivery: {
+                state: "not_needed",
+                attempts: request.delivery?.attempts ?? 0,
+                updatedAt: now,
+              },
+              ...closeDeliveryLoss(request.lost, now),
+            },
+            nodeId: request.nodeId,
+            occurredAt: now,
+          }),
+        ];
+      });
+
     const normalize: ProviderEventIngestorV2Shape["normalize"] = (input) =>
       Effect.gen(function* () {
         switch (input.event.type) {
@@ -554,13 +685,11 @@ export const layer: Layer.Layer<
               return [];
             const parent =
               existing === null && offered.lineage.parentThreadId !== null
-                ? yield* projections
-                    .getThread(offered.lineage.parentThreadId)
-                    .pipe(
-                      Effect.catchTags({
-                        ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
-                      }),
-                    )
+                ? yield* projections.getThread(offered.lineage.parentThreadId).pipe(
+                    Effect.catchTags({
+                      ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
+                    }),
+                  )
                 : null;
             const now = yield* DateTime.now;
             return [
@@ -661,27 +790,66 @@ export const layer: Layer.Layer<
                 nodeId: input.event.message.nodeId,
               }),
             ];
-          case "turn_item.updated":
+          case "turn_item.updated": {
+            const turnItem = input.event.turnItem;
+            // A provider refreshing a waiting approval (Codex sends a newer patch)
+            // must not reopen one the user already answered.
+            if (turnItem.type === "approval_request" && turnItem.status === "waiting") {
+              const request = yield* projections
+                .getRuntimeRequest(turnItem.threadId, turnItem.requestId)
+                .pipe(Effect.orElseSucceed(() => undefined));
+              if (request !== undefined && request.status !== "pending") return [];
+            }
             return [
               yield* makeDomainEvent(input, {
                 type: "turn-item.updated",
-                threadId: input.event.turnItem.threadId,
-                payload: boundFileChangeForStorage(
-                  stripUnservedToolOutputImageBytes(input.event.turnItem),
+                threadId: turnItem.threadId,
+                payload: dropResolvedApprovalPreview(
+                  boundFileChangeForStorage(stripUnservedToolOutputImageBytes(turnItem)),
                 ),
-                runId: input.event.turnItem.runId,
-                nodeId: input.event.turnItem.nodeId,
+                runId: turnItem.runId,
+                nodeId: turnItem.nodeId,
               }),
             ];
-          case "runtime_request.updated":
+          }
+          case "runtime_request.updated": {
+            const threadId = input.event.threadId ?? input.threadId;
+            const incoming = input.event.runtimeRequest;
+            const context = yield* projections.getRuntimeResponseContext(threadId, incoming.id);
+            // The provider closed the request itself. The payload is the
+            // request as first shown, so it is never stored: that would reopen
+            // an answer the user already gave.
+            if (input.event.closedByProvider === true) {
+              if (context.request === undefined) {
+                rememberClosedBeforeShown(threadId, incoming.id);
+                return [];
+              }
+              return yield* providerClosedEvents(input, threadId, context);
+            }
+            if (
+              closedBeforeShown.delete(closedBeforeShownKey(threadId, incoming.id)) &&
+              (context.request === undefined || context.request.status === "pending")
+            ) {
+              // Stored straight away as closed, with its node and card.
+              const shown = yield* projections.getRuntimeResponseContext(
+                threadId,
+                incoming.id,
+                incoming.nodeId,
+              );
+              return yield* providerClosedEvents(input, threadId, {
+                ...shown,
+                request: keepStarkRecord(incoming, context.request),
+              });
+            }
             return [
               yield* makeDomainEvent(input, {
                 type: "runtime-request.updated",
-                ...(input.event.threadId === undefined ? {} : { threadId: input.event.threadId }),
-                payload: input.event.runtimeRequest,
-                nodeId: input.event.runtimeRequest.nodeId,
+                threadId,
+                payload: keepStarkRecord(incoming, context.request),
+                nodeId: incoming.nodeId,
               }),
             ];
+          }
           case "plan.updated": {
             const occurredAt = yield* DateTime.now;
             const plan = input.event.plan;
@@ -843,6 +1011,8 @@ export const layer: Layer.Layer<
             }),
           ),
           (effect) => {
+            if (input.event.type === "runtime_request.updated")
+              return threadCommands.withLock(input.event.threadId ?? input.threadId, effect);
             if (input.event.type !== "app_thread.created") return effect;
             const child = input.event.appThread;
             const createChild = threadCommands.withLock(child.id, effect);

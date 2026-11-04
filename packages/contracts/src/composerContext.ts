@@ -5,6 +5,7 @@ import {
   ForwardCompatibleArray,
   NonNegativeInt,
   PositiveInt,
+  RunId,
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
@@ -204,6 +205,11 @@ export const ReviewCommentContextRecord = Schema.Struct({
   diff: BoundedString(COMPOSER_CONTEXT_REVIEW_DIFF_MAX_CHARS),
   fenceLanguage: Schema.optionalKey(BoundedString(64)),
   pullRequest: Schema.optionalKey(PullRequestContextMetadata),
+  /**
+   * The turn this comment reviews. `sectionId` only groups comments for display, and its
+   * format differs between clients, so readers link a correction to its turn through this.
+   */
+  runId: Schema.optionalKey(RunId),
 }).check(Schema.makeFilter((record) => record.endIndex >= record.startIndex));
 export type ReviewCommentContextRecord = typeof ReviewCommentContextRecord.Type;
 

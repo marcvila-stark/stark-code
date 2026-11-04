@@ -8,6 +8,7 @@ import {
   AgentSessionImportSource,
   AgentSessionScanError,
   AgentSessionSource,
+  agentSessionImportThreadId,
   EventId,
   MessageId,
   ProjectId,
@@ -29,6 +30,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as Semaphore from "effect/Semaphore";
 import * as LocalAgentHistoryStore from "./LocalAgentHistoryStore.ts";
@@ -170,7 +172,111 @@ function messageEvents(input: {
   ];
 }
 
+/**
+ * The events that create an imported session's thread: a settled thread whose
+ * provider thread points at the CLI session, so the first message resumes it.
+ * A local-history sync also records the session's own folder as `localSession`.
+ */
+export function makeAgentSessionImportEvents(input: {
+  readonly projectId: ProjectId;
+  readonly thread: AgentSessionScanner.AgentSessionThread;
+  readonly providerThreadId: OrchestrationV2ProviderThread["id"];
+  readonly localSession?: OrchestrationV2AppThread["localSession"];
+}): ReadonlyArray<OrchestrationV2DomainEvent> {
+  const { thread, providerThreadId } = input;
+  const threadId = agentSessionImportThreadId(thread);
+  const driver = ProviderDriverKind.make(thread.source);
+  const model = thread.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL;
+  const createdAt = dateTime(thread.createdAt);
+  const updatedAt = dateTime(thread.updatedAt);
+  const appThread: OrchestrationV2AppThread = {
+    createdBy: "system",
+    creationSource: "server",
+    id: threadId,
+    projectId: input.projectId,
+    title: thread.title.trim() === "" ? "Untitled thread" : thread.title,
+    providerInstanceId: thread.providerInstanceId,
+    modelSelection: { instanceId: thread.providerInstanceId, model },
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+    // Imported sessions always run an explicit preset.
+    permissionSource: "override",
+    branch: null,
+    worktreePath: null,
+    linkedPullRequest: null,
+    branchPullRequest: null,
+    activeProviderThreadId: providerThreadId,
+    historyOrigin: "v1_import",
+    ...(input.localSession === undefined ? {} : { localSession: input.localSession }),
+    lineage: {
+      parentThreadId: null,
+      relationshipToParent: null,
+      rootThreadId: threadId,
+    },
+    forkedFrom: null,
+    createdAt,
+    updatedAt,
+    archivedAt: null,
+    settledOverride: "settled",
+    settledAt: updatedAt,
+    unsettledAt: null,
+    snoozedUntil: null,
+    snoozedAt: null,
+    pinnedAt: null,
+    pinOrderKey: null,
+    activeOrderKey: null,
+    lastVisitedAt: null,
+    deletedAt: null,
+  };
+  const providerThread: OrchestrationV2ProviderThread = {
+    id: providerThreadId,
+    driver,
+    providerInstanceId: thread.providerInstanceId,
+    providerSessionId: null,
+    appThreadId: threadId,
+    ownerNodeId: null,
+    nativeThreadRef: {
+      driver,
+      nativeId: thread.providerSessionId,
+      strength: "strong",
+    },
+    nativeConversationHeadRef: null,
+    status: "idle",
+    firstRunOrdinal: null,
+    lastRunOrdinal: null,
+    handoffIds: [],
+    forkedFrom: null,
+    pendingBackgroundTasks: [],
+    createdAt,
+    updatedAt,
+  };
+  return [
+    {
+      id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${threadId}:created`),
+      type: "thread.created",
+      threadId,
+      providerInstanceId: thread.providerInstanceId,
+      occurredAt: createdAt,
+      payload: appThread,
+    },
+    ...thread.messages.flatMap((message, index) => messageEvents({ threadId, index, message })),
+    {
+      id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
+      type: "provider-thread.updated",
+      threadId,
+      driver,
+      providerInstanceId: thread.providerInstanceId,
+      occurredAt: updatedAt,
+      payload: providerThread,
+    },
+  ];
+}
+
+const nativeSessionKey = (driver: string, nativeSessionId: string) =>
+  `${driver}\0${nativeSessionId}`;
+
 const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projects = yield* ProjectService.ProjectService;
@@ -181,6 +287,38 @@ const make = Effect.gen(function* () {
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const gate = yield* Semaphore.make(1);
   const ignoredSources = new Map<string, AgentSessionImportSource>();
+
+  /**
+   * The app threads whose provider threads hold each native Claude or Codex
+   * session, keyed by driver and native session id. Stark's own threads run
+   * through those CLIs, which write ordinary transcripts into the project
+   * folder; this is how the importer tells them apart. Covers every project
+   * and every thread, archived or deleted included.
+   */
+  const readStarkNativeSessions = Effect.fnUntraced(function* () {
+    const rows = yield* sql<{
+      readonly threadId: string | null;
+      readonly driver: string;
+      readonly nativeId: string;
+    }>`
+      SELECT
+        thread_id AS "threadId",
+        json_extract(payload_json, '$.nativeThreadRef.driver') AS "driver",
+        json_extract(payload_json, '$.nativeThreadRef.nativeId') AS "nativeId"
+      FROM orchestration_v2_projection_provider_threads
+      WHERE json_extract(payload_json, '$.nativeThreadRef.driver') IN ('claudeAgent', 'codex')
+        AND json_extract(payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
+    `;
+    const threadIdsBySession = new Map<string, Array<string | null>>();
+    for (const row of rows) {
+      const key = nativeSessionKey(row.driver, row.nativeId);
+      const threadIds = threadIdsBySession.get(key);
+      if (threadIds === undefined) threadIdsBySession.set(key, [row.threadId]);
+      else threadIds.push(row.threadId);
+    }
+    return threadIdsBySession;
+  });
+
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
   ) {
@@ -227,11 +365,33 @@ const make = Effect.gen(function* () {
       return payload.value.importedTranscripts ?? [];
     });
     if (allLocal) completedSources.push(...ignoredSources.values());
+    // A session a Stark thread ran is already in History under that thread.
+    // The thread an earlier import created for the session does not count.
+    // A local-history sync checks the same owners (and native replies) below.
+    const starkNativeSessions = allLocal
+      ? new Map<string, Array<string | null>>()
+      : yield* readStarkNativeSessions().pipe(
+          Effect.mapError(
+            (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+          ),
+        );
+    const ranInStark: AgentSessionScanner.RanInStark = (session) => {
+      const importThreadId = agentSessionImportThreadId(session);
+      return (
+        starkNativeSessions
+          .get(nativeSessionKey(session.provider, session.providerSessionId))
+          ?.some((threadId) => threadId !== importThreadId) ?? false
+      );
+    };
     const outcomes = allLocal
       ? scanner.allThreads(completedSources)
-      : scanner.recentThreads(project.workspaceRoot, completedSources);
+      : scanner.recentThreads(project.workspaceRoot, completedSources, ranInStark);
     const importedThreadIds = new Set<ThreadId>();
+    // importedCount keeps counting sessions an earlier import brought in, as
+    // older clients expect; alreadyImportedCount tells the two apart.
     let importedCount = 0;
+    let alreadyImportedCount = 0;
+    let alreadyRunByStarkCount = 0;
     let skippedCount = 0;
     let updatedCount = 0;
     let unchangedCount = 0;
@@ -247,14 +407,19 @@ const make = Effect.gen(function* () {
           skippedCount += 1;
           return;
         }
+        if (outcome._tag === "RanInStark") {
+          alreadyRunByStarkCount += 1;
+          return;
+        }
         const source = outcome.source;
-        const threadId = ThreadId.make(
-          `import:${source.providerInstanceId}:${source.providerSessionId}`,
-        );
+        const threadId = agentSessionImportThreadId(source);
         if (outcome._tag === "AlreadyImported") {
           importedThreadIds.add(threadId);
           if (allLocal) unchangedCount += 1;
-          else importedCount += 1;
+          else {
+            importedCount += 1;
+            alreadyImportedCount += 1;
+          }
           return;
         }
         if (outcome._tag === "Duplicate") {
@@ -277,6 +442,7 @@ const make = Effect.gen(function* () {
           return;
         }
         let updated = false;
+        let alreadyImported = false;
         const imported = yield* threadCommands
           .withLock(
             threadId,
@@ -440,34 +606,19 @@ const make = Effect.gen(function* () {
                   return updated;
                 }
                 yield* runtimes.recordImportedTranscript({ threadId, source });
+                alreadyImported = true;
                 return true;
               }
 
               const driver = ProviderDriverKind.make(thread.source);
-              const model = thread.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL;
-              const providerThreadId = idAllocator.derive.providerThread({
-                driver,
-                nativeThreadId: thread.providerSessionId,
-                ...(allLocal ? { providerInstanceId: thread.providerInstanceId } : {}),
-              });
-              const createdAt = dateTime(thread.createdAt);
-              const updatedAt = dateTime(thread.updatedAt);
-              const appThread: OrchestrationV2AppThread = {
-                createdBy: "system",
-                creationSource: "server",
-                id: threadId,
+              const creationEvents = makeAgentSessionImportEvents({
                 projectId: input.projectId,
-                title: thread.title.trim() === "" ? "Untitled thread" : thread.title,
-                providerInstanceId: thread.providerInstanceId,
-                modelSelection: { instanceId: thread.providerInstanceId, model },
-                runtimeMode: DEFAULT_RUNTIME_MODE,
-                interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-                branch: null,
-                worktreePath: null,
-                linkedPullRequest: null,
-                branchPullRequest: null,
-                activeProviderThreadId: providerThreadId,
-                historyOrigin: "v1_import",
+                thread,
+                providerThreadId: idAllocator.derive.providerThread({
+                  driver,
+                  nativeThreadId: thread.providerSessionId,
+                  ...(allLocal ? { providerInstanceId: thread.providerInstanceId } : {}),
+                }),
                 ...(allLocal && thread.cwd
                   ? {
                       localSession: {
@@ -477,48 +628,7 @@ const make = Effect.gen(function* () {
                       },
                     }
                   : {}),
-                lineage: {
-                  parentThreadId: null,
-                  relationshipToParent: null,
-                  rootThreadId: threadId,
-                },
-                forkedFrom: null,
-                createdAt,
-                updatedAt,
-                archivedAt: null,
-                settledOverride: "settled",
-                settledAt: updatedAt,
-                unsettledAt: null,
-                snoozedUntil: null,
-                snoozedAt: null,
-                pinnedAt: null,
-                pinOrderKey: null,
-                activeOrderKey: null,
-                lastVisitedAt: null,
-                deletedAt: null,
-              };
-              const providerThread: OrchestrationV2ProviderThread = {
-                id: providerThreadId,
-                driver,
-                providerInstanceId: thread.providerInstanceId,
-                providerSessionId: null,
-                appThreadId: threadId,
-                ownerNodeId: null,
-                nativeThreadRef: {
-                  driver,
-                  nativeId: thread.providerSessionId,
-                  strength: "strong",
-                },
-                nativeConversationHeadRef: null,
-                status: "idle",
-                firstRunOrdinal: null,
-                lastRunOrdinal: null,
-                handoffIds: [],
-                forkedFrom: null,
-                pendingBackgroundTasks: [],
-                createdAt,
-                updatedAt,
-              };
+              });
 
               yield* runtimes.upsert(
                 {
@@ -539,28 +649,6 @@ const make = Effect.gen(function* () {
                 },
                 { onConflict: "ignore" },
               );
-              const creationEvents: ReadonlyArray<OrchestrationV2DomainEvent> = [
-                {
-                  id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${threadId}:created`),
-                  type: "thread.created",
-                  threadId,
-                  providerInstanceId: thread.providerInstanceId,
-                  occurredAt: createdAt,
-                  payload: appThread,
-                },
-                ...thread.messages.flatMap((message, index) =>
-                  messageEvents({ threadId, index, message }),
-                ),
-                {
-                  id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
-                  type: "provider-thread.updated",
-                  threadId,
-                  driver,
-                  providerInstanceId: thread.providerInstanceId,
-                  occurredAt: updatedAt,
-                  payload: providerThread,
-                },
-              ];
               if (allLocal) {
                 // Commit the owner with thread creation, before chunking long history.
                 yield* eventSink.write({
@@ -596,7 +684,10 @@ const make = Effect.gen(function* () {
         if (imported) {
           importedThreadIds.add(threadId);
           if (updated) updatedCount += 1;
-          else importedCount += 1;
+          else {
+            importedCount += 1;
+            if (alreadyImported) alreadyImportedCount += 1;
+          }
         }
       }),
     );
@@ -604,6 +695,8 @@ const make = Effect.gen(function* () {
     const result: AgentSessionImportResult = {
       importedCount,
       skippedCount,
+      alreadyImportedCount,
+      alreadyRunByStarkCount,
       ...(allLocal ? { updatedCount, unchangedCount, truncated } : {}),
     };
     return result;

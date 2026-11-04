@@ -3,6 +3,7 @@ import {
   CheckpointId,
   CheckpointRef,
   CheckpointScopeId,
+  EventId,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -1595,6 +1596,110 @@ layer("ProviderEventIngestorV2", (it) => {
     }),
   );
 
+  it.effect("keeps a proposed diff only while its approval waits and never reopens it", () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const nodeId = NodeId.make("node:proposed-change");
+      const request: OrchestrationV2RuntimeRequest = {
+        id: RuntimeRequestId.make("request:proposed-change"),
+        nodeId,
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "file-change",
+        status: "pending",
+        responseCapability: { type: "live", providerSessionId },
+        createdAt: now,
+        resolvedAt: null,
+      };
+      const patch = "--- /work/a.ts\n+++ /work/a.ts\n@@ -1 +1 @@\n-PRIVATE_OLD\n+new\n";
+      const waiting: OrchestrationV2TurnItem = {
+        id: TurnItemId.make("turn-item:proposed-change"),
+        threadId,
+        runId: null,
+        nodeId,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "waiting",
+        title: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "approval_request",
+        requestId: request.id,
+        requestKind: "file-change",
+        proposedChanges: [{ path: "/work/a.ts", operation: "update", patch }],
+      };
+      const ingest = (
+        event:
+          | { readonly type: "turn_item.updated"; readonly turnItem: OrchestrationV2TurnItem }
+          | {
+              readonly type: "runtime_request.updated";
+              readonly runtimeRequest: OrchestrationV2RuntimeRequest;
+            },
+      ) =>
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event:
+            event.type === "turn_item.updated"
+              ? { ...event, driver: CODEX_DRIVER }
+              : { ...event, driver: CODEX_DRIVER, threadId },
+        });
+      const stored = () => projectionStore.getTurnItem({ threadId, itemId: waiting.id });
+
+      yield* eventSink.write({ events: [threadEvent] });
+      yield* ingest({ type: "runtime_request.updated", runtimeRequest: request });
+      yield* ingest({ type: "turn_item.updated", turnItem: waiting });
+      assert.deepEqual(yield* stored(), waiting);
+
+      yield* ingest({
+        type: "runtime_request.updated",
+        runtimeRequest: { ...request, status: "resolved", resolvedAt: now, decision: "accept" },
+      });
+      yield* ingest({
+        type: "turn_item.updated",
+        turnItem: { ...waiting, status: "completed", completedAt: now },
+      });
+      const resolved = yield* stored();
+      assert.equal(resolved?.status, "completed");
+      assert.deepEqual(resolved?.type === "approval_request" ? resolved.proposedChanges : [], [
+        { path: "/work/a.ts", operation: "update" },
+      ]);
+
+      const refreshed = yield* ingest({
+        type: "turn_item.updated",
+        turnItem: { ...waiting, updatedAt: now },
+      });
+      assert.isEmpty(refreshed);
+      assert.equal((yield* stored())?.status, "completed");
+
+      const sql = yield* SqlClient.SqlClient;
+      const rows = yield* sql<{ readonly payload: string }>`
+        SELECT payload_json AS payload FROM orchestration_events
+          WHERE stream_id = ${threadId} AND event_type = 'turn-item.updated'
+          ORDER BY sequence ASC
+      `;
+      assert.deepEqual(
+        rows.map((row) => row.payload.includes("PRIVATE_OLD")),
+        [true, false],
+      );
+    }),
+  );
+
   it.effect("routes provider-owned child artifacts to their child app thread", () =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;
@@ -1969,6 +2074,204 @@ layer("ProviderEventIngestorV2", (it) => {
         (yield* projectionStore.getThread(childThreadId)).modelSelection,
         reportedSelection,
       );
+    }),
+  );
+});
+
+layer("ProviderEventIngestorV2 runtime request records", (it) => {
+  /** A thread with one approval request, and what an adapter event does to it. */
+  const setup = (name: string) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const nodeId = NodeId.make(`node:${name}`);
+      const shown: OrchestrationV2RuntimeRequest = {
+        id: RuntimeRequestId.make(`request:${name}`),
+        nodeId,
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "command",
+        status: "pending",
+        responseCapability: { type: "live", providerSessionId },
+        createdAt: now,
+        resolvedAt: null,
+      };
+      const card: OrchestrationV2TurnItem = {
+        id: TurnItemId.make(`turn-item:${name}`),
+        threadId,
+        runId: null,
+        nodeId,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "waiting",
+        title: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "approval_request",
+        requestId: shown.id,
+        requestKind: "command",
+      };
+      yield* eventSink.write({ events: [threadEvent] });
+      const ingest = (runtimeRequest: OrchestrationV2RuntimeRequest, closedByProvider?: true) =>
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event: {
+            type: "runtime_request.updated",
+            driver: CODEX_DRIVER,
+            threadId,
+            runtimeRequest,
+            ...(closedByProvider === undefined ? {} : { closedByProvider }),
+          },
+        });
+      const ingestItem = (turnItem: OrchestrationV2TurnItem) =>
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event: { type: "turn_item.updated", driver: CODEX_DRIVER, turnItem },
+        });
+      yield* ingest(shown);
+      yield* ingestItem(card);
+      /** Stands in for the orchestrator recording the user's answer on the request. */
+      const answer = (delivery: NonNullable<OrchestrationV2RuntimeRequest["delivery"]>["state"]) =>
+        eventSink.write({
+          events: [
+            {
+              id: EventId.make(`event:${name}:answer:${delivery}`),
+              type: "runtime-request.updated",
+              threadId,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                ...shown,
+                status: "resolved",
+                resolvedAt: now,
+                decision: "accept",
+                chosen: { decision: "accept" },
+                delivery: { state: delivery, attempts: 1, updatedAt: now },
+                ...(delivery === "uncertain"
+                  ? {
+                      lost: {
+                        cause: "delivery_failed" as const,
+                        lostAt: now,
+                        deliveryUncertain: true,
+                      },
+                    }
+                  : {}),
+              },
+            },
+          ],
+        });
+      const request = () => projectionStore.getRuntimeRequest(threadId, shown.id);
+      const item = () => projectionStore.getTurnItem({ threadId, itemId: card.id });
+      return {
+        shown,
+        card,
+        ingest,
+        ingestItem,
+        answer,
+        request,
+        item,
+        getRequest: (id: RuntimeRequestId) => projectionStore.getRuntimeRequest(threadId, id),
+        getItem: (itemId: TurnItemId) => projectionStore.getTurnItem({ threadId, itemId }),
+      };
+    });
+
+  it.effect("never leaves a card pending when the provider closed it before it was shown", () =>
+    Effect.gen(function* () {
+      const { shown, card, ingest, ingestItem, getRequest, getItem } =
+        yield* setup("closed-before-shown");
+      // Codex resolved the request while the adapter was still publishing it:
+      // the closure reaches the ingestor before the request and its card.
+      const late = { ...shown, id: RuntimeRequestId.make("request:closed-before-shown:late") };
+      const lateCard = {
+        ...card,
+        id: TurnItemId.make("turn-item:closed-before-shown:late"),
+        requestId: late.id,
+      };
+      assert.isEmpty(yield* ingest(late, true));
+      yield* ingestItem(lateCard);
+      yield* ingest(late);
+      assert.equal((yield* getRequest(late.id))?.status, "expired");
+      assert.equal((yield* getItem(lateCard.id))?.status, "cancelled");
+      // Only that request is closed; another one shown later stays open.
+      const reshown = { ...late, id: RuntimeRequestId.make("request:closed-before-shown:other") };
+      yield* ingest(reshown);
+      assert.equal((yield* getRequest(reshown.id))?.status, "pending");
+    }),
+  );
+
+  it.effect("expires an unanswered request the provider closed, with its card", () =>
+    Effect.gen(function* () {
+      const { shown, ingest, request, item } = yield* setup("closed-unanswered");
+      yield* ingest(shown, true);
+      assert.equal((yield* request())?.status, "expired");
+      assert.equal((yield* item())?.status, "cancelled");
+    }),
+  );
+
+  it.effect("keeps an answer the provider received when it reports the request closed", () =>
+    Effect.gen(function* () {
+      const { shown, ingest, answer, request } = yield* setup("answer-then-close");
+      yield* answer("delivered");
+      const stored = yield* ingest(shown, true);
+      assert.isEmpty(stored);
+      const kept = yield* request();
+      assert.equal(kept?.status, "resolved");
+      assert.equal(kept?.delivery?.state, "delivered");
+    }),
+  );
+
+  it.effect("marks an answer the provider closed before it arrived as not needed", () =>
+    Effect.gen(function* () {
+      const { shown, ingest, answer, request } = yield* setup("close-then-answer");
+      yield* answer("pending");
+      // The close carries the request as first shown; storing it would reopen the answer.
+      yield* ingest(shown, true);
+      const closed = yield* request();
+      assert.equal(closed?.status, "resolved");
+      assert.equal(closed?.decision, "accept");
+      assert.equal(closed?.delivery?.state, "not_needed");
+    }),
+  );
+
+  it.effect("closes an uncertain answer's loss when the provider reports the request closed", () =>
+    Effect.gen(function* () {
+      const { shown, ingest, answer, request } = yield* setup("uncertain-then-close");
+      yield* answer("uncertain");
+      yield* ingest(shown, true);
+      const closed = yield* request();
+      assert.equal(closed?.delivery?.state, "not_needed");
+      assert.equal(closed?.lost?.cause, "delivery_failed");
+      assert.isDefined(closed?.lost?.dismissedAt);
+    }),
+  );
+
+  it.effect("keeps the choice, delivery and loss when an adapter re-emits a request", () =>
+    Effect.gen(function* () {
+      const { shown, ingest, answer, request } = yield* setup("re-emitted");
+      yield* answer("uncertain");
+      yield* ingest({ ...shown, createdAt: shown.createdAt });
+      const kept = yield* request();
+      assert.equal(kept?.status, "resolved");
+      assert.deepEqual(kept?.chosen, { decision: "accept" });
+      assert.equal(kept?.delivery?.state, "uncertain");
+      assert.equal(kept?.lost?.cause, "delivery_failed");
     }),
   );
 });

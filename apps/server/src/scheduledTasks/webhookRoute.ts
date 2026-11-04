@@ -10,6 +10,7 @@ import * as HttpTraceContext from "effect/http/HttpTraceContext";
 import { withRelayClientTracing } from "@starkfuture/shared/relayTracing";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
+import * as MaintenanceGate from "../maintenance/MaintenanceGate.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as RelayDeliveryProof from "./RelayDeliveryProof.ts";
 import * as ScheduledTaskService from "./ScheduledTaskService.ts";
@@ -29,6 +30,7 @@ export const layer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
     const relayDeliveryProof = yield* RelayDeliveryProof.RelayDeliveryProof;
+    const maintenance = yield* MaintenanceGate.MaintenanceGate;
     /**
      * Handles `/api/hooks/:hookId/:token` for every accepted method. The endpoint
      * is raw so the signature is checked over the exact body bytes; the service
@@ -44,6 +46,17 @@ export const layer = HttpApiBuilder.group(
       readonly request: HttpServerRequest.HttpServerRequest;
     }) =>
       Effect.gen(function* () {
+        // Refused before anything is accepted while this server updates or
+        // waits for Resume after a restore; senders retry later.
+        if (!(yield* maintenance.admits("webhook"))) {
+          return HttpServerResponse.jsonUnsafe(
+            { error: "maintenance" },
+            {
+              status: 503,
+              headers: { [WEBHOOK_OUTCOME_HEADER]: "maintenance", "retry-after": "60" },
+            },
+          );
+        }
         const contentLength = Number(request.headers["content-length"] ?? "0");
         if (!Number.isFinite(contentLength) || contentLength > WEBHOOK_MAX_BODY_BYTES) {
           return json(413, { error: "body_too_large" }, "body_too_large");

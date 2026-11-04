@@ -119,7 +119,7 @@ export const make = (config: ServerConfig["Service"]) => ServerConfig.of(config)
  * Resource attributes shared by every OTLP exporter, so traces, metrics, and
  * logs report the same service identity to the collector.
  */
-export const otlpResource = (config: ServerConfig["Service"]) => ({
+const otlpResource = (config: ServerConfig["Service"]) => ({
   serviceName: "starkcode-server",
   attributes: {
     "service.namespace": "starkcode",

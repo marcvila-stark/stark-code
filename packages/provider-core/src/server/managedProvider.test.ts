@@ -1,4 +1,5 @@
 import { describe, it, assert } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import {
   DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
@@ -18,6 +19,8 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ProviderHost from "./ProviderHost.ts";
 import { makeManagedServerProvider } from "./managedProvider.ts";
+
+vi.mock("effect/PubSub", { spy: true });
 
 const emptyCapabilities = createModelCapabilities({ optionDescriptors: [] });
 const fastModeCapabilities = createModelCapabilities({
@@ -437,6 +440,40 @@ describe("makeManagedServerProvider", () => {
     ).pipe(Effect.provide(Layer.mergeAll(layerAlwaysRunTest, TestClock.layer()))),
   );
 
+  it.effect("a settings-only refresh cannot restore invalidated account identity", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const settingsChanges = yield* PubSub.unbounded<TestSettings>();
+        const initialEnriched = yield* Deferred.make<void>();
+        const settingsEnriched = yield* Deferred.make<void>();
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.fromPubSub(settingsChanges),
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          checkProviderOnSettingsChange: () => false,
+          refreshOnInterval: false,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Effect.succeed(refreshedSnapshot),
+          enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
+            Effect.gen(function* () {
+              yield* publishSnapshot(snapshot);
+              yield* Deferred.succeed(
+                settings.enabled ? initialEnriched : settingsEnriched,
+                undefined,
+              );
+            }),
+        });
+        yield* Deferred.await(initialEnriched);
+        yield* provider.invalidateAccount!;
+        yield* PubSub.publish(settingsChanges, { enabled: false });
+        yield* Deferred.await(settingsEnriched);
+        assert.deepEqual((yield* provider.getSnapshot).auth, { status: "unknown" });
+        assert.isUndefined((yield* provider.getSnapshot).usageLimits);
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
   it.effect("streams supplemental snapshot updates after the base provider check completes", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -603,6 +640,139 @@ describe("makeManagedServerProvider", () => {
         assert.deepStrictEqual(yield* provider.getSnapshot, update);
       }),
     ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect("orders account invalidation after an already-committed publication", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (a, b) => a.enabled !== b.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Effect.succeed(refreshedSnapshot),
+          refreshInterval: "1 hour",
+        });
+        yield* Stream.take(provider.streamChanges, 1).pipe(Stream.runDrain);
+        const publishing = yield* Deferred.make<void>();
+        const releasePublication = yield* Deferred.make<void>();
+        const invalidationStarted = yield* Deferred.make<void>();
+        const invalidationDone = yield* Ref.make(false);
+        const observed: ServerProvider[] = [];
+        const actualPubSub = yield* Effect.promise(() =>
+          vi.importActual<typeof import("effect/PubSub")>("effect/PubSub"),
+        );
+        const originalPublish = actualPubSub.publish;
+        let pause = true;
+        const publish = vi.spyOn(PubSub, "publish").mockImplementation(((
+          pubsub: PubSub.PubSub<ServerProvider>,
+          snapshot: ServerProvider,
+        ) =>
+          Effect.gen(function* () {
+            if (pause && snapshot === refreshedSnapshot) {
+              pause = false;
+              // Suspend after the Ref commit but before notification. Without
+              // serialization the old account could appear after invalidation.
+              yield* Deferred.succeed(publishing, undefined);
+              yield* Deferred.await(releasePublication);
+            }
+            observed.push(snapshot);
+            return yield* originalPublish(pubsub, snapshot);
+          })) as typeof PubSub.publish);
+        yield* Effect.addFinalizer(() => Effect.sync(() => publish.mockRestore()));
+        const refresh = yield* provider.refresh.pipe(Effect.forkChild);
+        yield* Deferred.await(publishing);
+        const invalidate = yield* Deferred.succeed(invalidationStarted, undefined).pipe(
+          Effect.andThen(provider.invalidateAccount!),
+          Effect.andThen(Ref.set(invalidationDone, true)),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(invalidationStarted);
+        yield* Effect.yieldNow;
+        assert.isFalse(yield* Ref.get(invalidationDone));
+        yield* Deferred.succeed(releasePublication, undefined);
+        yield* Fiber.join(refresh);
+        yield* Fiber.join(invalidate);
+        assert.strictEqual(observed.at(-1)?.auth.status, "unknown");
+        assert.isUndefined(observed.at(-1)?.usageLimits);
+        assert.strictEqual((yield* provider.getSnapshot).auth.status, "unknown");
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect(
+    "clears switched account usage immediately and rejects earlier probes and enrichment",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const oldProbeStarted = yield* Deferred.make<void>();
+          const releaseOldProbe = yield* Deferred.make<void>();
+          const enrichmentStarted = yield* Deferred.make<void>();
+          const count = yield* Ref.make(0);
+          const oldAccount: ServerProvider = {
+            ...refreshedSnapshot,
+            auth: { status: "authenticated", email: "same@example.test", workspaceId: "org-a" },
+            usageLimits: {
+              checkedAt: "2026-04-10T00:00:01.000Z",
+              windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 95 }],
+            },
+          };
+          const newAccount: ServerProvider = {
+            ...oldAccount,
+            auth: { ...oldAccount.auth, workspaceId: "org-b" },
+            usageLimits: {
+              checkedAt: "2026-04-10T00:00:02.000Z",
+              windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 31 }],
+            },
+          };
+          const oldEnrichment = yield* Ref.make<Effect.Effect<void>>(Effect.void);
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (a, b) => a.enabled !== b.enabled,
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            refreshInterval: "1 hour",
+            checkProvider: Effect.gen(function* () {
+              const call = yield* Ref.updateAndGet(count, (n) => n + 1);
+              if (call === 2) {
+                yield* Deferred.succeed(oldProbeStarted, undefined);
+                yield* Deferred.await(releaseOldProbe);
+              }
+              return call <= 2 ? oldAccount : newAccount;
+            }),
+            enrichSnapshot: ({ snapshot, publishSnapshot }) =>
+              snapshot.auth.workspaceId === "org-a"
+                ? Ref.set(oldEnrichment, publishSnapshot(oldAccount)).pipe(
+                    Effect.andThen(Deferred.succeed(enrichmentStarted, undefined)),
+                    Effect.asVoid,
+                  )
+                : Effect.void,
+          });
+          yield* Deferred.await(enrichmentStarted);
+          const oldProbe = yield* provider.refresh.pipe(Effect.forkChild);
+          yield* Deferred.await(oldProbeStarted);
+          yield* provider.invalidateAccount!;
+          assert.deepStrictEqual((yield* provider.getSnapshot).auth, { status: "unknown" });
+          assert.isUndefined((yield* provider.getSnapshot).usageLimits);
+          yield* yield* Ref.get(oldEnrichment);
+          assert.isUndefined((yield* provider.getSnapshot).usageLimits);
+          yield* Deferred.succeed(releaseOldProbe, undefined);
+          const ignoredOldProbe = yield* Fiber.join(oldProbe);
+          assert.deepStrictEqual(ignoredOldProbe.auth, { status: "unknown" });
+          assert.isUndefined(ignoredOldProbe.usageLimits);
+          const refreshed = yield* provider.refresh;
+          assert.strictEqual(refreshed.auth.workspaceId, "org-b");
+          assert.strictEqual(refreshed.usageLimits?.windows[0]?.usedPercent, 31);
+          yield* yield* Ref.get(oldEnrichment);
+          assert.strictEqual((yield* provider.getSnapshot).auth.workspaceId, "org-b");
+          assert.strictEqual(
+            (yield* provider.getSnapshot).usageLimits?.windows[0]?.usedPercent,
+            31,
+          );
+        }),
+      ).pipe(Effect.provide(layerAlwaysRunTest)),
   );
 
   it.effect("keeps live usage windows across a failed probe and a stale enrichment", () =>

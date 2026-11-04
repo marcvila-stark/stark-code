@@ -36,6 +36,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { PermissionSource } from "./providerPolicy.ts";
 
 const PROVIDER_SLUG_MAX_CHARS = 64;
 /**
@@ -128,8 +129,29 @@ export const ProviderInstanceConfig = Schema.Struct({
   environment: Schema.optionalKey(ProviderInstanceEnvironment),
   enabled: Schema.optionalKey(Schema.Boolean),
   config: Schema.optionalKey(Schema.Unknown),
+  /**
+   * Where new chats on this instance take their permissions from. Unset means
+   * the driver's default (`newChatPermissionSourceFor`). Saved chats and the
+   * native terminal never follow this setting.
+   */
+  newChatPermissionSource: Schema.optionalKey(PermissionSource),
 });
 export type ProviderInstanceConfig = typeof ProviderInstanceConfig.Type;
+
+/**
+ * The permission source a new chat on an instance starts with: the instance's
+ * setting, else Claude's own settings for Claude and a Stark preset for every
+ * other driver. The server still stores `override` when the instance cannot
+ * inherit.
+ */
+export function newChatPermissionSourceFor(instance: {
+  readonly driver: ProviderDriverKind;
+  readonly newChatPermissionSource?: PermissionSource | undefined;
+}): PermissionSource {
+  return (
+    instance.newChatPermissionSource ?? (instance.driver === "claudeAgent" ? "inherit" : "override")
+  );
+}
 
 /** Atomic mutation for one provider-instance map entry. */
 export const ProviderInstanceMutation = Schema.Union([

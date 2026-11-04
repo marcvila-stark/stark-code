@@ -5,24 +5,21 @@ import {
   htmlRenderFrameHeight,
   type HtmlRenderReference,
 } from "@starkfuture/shared/htmlRender";
-import { Maximize2Icon } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
 
 import { HtmlRenderDocument } from "../files/BrowserDocumentFrame";
-import { Button } from "../ui/button";
 import { toastManager } from "../ui/toast";
-import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { HtmlRenderDialog } from "./HtmlRenderDialog";
+import { InlinePreviewStage } from "./InlinePreviewStage";
 import { observeResize } from "~/lib/observeResize";
 
 // A frame may load its URL a little after mounting.
 const MIN_URL_LIFE_MS = 5 * 60_000;
 
 /**
- * An agent's HTML render inline in the thread: the page itself on the thread's
- * own background, at the server's measured height for this width until the
+ * An agent's HTML render inline in the thread, at the server's measured height until the
  * page reports its own. Loading and failure hold the same box so nothing below
  * it moves.
  */
@@ -31,6 +28,12 @@ export function HtmlRenderFrame(props: {
   readonly htmlRender: HtmlRenderReference;
   readonly threadRef: ScopedThreadRef | undefined;
   readonly onFullscreenChange?: (fullscreen: boolean) => void;
+  readonly navigation?: {
+    readonly index: number;
+    readonly count: number;
+    readonly onPrevious: () => void;
+    readonly onNext: () => void;
+  };
 }) {
   const { attachmentId, title } = props.htmlRender;
   // The frame takes the page's measured height at its own width, read before
@@ -42,7 +45,8 @@ export function HtmlRenderFrame(props: {
     if (!box) return;
     setWidth(box.clientWidth);
     return observeResize(box, ([entry]) => {
-      if (entry) setWidth(entry.contentRect.width);
+      // A visited carousel page stays mounted while hidden; keep its last real width.
+      if (entry && entry.contentRect.width > 0) setWidth(entry.contentRect.width);
     });
   }, []);
   // Client fonts can wrap a page taller than the server measured it; a frame
@@ -99,57 +103,108 @@ export function HtmlRenderFrame(props: {
     );
   }, [cacheFailed, cachedExpiresAt, cachedUrl, refresh, src]);
 
+  const expand = async () => {
+    const url = await refresh().catch(() => null);
+    if (url !== null) setExpandedSrc(url);
+    else
+      toastManager.add({
+        type: "error",
+        title: "Page unavailable",
+        description: "Reconnect to the environment and try again.",
+      });
+  };
+
   return (
-    <div ref={boxRef} className="group/html-render relative" style={{ height }}>
-      {src !== null ? (
-        <>
-          <HtmlRenderDocument
-            src={src}
-            title={title}
-            threadRef={props.threadRef}
-            className="block size-full"
-            onContentHeight={setContentHeight}
-          />
-          <div className="absolute end-2 top-2 flex gap-1 opacity-0 transition-opacity duration-150 focus-within:opacity-100 group-hover/html-render:opacity-100 pointer-coarse:opacity-100">
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    aria-label="Open full screen"
-                    size="icon-xs"
-                    variant="glass"
-                    onClick={async () => {
-                      const url = await refresh().catch(() => null);
-                      if (url !== null) setExpandedSrc(url);
-                      else
-                        toastManager.add({
-                          type: "error",
-                          title: "Page unavailable",
-                          description: "Reconnect to the environment and try again.",
-                        });
-                    }}
-                  />
-                }
-              >
-                <Maximize2Icon className="size-3.5" />
-              </TooltipTrigger>
-              <TooltipPopup side="left">Open full screen</TooltipPopup>
-            </Tooltip>
-          </div>
-          {expandedSrc !== null ? (
-            <HtmlRenderDialog
-              src={expandedSrc}
+    <InlinePreviewStage
+      title={title}
+      {...props.navigation}
+      onExpand={expand}
+      expandDisabled={src === null}
+    >
+      <div ref={boxRef} className="relative" style={{ height }}>
+        {src !== null ? (
+          <>
+            <HtmlRenderDocument
+              src={src}
               title={title}
               threadRef={props.threadRef}
-              onClose={() => setExpandedSrc(null)}
+              className="block size-full"
+              onContentHeight={setContentHeight}
             />
-          ) : null}
-        </>
-      ) : failed ? (
-        <p className="flex size-full items-center justify-center text-muted-foreground text-xs">
-          Unable to load {title}
-        </p>
-      ) : null}
+            {expandedSrc !== null ? (
+              <HtmlRenderDialog
+                src={expandedSrc}
+                title={title}
+                threadRef={props.threadRef}
+                onClose={() => setExpandedSrc(null)}
+              />
+            ) : null}
+          </>
+        ) : failed ? (
+          <p className="flex size-full items-center justify-center text-muted-foreground text-xs">
+            Unable to load {title}
+          </p>
+        ) : null}
+      </div>
+    </InlinePreviewStage>
+  );
+}
+
+/** Only adjacent pages from one turn share navigation. Visited pages retain their UI state. */
+export function HtmlRenderGallery(props: {
+  readonly environmentId: EnvironmentId;
+  readonly renders: readonly HtmlRenderReference[];
+  readonly threadRef: ScopedThreadRef | undefined;
+  readonly onFullscreenChange?: (fullscreen: boolean) => void;
+}) {
+  const [selected, setSelected] = useState(props.renders[0]?.attachmentId);
+  const [visited, setVisited] = useState(() => new Set([selected]));
+  const galleryRef = useRef<HTMLDivElement>(null);
+  const navigationFocus = useRef<string | null>(null);
+  const foundIndex = props.renders.findIndex((render) => render.attachmentId === selected);
+  const index = Math.max(0, foundIndex);
+  const navigate = (direction: -1 | 1) => {
+    const next = props.renders[(index + direction + props.renders.length) % props.renders.length];
+    if (!next) return;
+    navigationFocus.current = direction === -1 ? "Previous preview" : "Next preview";
+    setSelected(next.attachmentId);
+    setVisited((current) => new Set([...current, next.attachmentId]));
+  };
+  useLayoutEffect(() => {
+    if (selected === undefined || navigationFocus.current === null) return;
+    galleryRef.current
+      ?.querySelector<HTMLButtonElement>(
+        `[data-preview-active="true"] button[aria-label="${navigationFocus.current}"]`,
+      )
+      ?.focus({ preventScroll: true });
+    navigationFocus.current = null;
+  }, [selected]);
+  return (
+    <div ref={galleryRef}>
+      {props.renders.map((render, position) =>
+        position === index || visited.has(render.attachmentId) ? (
+          <div
+            key={render.attachmentId}
+            hidden={position !== index}
+            data-preview-active={position === index}
+          >
+            <HtmlRenderFrame
+              environmentId={props.environmentId}
+              htmlRender={render}
+              threadRef={props.threadRef}
+              {...(props.onFullscreenChange
+                ? { onFullscreenChange: props.onFullscreenChange }
+                : {})}
+              navigation={{
+                index: position,
+                count: props.renders.length,
+                onPrevious: () => navigate(-1),
+                onNext: () => navigate(1),
+              }}
+            />
+          </div>
+        ) : null,
+      )}
     </div>
   );
 }

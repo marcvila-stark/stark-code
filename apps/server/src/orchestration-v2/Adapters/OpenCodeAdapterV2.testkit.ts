@@ -57,7 +57,7 @@ export class OpenCodeReplayMismatchError extends Schema.TaggedError<OpenCodeRepl
   },
 ) {
   override get message(): string {
-    return `OpenCode replay frame mismatch at cursor ${this.cursor} in scenario ${this.scenario}.`;
+    return `OpenCode replay frame mismatch at cursor ${this.cursor} in scenario ${this.scenario}. Expected ${JSON.stringify(this.expected)}, received ${JSON.stringify(this.actual)}.`;
   }
 }
 
@@ -323,7 +323,7 @@ export class OpenCodeReplayController {
   }
 
   private fail(cause: unknown): void {
-    this.failure = cause;
+    this.failure ??= cause;
     for (const waiter of this.waiters) waiter();
     this.waiters.clear();
   }

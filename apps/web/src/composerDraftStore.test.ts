@@ -3347,6 +3347,62 @@ describe("composerDraftStore inline context references", () => {
     expect(merged.draftsByThreadKey[threadKeyFor(threadId)]?.prompt).toContain(annotationLink);
   });
 
+  it("keeps browser capture cards separate when replacing annotations", () => {
+    const store = useComposerDraftStore.getState();
+    const browserCapture = { ...annotation, id: "browser-capture-bulk" };
+    store.setPrompt(threadRef, "Keep this existing prompt intact.");
+    store.setPreviewAnnotations(threadRef, [browserCapture]);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe(
+      "Keep this existing prompt intact.",
+    );
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.previewAnnotations).toEqual([browserCapture]);
+
+    store.setPreviewAnnotations(threadRef, [browserCapture, annotation]);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe(
+      `Keep this existing prompt intact. ${annotationLink} `,
+    );
+  });
+
+  it("does not synthesize a browser capture chip when clearing text and attachments", () => {
+    const store = useComposerDraftStore.getState();
+    const browserCapture = { ...annotation, id: "browser-capture-clear" };
+    store.setPrompt(threadRef, "Clear this text.");
+    store.addPreviewAnnotation(threadRef, browserCapture, { appendReference: false });
+    store.addPreviewAnnotation(threadRef, annotation);
+    store.clearComposerPromptAndImages(threadRef);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe(`${annotationLink} `);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.previewAnnotations).toEqual([
+      browserCapture,
+      annotation,
+    ]);
+  });
+
+  it("preserves an existing browser capture reference through hydration and bulk replacement", () => {
+    const browserCapture = { ...annotation, id: "browser-capture-linked" };
+    const browserLink =
+      "[Bigger](stark-context://v1/preview-annotation/preview-annotation_browser-capture-linked)";
+    const prompt = `Before ${browserLink} after.`;
+    const merged = useComposerDraftStore.persist.getOptions().merge!(
+      {
+        draftsByThreadKey: {
+          [threadKeyFor(threadId)]: {
+            prompt,
+            attachments: [],
+            previewAnnotations: [browserCapture],
+          },
+        },
+      },
+      useComposerDraftStore.getInitialState(),
+    );
+    expect(merged.draftsByThreadKey[threadKeyFor(threadId)]?.prompt).toBe(prompt);
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, prompt);
+    store.setPreviewAnnotations(threadRef, [browserCapture]);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe(prompt);
+    store.clearComposerPromptAndImages(threadRef);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe(`${browserLink} `);
+  });
+
   it("adds links for persisted review comments that predate references", () => {
     const persistApi = useComposerDraftStore.persist as unknown as {
       getOptions: () => {

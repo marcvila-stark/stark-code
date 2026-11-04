@@ -33,21 +33,25 @@ export function assertClaudeThreadRollbackOutput(
   assertRunOrdinals(projection, [1, 2, 3]);
   assertTurnItemTypeSequence(projection, [
     "user_message",
+    "hook_run",
     "assistant_message",
     "checkpoint",
     "user_message",
     "assistant_message",
     "checkpoint",
     "user_message",
+    "hook_run",
     "reasoning",
     "assistant_message",
     "checkpoint",
   ]);
   assertVisibleTurnItemTypeSequence(projection, [
     "user_message",
+    "hook_run",
     "assistant_message",
     "checkpoint",
     "user_message",
+    "hook_run",
     "reasoning",
     "assistant_message",
     "checkpoint",

@@ -1,9 +1,11 @@
 import {
   DesktopHostTelemetryMessage,
   type DesktopHostTelemetrySnapshot,
+  type DesktopMaintenanceRequest,
   type DesktopTelemetryControlMessage,
   type DesktopTelemetryCancelDesktopUpdate,
   type DesktopTelemetryCommitDesktopUpdate,
+  type DesktopTelemetryMaintenanceStatus,
   type DesktopTelemetryRequestDesktopUpdate,
   type DesktopUpdateStatusReport,
   type HostPowerSnapshot,
@@ -31,6 +33,9 @@ const CONSTRAINED_SAMPLE_INTERVAL = Duration.seconds(15);
 const DEFAULT_HOST_POWER_ACTIVE_INTERVAL = Duration.seconds(30);
 const DEFAULT_HOST_POWER_IDLE_INTERVAL = Duration.minutes(2);
 const IDLE_THRESHOLD_SECONDS = 60;
+// Gate statuses are rare (one per request, plus lease expiries); the bound only
+// keeps an absent consumer from accumulating them.
+const MAINTENANCE_STATUS_BUFFER = 64;
 const encodeMessage = Schema.encodeSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
 const textEncoder = new TextEncoder();
 
@@ -58,6 +63,12 @@ interface HostPowerIntervals {
   readonly idle: Duration.Duration;
 }
 
+/** A maintenance gate status and the backend (control source) that reported it. */
+export interface DesktopMaintenanceStatusFromSource {
+  readonly sourceId: string;
+  readonly message: DesktopTelemetryMaintenanceStatus;
+}
+
 export class DesktopTelemetryPublisher extends Context.Service<
   DesktopTelemetryPublisher,
   {
@@ -77,6 +88,13 @@ export class DesktopTelemetryPublisher extends Context.Service<
     readonly updateRequests: Stream.Stream<DesktopTelemetryRequestDesktopUpdate>;
     readonly updateCommits: Stream.Stream<DesktopTelemetryCommitDesktopUpdate>;
     readonly updateCancellations: Stream.Stream<DesktopTelemetryCancelDesktopUpdate>;
+    /** Sends the request to every attached backend. Never replayed: a backend
+        that attaches later (a restart) starts with an open gate and owes no
+        answer. */
+    readonly sendMaintenanceRequest: (request: DesktopMaintenanceRequest) => Effect.Effect<void>;
+    /** Gate statuses the backends report, each tagged with its backend.
+        Single consumer. */
+    readonly maintenanceStatuses: Stream.Stream<DesktopMaintenanceStatusFromSource>;
   }
 >()("@starkfuture/desktop/telemetry/DesktopTelemetryPublisher") {}
 
@@ -179,6 +197,9 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
   const updateRequestQueue = yield* Queue.unbounded<DesktopTelemetryRequestDesktopUpdate>();
   const updateCommitQueue = yield* Queue.unbounded<DesktopTelemetryCommitDesktopUpdate>();
   const updateCancellationQueue = yield* Queue.unbounded<DesktopTelemetryCancelDesktopUpdate>();
+  const maintenanceRequestChanges = yield* PubSub.sliding<DesktopMaintenanceRequest>(16);
+  const maintenanceStatusQueue =
+    yield* Queue.sliding<DesktopMaintenanceStatusFromSource>(MAINTENANCE_STATUS_BUFFER);
 
   const offer = (event: PowerEvent): void => {
     Queue.offerUnsafe(powerEvents, event);
@@ -353,6 +374,8 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
         return Queue.offer(updateCommitQueue, message).pipe(Effect.asVoid);
       case "cancelDesktopUpdate":
         return Queue.offer(updateCancellationQueue, message).pipe(Effect.asVoid);
+      case "maintenanceStatus":
+        return Queue.offer(maintenanceStatusQueue, { sourceId, message }).pipe(Effect.asVoid);
     }
   };
   const removeControlSource: DesktopTelemetryPublisher["Service"]["removeControlSource"] = (
@@ -397,13 +420,16 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
       );
     }),
   );
+  const maintenanceRequests = Stream.unwrap(
+    PubSub.subscribe(maintenanceRequestChanges).pipe(Effect.map(Stream.fromSubscription)),
+  );
   const encoded = Stream.concat(
     Stream.make({
       version: 1,
       type: "desktopTelemetryHello",
       electronPid: process.pid,
     } as const),
-    Stream.merge(snapshots, updateReports),
+    Stream.merge(Stream.merge(snapshots, updateReports), maintenanceRequests),
   ).pipe(Stream.map((message) => textEncoder.encode(`${encodeMessage(message)}\n`)));
 
   const publishUpdateReport: DesktopTelemetryPublisher["Service"]["publishUpdateReport"] = (
@@ -413,6 +439,10 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
       Effect.andThen(PubSub.publish(updateReportChanges, report)),
       Effect.asVoid,
     );
+
+  const sendMaintenanceRequest: DesktopTelemetryPublisher["Service"]["sendMaintenanceRequest"] = (
+    request,
+  ) => PubSub.publish(maintenanceRequestChanges, request).pipe(Effect.asVoid);
 
   return DesktopTelemetryPublisher.of({
     latest: Ref.get(latest),
@@ -424,6 +454,8 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
     updateRequests: Stream.fromQueue(updateRequestQueue),
     updateCommits: Stream.fromQueue(updateCommitQueue),
     updateCancellations: Stream.fromQueue(updateCancellationQueue),
+    sendMaintenanceRequest,
+    maintenanceStatuses: Stream.fromQueue(maintenanceStatusQueue),
   });
 });
 

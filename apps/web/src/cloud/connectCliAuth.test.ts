@@ -6,6 +6,20 @@ import {
   hasConnectCliAuthConfig,
 } from "./connectCliAuth";
 
+// The local build disables hosted services. This fixture exercises the optional
+// authorize-URL builder with public, fake configuration; it never starts sign-in.
+vi.mock("./publicConfig", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./publicConfig")>()),
+  resolveCloudPublicConfig: () => ({
+    clerkPublishableKey:
+      (import.meta.env.VITE_CLERK_PUBLISHABLE_KEY as string | undefined)?.trim() || null,
+    clerkJwtTemplate:
+      (import.meta.env.VITE_CLERK_JWT_TEMPLATE as string | undefined)?.trim() || null,
+    relayUrl: (import.meta.env.VITE_STARK_CODE_RELAY_URL as string | undefined)?.trim() || null,
+    relayTracing: { tracesUrl: null, tracesDataset: null, tracesToken: null },
+  }),
+}));
+
 // Any pk_test_* key decodes to <base64 hostname>.clerk.accounts.dev.
 const TEST_PUBLISHABLE_KEY = `pk_test_${btoa("witty-mole-42.clerk.accounts.dev$")}`;
 

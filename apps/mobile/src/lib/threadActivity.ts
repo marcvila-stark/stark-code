@@ -61,7 +61,12 @@ import {
   formatReadToolLabel,
   formatSearchToolLabel,
 } from "@starkfuture/shared/toolActivity";
-import { formatDuration } from "@starkfuture/shared/orchestrationTiming";
+import {
+  formatDuration,
+  humanWaitFromTurnItem,
+  humanWaitMs,
+  workedForLabel,
+} from "@starkfuture/shared/orchestrationTiming";
 import type { HtmlRenderReference } from "@starkfuture/shared/htmlRender";
 import type { McpAppReference } from "@starkfuture/shared/mcpApp";
 import {
@@ -307,6 +312,8 @@ const projectedEntriesCache = new WeakMap<
   OrchestrationV2ProjectedTurnItem,
   {
     readonly attemptId: RunAttemptId | null;
+    /** The row was built as a command or tool call its approval never allowed. */
+    readonly declined: boolean;
     readonly entry: RawThreadFeedEntry;
   }
 >();
@@ -512,6 +519,8 @@ function itemWorkLogTone(item: OrchestrationV2TurnItem): WorkLogPresentationEntr
 }
 
 function itemIcon(item: OrchestrationV2TurnItem): ThreadFeedActivity["icon"] {
+  if (item.type === "hook_run")
+    return item.outcome === "blocked" || item.outcome === "failed" ? "warning" : "wrench";
   if (item.type === "notification") {
     const source = item.source;
     switch (source.kind) {
@@ -598,6 +607,7 @@ function itemSummary(
   item: OrchestrationV2TurnItem,
   toolPresentation: StarkMcpToolPresentation | null = null,
 ): string {
+  if (item.type === "hook_run") return item.summary;
   if (item.type === "notification") return item.summary;
   if (item.type === "system_notice") return item.message;
   if (item.type === "compaction") return contextCompactionLabel(item);
@@ -666,6 +676,7 @@ function itemSummary(
 }
 
 function itemPreview(item: OrchestrationV2TurnItem): string | null {
+  if (item.type === "hook_run") return item.detail || null;
   switch (item.type) {
     case "reasoning":
       return item.text || null;
@@ -720,6 +731,7 @@ function toWorkLogEntry(
   createdAt: string,
   summary: string,
   detail: string | null,
+  lifecycleStatus: WorkLogToolLifecycleStatus = itemLifecycleStatus(item),
 ): WorkLogPresentationEntry {
   const title = item.title?.trim() || null;
   const common = {
@@ -729,7 +741,7 @@ function toWorkLogEntry(
     label: summary,
     tone: itemWorkLogTone(item),
     itemType: item.type,
-    toolLifecycleStatus: itemLifecycleStatus(item),
+    toolLifecycleStatus: lifecycleStatus,
     structuredPayload: item,
     ...(item.type === "user_input_request" && item.questionAnswer
       ? { questionAnswer: item.questionAnswer }
@@ -808,13 +820,16 @@ export function formatItemFullDetail(
 function toFeedActivity(
   row: OrchestrationV2ProjectedTurnItem,
   attemptId: RunAttemptId | null,
+  declined = false,
 ): ThreadFeedActivity {
   const item = row.item;
   const toolPresentation = itemToolPresentation(item);
   const summary = itemSummary(item, toolPresentation);
   const detail = item.type === "notification" ? null : itemPreview(item);
   const createdAt = DateTime.formatIso(item.startedAt ?? item.updatedAt);
-  const workEntry = toWorkLogEntry(item, createdAt, summary, detail);
+  // A command its approval never allowed did not run, whatever its item says.
+  const lifecycleStatus = declined ? "declined" : itemLifecycleStatus(item);
+  const workEntry = toWorkLogEntry(item, createdAt, summary, detail, lifecycleStatus);
   const readPaths =
     item.type === "dynamic_tool" && toolGroupAction(workEntry) === "read"
       ? collectToolFilePaths(item)
@@ -860,7 +875,7 @@ function toFeedActivity(
         : workEntryDisplayIndicatesToolFailure(workEntry)
           ? "failure"
           : itemStatus(item),
-    lifecycleStatus: itemLifecycleStatus(item),
+    lifecycleStatus,
     workEntry,
     projectedItem: row,
   };
@@ -1172,17 +1187,27 @@ function deriveThreadFeedRunFolds(
     const latestRunMatches = latestRun?.runId === runId;
     const lastEntryEnd =
       lastEntry.type === "message" ? lastEntry.message.updatedAt : lastEntry.createdAt;
-    const elapsedMs =
+    const [windowStart, windowEnd] =
       latestRunMatches && latestRun.startedAt && latestRun.completedAt
-        ? computeElapsedMs(latestRun.startedAt, latestRun.completedAt)
-        : computeElapsedMs(
+        ? [latestRun.startedAt, latestRun.completedAt]
+        : [
             group.startBoundary ?? firstEntry.createdAt,
             maxIsoTimestamp(
               terminalEntry?.type === "message" ? terminalEntry.message.updatedAt : null,
               lastEntryEnd,
             ) ?? lastEntryEnd,
-          );
+          ];
+    const elapsedMs = computeElapsedMs(windowStart, windowEnd);
     const duration = elapsedMs === null ? null : formatDuration(elapsedMs);
+    // Approval and question waits are the user's time, not the agent's work.
+    const waits = group.entries.flatMap((entry) =>
+      entry.type === "activity-group"
+        ? entry.activities.flatMap((activity) => {
+            const wait = humanWaitFromTurnItem(activity.projectedItem.item);
+            return wait === null ? [] : [wait];
+          })
+        : [],
+    );
     const interrupted =
       latestRunMatches && (latestRun.status === "interrupted" || latestRun.status === "cancelled");
     foldsByAnchorId.set(firstHiddenEntry.id, {
@@ -1193,9 +1218,10 @@ function deriveThreadFeedRunFolds(
         ? duration
           ? `You stopped after ${duration}`
           : "You stopped this response"
-        : duration
-          ? `Worked for ${duration}`
-          : "Worked",
+        : workedForLabel(
+            elapsedMs,
+            humanWaitMs(waits, Date.parse(windowStart), Date.parse(windowEnd)),
+          ),
     });
   }
   return foldsByAnchorId;
@@ -1735,6 +1761,8 @@ export function buildThreadFeed(
     readonly anchoredMessages?: ReadonlyArray<LocalThreadMessage>;
     readonly attempts?: ReadonlyArray<OrchestrationV2RunAttempt>;
     readonly nodes?: ReadonlyArray<OrchestrationV2ExecutionNode>;
+    /** Commands and tool calls whose approval never allowed them (`deriveDeclinedApprovalItemIds`). */
+    readonly declinedItemIds?: ReadonlySet<string>;
   },
 ): ThreadFeedEntry[] {
   const entries: RawThreadFeedEntry[] = [];
@@ -1776,8 +1804,11 @@ export function buildThreadFeed(
       continue;
     }
     const attemptId = resolveAttemptId(item);
+    const declined =
+      (item.type === "command_execution" || item.type === "dynamic_tool") &&
+      options?.declinedItemIds?.has(item.id) === true;
     const cached = projectedEntriesCache.get(row);
-    if (cached?.attemptId === attemptId) {
+    if (cached?.attemptId === attemptId && cached.declined === declined) {
       entries.push(cached.entry);
       continue;
     }
@@ -1795,7 +1826,7 @@ export function buildThreadFeed(
         runId: item.runId,
         render,
       };
-      projectedEntriesCache.set(row, { attemptId, entry });
+      projectedEntriesCache.set(row, { attemptId, declined, entry });
       entries.push(entry);
       continue;
     }
@@ -1814,7 +1845,7 @@ export function buildThreadFeed(
         revision: turnItemDetailRevision(item),
         app,
       };
-      projectedEntriesCache.set(row, { attemptId, entry });
+      projectedEntriesCache.set(row, { attemptId, declined, entry });
       entries.push(entry);
       continue;
     }
@@ -1848,11 +1879,11 @@ export function buildThreadFeed(
           projectedItem: row,
         },
       };
-      projectedEntriesCache.set(row, { attemptId, entry });
+      projectedEntriesCache.set(row, { attemptId, declined, entry });
       entries.push(entry);
       continue;
     }
-    const activity = toFeedActivity(row, attemptId);
+    const activity = toFeedActivity(row, attemptId, declined);
     const entry: RawThreadFeedEntry = {
       type: "activity",
       id: activity.id,
@@ -1860,7 +1891,7 @@ export function buildThreadFeed(
       runId: item.runId,
       activity,
     };
-    projectedEntriesCache.set(row, { attemptId, entry });
+    projectedEntriesCache.set(row, { attemptId, declined, entry });
     entries.push(entry);
   }
   const retainedMessageIds = new Set([

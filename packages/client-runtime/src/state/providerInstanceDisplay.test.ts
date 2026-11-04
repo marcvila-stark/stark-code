@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   normalizeProviderAccentColor,
   providerInstanceInitials,
+  providerKindDisplayName,
   resolveProviderInstanceDisplayName,
   shouldShowInstanceBadge,
 } from "./providerInstanceDisplay.ts";
@@ -11,6 +12,19 @@ import {
 const codex = ProviderDriverKind.make("codex");
 const claude = ProviderDriverKind.make("claudeAgent");
 const acpRegistry = ProviderDriverKind.make("acpRegistry");
+
+describe("providerKindDisplayName", () => {
+  it("names driver kinds and default instance ids by brand", () => {
+    expect(providerKindDisplayName("claudeAgent")).toBe("Claude");
+    expect(providerKindDisplayName(ProviderInstanceId.make("codex"))).toBe("Codex");
+    expect(providerKindDisplayName("cursor")).toBe("Cursor");
+  });
+
+  it("keeps ids it has no brand name for", () => {
+    expect(providerKindDisplayName("codex_personal")).toBe("codex_personal");
+    expect(providerKindDisplayName("Not a slug")).toBe("Not a slug");
+  });
+});
 
 describe("resolveProviderInstanceDisplayName", () => {
   it("keeps a snapshot name that differs from the brand label", () => {

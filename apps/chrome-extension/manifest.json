@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Stark Code Capture",
+  "version": "0.1.0",
+  "description": "Review selected text, images and screenshot regions, then add them to a Stark Code chat draft.",
+  "minimum_chrome_version": "127",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzud6y8Rd5OPGwwiSs7+iX6sx8A3FQi4W+cAUd4Wsclxwtc3AO1El92+/A9pRVwxj2SHENKK+DZ6PkaDmsij02KEYsFt+38/tVDS7IOLYD6xcv3e8DtA+Ucz4T3bKy/YKc566BJ94J5T/X0SvonhTOyUfKBN7QH6czYnmeO7V7I3UM8Eq7Obgxt5+6O9CkA2VmqRKnimnAZC9t8MdiRJZeYGIC8c/vyQXUY2J3DV9+W4znU2+VXt20RhbLYpAA/KPxlAHd7zbKcC/bQVT/RBX8I/6yedlk9YkQK0eCtcSK8zo0ybs+n+TUm7+GVaY7kUE4/3GaEGWG5ht7iXNWYRlfwIDAQAB",
+  "permissions": ["activeTab", "contextMenus", "scripting", "nativeMessaging", "storage"],
+  "action": {
+    "default_title": "Add to Stark Code",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "32": "icon.png"
+    }
+  },
+  "icons": {
+    "32": "icon.png"
+  },
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  },
+  "commands": {
+    "capture-region": {
+      "description": "Capture a page region for Stark Code"
+    }
+  }
+}

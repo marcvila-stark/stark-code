@@ -4,13 +4,19 @@ import {
   type ComposerPathSearchTarget,
 } from "@starkfuture/client-runtime/state/threads";
 import {
+  createThreadHistoryResultsAtomFamily,
   createThreadSearchResultsAtomFamily,
+  makeThreadHistoryKey,
   makeThreadSearchKey,
+  threadHistoryPageInput,
   type EnvironmentThreadSearchMatch,
+  type ThreadHistoryFilters,
+  type ThreadHistoryState,
 } from "@starkfuture/client-runtime/state/thread-search";
 import { type VcsRefTarget } from "@starkfuture/client-runtime/state/vcs";
 import type {
   EnvironmentId,
+  OrchestrationThreadHistoryCursor,
   ProjectContentMatch,
   ProjectEntry,
   ProjectEntryKind,
@@ -97,6 +103,84 @@ export function useThreadSearch(
     matches: isDebouncing ? EMPTY_THREAD_SEARCH_MATCHES : result.matches,
     query: settledQuery ?? "",
     isPending: canSearch && (isDebouncing || result.isLoading),
+  };
+}
+
+const threadHistoryResultsAtom = createThreadHistoryResultsAtomFamily({
+  getHistoryAtom: (environmentId, input) =>
+    orchestrationEnvironment.threadHistory({ environmentId, input }),
+  labelPrefix: "web:thread-history",
+});
+
+type ThreadHistoryCursors = Readonly<
+  Record<string, ReadonlyArray<OrchestrationThreadHistoryCursor>>
+>;
+const NO_THREAD_HISTORY_CURSORS: ThreadHistoryCursors = Object.freeze({});
+
+/**
+ * History across environments that answer `threadHistorySearch`. The query is
+ * debounced like `useThreadSearch`; older pages stay loaded until the filters
+ * change, and `showOlder` asks only the environments holding the list back.
+ */
+export function useThreadHistory(
+  environmentIds: ReadonlyArray<EnvironmentId>,
+  filters: ThreadHistoryFilters,
+): ThreadHistoryState & {
+  readonly isPending: boolean;
+  readonly showOlder: () => void;
+  readonly refresh: () => void;
+} {
+  const query = filters.query ?? "";
+  const debouncedQuery = useDebouncedValue(query, THREAD_SEARCH_DEBOUNCE_MS);
+  const isDebouncing = query !== debouncedQuery;
+  const { query: _query, ...rest } = filters;
+  const settledFilters: ThreadHistoryFilters =
+    debouncedQuery === "" ? rest : { ...rest, query: debouncedQuery };
+  const baseKey = makeThreadHistoryKey(
+    settledFilters,
+    environmentIds.map((environmentId) => ({ environmentId, cursors: [null] })),
+  );
+  const [olderPages, setOlderPages] = useState<{
+    readonly baseKey: string;
+    readonly cursors: ThreadHistoryCursors;
+  }>({ baseKey, cursors: NO_THREAD_HISTORY_CURSORS });
+  const cursors = olderPages.baseKey === baseKey ? olderPages.cursors : NO_THREAD_HISTORY_CURSORS;
+  const pages = environmentIds.map((environmentId) => ({
+    environmentId,
+    cursors: [null, ...(cursors[environmentId] ?? [])],
+  }));
+  const key = makeThreadHistoryKey(settledFilters, pages);
+  const state = useAtomValue(threadHistoryResultsAtom(key));
+  const { older } = state;
+  const showOlder = () => {
+    if (older.length === 0) return;
+    setOlderPages((previous) => {
+      const next: Record<string, ReadonlyArray<OrchestrationThreadHistoryCursor>> = {
+        ...(previous.baseKey === baseKey ? previous.cursors : NO_THREAD_HISTORY_CURSORS),
+      };
+      for (const page of older) {
+        next[page.environmentId] = [...(next[page.environmentId] ?? []), page.after];
+      }
+      return { baseKey, cursors: next };
+    });
+  };
+  const refresh = () => {
+    for (const page of pages) {
+      for (const cursor of page.cursors) {
+        appAtomRegistry.refresh(
+          orchestrationEnvironment.threadHistory({
+            environmentId: page.environmentId,
+            input: threadHistoryPageInput(settledFilters, cursor),
+          }),
+        );
+      }
+    }
+  };
+  return {
+    ...state,
+    isPending: isDebouncing || state.isLoading,
+    showOlder,
+    refresh,
   };
 }
 

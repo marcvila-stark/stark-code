@@ -66,26 +66,33 @@ describe("highlightSourceFile", () => {
   });
 
   it("initializes source and snippet highlighting without a warmup", async () => {
-    vi.resetModules();
-    const highlighter = await import("./shikiReviewHighlighter");
-    const source = "const answer: number = 42;";
+    // Shiki limits each line to 500ms. Control its clock so host load cannot
+    // truncate the cold call while this test compares initialization results.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      vi.resetModules();
+      const highlighter = await import("./shikiReviewHighlighter");
+      const source = "const answer: number = 42;";
 
-    const highlighted = await highlighter.highlightSourceFile({
-      path: "example.ts",
-      contents: source,
-      theme: "dark",
-    });
+      const highlighted = await highlighter.highlightSourceFile({
+        path: "example.ts",
+        contents: source,
+        theme: "dark",
+      });
 
-    expect(
-      highlighted
-        .flat()
-        .map((token) => token.content)
-        .join(""),
-    ).toBe(source);
-    expect(highlighted.flat().some((token) => token.color !== null)).toBe(true);
-    expect(
-      await highlighter.highlightCodeSnippet({ code: source, language: "ts", theme: "dark" }),
-    ).toEqual(highlighted);
+      expect(
+        highlighted
+          .flat()
+          .map((token) => token.content)
+          .join(""),
+      ).toBe(source);
+      expect(highlighted.flat().some((token) => token.color !== null)).toBe(true);
+      expect(
+        await highlighter.highlightCodeSnippet({ code: source, language: "ts", theme: "dark" }),
+      ).toEqual(highlighted);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });
 

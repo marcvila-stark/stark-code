@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   NodeId,
@@ -6,14 +6,18 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
+  ProviderDriverKind,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@starkfuture/contracts";
+import * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -27,6 +31,7 @@ import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
+import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -83,6 +88,8 @@ function layerExecutorFor(input: {
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
+  readonly runtimeRequests?: RuntimeRequestService.RuntimeRequestServiceV2Shape;
+  readonly getSession?: ProviderSessionManager.ProviderSessionManagerV2Shape["get"];
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
@@ -104,7 +111,7 @@ function layerExecutorFor(input: {
       ProviderSessionManager.ProviderSessionManagerV2.of({
         shutdown: Effect.void,
         open: () => Effect.die("unused open"),
-        get: () => Effect.succeed(Option.none()),
+        get: input.getSession ?? (() => Effect.succeed(Option.none())),
         peek: () => Effect.succeed(Option.none()),
         close: () => Effect.void,
         closeInstance: () => Effect.void,
@@ -143,7 +150,10 @@ function layerExecutorFor(input: {
     ),
     Layer.succeed(
       RuntimeRequestService.RuntimeRequestServiceV2,
-      RuntimeRequestService.RuntimeRequestServiceV2.of({ respond: () => Effect.void }),
+      input.runtimeRequests ??
+        RuntimeRequestService.RuntimeRequestServiceV2.of({
+          respond: () => Effect.succeed("delivered"),
+        }),
     ),
     Layer.succeed(
       ThreadTitleRegenerationService.ThreadTitleRegenerationService,
@@ -160,6 +170,7 @@ function layerExecutorFor(input: {
         ServerSettings.layerTest(
           input.continueAfterRestart === true ? { continueThreadsAfterServerUpdate: true } : {},
         ),
+        RuntimePolicy.layer,
       ),
     ),
   );
@@ -911,3 +922,292 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
       );
     }),
 );
+
+/** A user's answer waiting in the outbox, on its `attemptCount`th attempt. */
+const respondEffect = (attemptCount: number, now: string): EffectOutbox.OrchestrationEffectV2 => ({
+  id: "effect:respond",
+  commandId: CommandId.make("command:respond"),
+  threadId,
+  request: {
+    type: "runtime-request.respond",
+    providerSessionId: oldSessionId,
+    requestId: RuntimeRequestId.make("request:respond"),
+    decision: "accept",
+  },
+  status: "running",
+  attemptCount,
+  availableAt: now,
+  leaseOwner: "worker-respond",
+  leaseExpiresAt: now,
+  createdAt: now,
+  updatedAt: now,
+  completedAt: null,
+  lastError: null,
+});
+
+/**
+ * A worker running a user's answer through the real executor, with the
+ * outbox and the answer's delivery reports both writing to `events` in order.
+ */
+const respondWorker = (input: {
+  readonly events: Ref.Ref<ReadonlyArray<string>>;
+  readonly attempts: Ref.Ref<number>;
+  readonly respond: RuntimeRequestService.RuntimeRequestServiceV2Shape["respond"];
+  /** Stands in for the orchestrator recording a delivery report. */
+  readonly recordDelivery?: (state: string) => Effect.Effect<unknown>;
+  readonly now: string;
+}) => {
+  const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
+  const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    claimNext: () =>
+      Ref.updateAndGet(input.attempts, (count) => count + 1).pipe(
+        Effect.map((attempt) => Option.some(respondEffect(attempt, input.now))),
+      ),
+    get: () => Effect.succeed(Option.some(respondEffect(1, input.now))),
+    awaitCancellation: () => Effect.never,
+    clearCancellation: () => Effect.void,
+    retry: () => record("outbox:retry").pipe(Effect.as(true)),
+    fail: () => record("outbox:fail").pipe(Effect.as(true)),
+    succeed: () => record("outbox:succeed").pipe(Effect.as(true)),
+  });
+  const layerExecutor = layerExecutorFor({
+    events: input.events,
+    runtimeRequests: RuntimeRequestService.RuntimeRequestServiceV2.of({ respond: input.respond }),
+    threads: {
+      dispatch: (command) =>
+        command.type === "runtime-request.delivery.update"
+          ? (input.recordDelivery ?? ((state) => record(`delivery:${state}`)))(
+              `${command.state}${command.reason === undefined ? "" : `:${command.reason}`}`,
+            ).pipe(Effect.as({ sequence: 1, storedEvents: [] }))
+          : Effect.die(`unexpected ${command.type}`),
+    },
+  });
+  return EffectWorker.layerWithOptions({ workerId: "worker-respond", maxAttempts: 5 }).pipe(
+    Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+  );
+};
+
+it.effect("reports a delivered answer before the outbox settles it", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const attempts = yield* Ref.make(0);
+    yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce),
+      Effect.provide(
+        respondWorker({ events, attempts, now, respond: () => Effect.succeed("delivered") }),
+      ),
+    );
+    assert.deepEqual(yield* Ref.get(events), ["delivery:delivered", "outbox:succeed"]);
+  }),
+);
+
+it.effect("sends nothing again and reports nothing for an answer the provider already closed", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const attempts = yield* Ref.make(0);
+    yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce),
+      Effect.provide(
+        respondWorker({ events, attempts, now, respond: () => Effect.succeed("not_needed") }),
+      ),
+    );
+    assert.deepEqual(yield* Ref.get(events), ["outbox:succeed"]);
+  }),
+);
+
+it.effect("marks an answer that fails every attempt uncertain once, before failing its row", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const attempts = yield* Ref.make(0);
+    const failure = new RuntimeRequestService.RuntimeRequestResponseExecutionError({
+      reason: "unexpected-failure",
+      threadId,
+      providerSessionId: oldSessionId,
+      requestId: RuntimeRequestId.make("request:respond"),
+      cause: "adapter write failed",
+    });
+    yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => Effect.repeat(worker.runOnce, { times: 4 })),
+      Effect.provide(respondWorker({ events, attempts, now, respond: () => Effect.fail(failure) })),
+    );
+    assert.deepEqual(yield* Ref.get(events), [
+      "outbox:retry",
+      "outbox:retry",
+      "outbox:retry",
+      "outbox:retry",
+      "delivery:uncertain:Sending the answer failed; it may or may not have reached the agent.",
+      "outbox:fail",
+    ]);
+  }),
+);
+
+it.effect("reports an answer Stark never handed over as not delivered", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const attempts = yield* Ref.make(4);
+    const failure = new RuntimeRequestService.RuntimeRequestResponseExecutionError({
+      reason: "provider-session-not-active",
+      threadId,
+      providerSessionId: oldSessionId,
+      requestId: RuntimeRequestId.make("request:respond"),
+    });
+    yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce),
+      Effect.provide(respondWorker({ events, attempts, now, respond: () => Effect.fail(failure) })),
+    );
+    assert.deepEqual(yield* Ref.get(events), [
+      "delivery:not_delivered:The agent's session ended before the answer was sent.",
+      "outbox:fail",
+    ]);
+  }),
+);
+
+it.effect("reports an answer the adapter proved nothing waited for as not delivered", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const attempts = yield* Ref.make(4);
+    const requestId = RuntimeRequestId.make("request:respond");
+    const failure = new RuntimeRequestService.RuntimeRequestResponseExecutionError({
+      reason: "unexpected-failure",
+      threadId,
+      providerSessionId: oldSessionId,
+      requestId,
+      cause: new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
+        driver: ProviderDriverKind.make("codex"),
+        requestId,
+        nothingWaiting: true,
+      }),
+    });
+    yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce),
+      Effect.provide(respondWorker({ events, attempts, now, respond: () => Effect.fail(failure) })),
+    );
+    assert.deepEqual(yield* Ref.get(events), [
+      "delivery:not_delivered:Nothing was waiting for this answer any more, so nothing ran.",
+      "outbox:fail",
+    ]);
+  }),
+);
+
+// A process that dies after the last attempt failed but before its report
+// commits leaves the outbox row unsettled. Startup recovery reads unsettled
+// answers and keeps them as uncertain lost ones (ProjectionRecovery.test.ts,
+// "keeps an answer whose delivery the crash interrupted ...").
+it.effect("leaves the row unsettled for startup recovery when the process dies mid-report", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const attempts = yield* Ref.make(4);
+    const reporting = yield* Deferred.make<void>();
+    const failure = new RuntimeRequestService.RuntimeRequestResponseExecutionError({
+      reason: "unexpected-failure",
+      threadId,
+      providerSessionId: oldSessionId,
+      requestId: RuntimeRequestId.make("request:respond"),
+    });
+    const fiber = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce),
+      Effect.provide(
+        respondWorker({
+          events,
+          attempts,
+          now,
+          respond: () => Effect.fail(failure),
+          recordDelivery: () =>
+            Deferred.succeed(reporting, undefined).pipe(Effect.andThen(Effect.never)),
+        }),
+      ),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(reporting);
+    yield* Fiber.interrupt(fiber);
+    assert.deepEqual(yield* Ref.get(events), []);
+  }),
+);
+
+describe("permission changes during a run", () => {
+  const providerThreadIdForPolicy = ProviderThreadId.make("provider-thread:apply-policy");
+  const applyEffect = (
+    now: string,
+    timing: "now" | "after-run",
+  ): EffectOutbox.OrchestrationEffectV2 => ({
+    ...respondEffect(1, now),
+    id: `effect:apply-policy:${timing}`,
+    request: {
+      type: "provider-runtime.apply-policy",
+      providerSessionId: oldSessionId,
+      providerThreadId: providerThreadIdForPolicy,
+      timing,
+    },
+  });
+  /** A Codex chat that just narrowed to Supervised, and its live provider thread. */
+  const records = {
+    thread: {
+      id: threadId,
+      projectId: "project:apply-policy",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      worktreePath: "/work",
+    },
+    providerThreads: [{ id: providerThreadIdForPolicy, providerSessionId: oldSessionId }],
+    providerSessions: [{ id: oldSessionId, driver: "codex" }],
+  };
+
+  it.effect("hands the narrowed policy to a provider that applies it to a live thread", () =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const applied = yield* Ref.make<ReadonlyArray<string>>([]);
+      const layer = layerExecutorFor({
+        events,
+        getSession: () =>
+          Effect.succeed(
+            Option.some({
+              applyRuntimePolicy: (change: {
+                readonly providerThread: { readonly id: string };
+                readonly runtimePolicy: { readonly runtimeMode: string };
+                readonly timing: string;
+              }) =>
+                Ref.update(applied, (calls) => [
+                  ...calls,
+                  `${change.providerThread.id}:${change.runtimePolicy.runtimeMode}:${change.timing}`,
+                ]).pipe(Effect.as(change.timing === "now" ? "stopped" : "after-run")),
+            } as never),
+          ),
+        threads: { getThreadRecords: () => Effect.succeed(records as never) },
+      });
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        yield* executor.execute(applyEffect(now, "now"));
+        yield* executor.execute(applyEffect(now, "after-run"));
+      }).pipe(Effect.provide(layer));
+      assert.deepEqual(yield* Ref.get(applied), [
+        `${providerThreadIdForPolicy}:approval-required:now`,
+        `${providerThreadIdForPolicy}:approval-required:after-run`,
+      ]);
+    }),
+  );
+
+  it.effect("leaves the change to the next turn for an adapter without the hook", () =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const layer = layerExecutorFor({
+        events,
+        getSession: () => Effect.succeed(Option.some({} as never)),
+        threads: { getThreadRecords: () => Effect.die("no projection read without the hook") },
+      });
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        yield* executor.execute(applyEffect(now, "now"));
+      }).pipe(Effect.provide(layer));
+      assert.deepEqual(yield* Ref.get(events), []);
+    }),
+  );
+});

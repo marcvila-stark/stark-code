@@ -13,6 +13,18 @@ import {
 } from "@starkfuture/shared/orchestrationV2ThreadError";
 import { threadPullRequestsOf } from "@starkfuture/shared/threadPullRequests";
 import {
+  closeDeliveryLoss,
+  askAgainText,
+  isOpenLostRuntimeRequest,
+  isPersonFacingRuntimeRequest,
+  lostRuntimeRequestDetail,
+  openLostRuntimeRequests,
+} from "@starkfuture/shared/orchestrationV2LostRequests";
+import {
+  type UserShellCheckSubjectRejection,
+  validateUserShellCheckSubject,
+} from "@starkfuture/shared/userShellChecks";
+import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
   threadPullRequestKeysEqual,
@@ -24,6 +36,9 @@ import {
   CommandId,
   isProviderNativeSubagentThread,
   MessageId,
+  newChatPermissionSourceFor,
+  permissionSourceOf,
+  ProviderDriverKind,
   type NodeId,
   type ModelSelection,
   OrchestrationV2Command,
@@ -62,6 +77,7 @@ import {
   ThreadLinkedPullRequest,
   ThreadId,
   type TurnItemId,
+  USER_SHELL_CHECK_SUPERSEDED_CODE,
 } from "@starkfuture/contracts";
 import { modelSelectionsEqual } from "@starkfuture/shared/model";
 import {
@@ -106,6 +122,11 @@ import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from 
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimit.ts";
+import { DispatchSettingsWrite } from "./DispatchSettingsWrite.ts";
+import { DispatchPermissionRevocation } from "./DispatchPermissionRevocation.ts";
+import * as PermissionContainment from "./PermissionContainment.ts";
+import * as PermissionPolicy from "./PermissionPolicy.ts";
+import { isPersistentChoice, resolveApprovalChoice } from "./PermissionPolicy.ts";
 import {
   applyToProjection,
   emptyProjection,
@@ -141,6 +162,7 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
+import { continuesImportedAgentSession } from "./AgentSessionContinuation.ts";
 import type * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -526,6 +548,13 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.fork":
     case "thread.merge_back":
       return command.targetThreadId;
+    case "runtime-request.ask-again":
+    case "runtime-request.lost.dismiss":
+    case "runtime-request.delivery.update":
+    case "runtime-request.provider-closed":
+    case "thread.permission.set":
+    case "thread.permission.migrate":
+      return command.threadId;
   }
 }
 
@@ -785,9 +814,14 @@ export function shouldPrepareLegacyImportHandoff(input: {
   readonly hasCompletedRun: boolean;
   readonly historyOrigin: OrchestrationV2AppThread["historyOrigin"];
   readonly legacyImportItemCount: number;
+  /** The turn resumes the imported CLI session, which already holds this history. */
+  readonly continuesImportedAgentSession?: boolean;
 }): boolean {
   return (
-    input.historyOrigin === "v1_import" && !input.hasCompletedRun && input.legacyImportItemCount > 0
+    input.historyOrigin === "v1_import" &&
+    !input.hasCompletedRun &&
+    input.legacyImportItemCount > 0 &&
+    input.continuesImportedAgentSession !== true
   );
 }
 
@@ -835,6 +869,13 @@ function lastDeliveredRunForProviderThread(
   );
 }
 
+const USER_SHELL_CHECK_REJECTIONS: Record<UserShellCheckSubjectRejection, string> = {
+  "not-found": "The turn to check is not in this thread.",
+  "is-check": "A check runs after a turn, not after another check.",
+  unfinished: "Checks run after the turn finishes.",
+  superseded: "Checks run after the latest turn only, once queued messages have run.",
+};
+
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
   const checkpointService = yield* CheckpointServiceV2;
   const commandPolicy = yield* CommandPolicyV2;
@@ -872,6 +913,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const sideChatLineageMutations = yield* Semaphore.make(1);
+
+  /**
+   * The thread after it selects `modelSelection`. Moving to another provider
+   * instance stores what the target runs (PermissionPolicy.switchedPermissionFields);
+   * every event that changes a chat's instance builds its payload here.
+   */
+  const threadWithSelection = (
+    thread: OrchestrationV2AppThread,
+    modelSelection: ModelSelection,
+    now: DateTime.Utc,
+  ) =>
+    Effect.gen(function* () {
+      const selected: OrchestrationV2AppThread = {
+        ...thread,
+        providerInstanceId: modelSelection.instanceId,
+        modelSelection,
+        updatedAt: now,
+      };
+      if (modelSelection.instanceId === thread.providerInstanceId) return selected;
+      const capabilities = yield* runtimePolicy.permissionCapabilities(modelSelection.instanceId);
+      return { ...selected, ...PermissionPolicy.switchedPermissionFields(thread, capabilities) };
+    });
 
   const mapDispatchError =
     (command: OrchestrationV2ServerCommand) =>
@@ -1306,6 +1369,109 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ]);
     });
 
+  // A queued check runs in the live folder after the turn it names. It is cancelled with a
+  // "Check skipped" error item instead of reporting on a folder that newer work changed. The
+  // cancelled run reaches the terminal-run listener, which starts whatever is queued next.
+  const skipSupersededQueuedCheck = (
+    projection: Pick<OrchestrationV2ThreadProjection, "runs" | "nodes" | "attempts">,
+    run: OrchestrationV2Run,
+    message: OrchestrationV2ConversationMessage,
+    subjectRunId: RunId,
+  ) =>
+    Effect.gen(function* () {
+      const threadId = run.threadId;
+      const now = yield* DateTime.now;
+      const subjectOrdinal = projection.runs.find(
+        (candidate) => candidate.id === subjectRunId,
+      )?.ordinal;
+      const rootNode = projection.nodes.find((node) => node.id === run.rootNodeId);
+      const attempt = projection.attempts.find((entry) => entry.id === run.activeAttemptId);
+      const itemBase = {
+        threadId,
+        runId: run.id,
+        nodeId: run.rootNodeId,
+        providerThreadId: run.providerThreadId,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+      };
+      const eventBase = {
+        threadId,
+        runId: run.id,
+        ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+      };
+      yield* writeSystemEvents([
+        {
+          ...eventBase,
+          type: "turn-item.updated" as const,
+          payload: {
+            ...itemBase,
+            id: idAllocator.derive.userTurnItem({ messageId: message.id }),
+            ordinal: run.ordinal * 100,
+            status: "completed" as const,
+            title: null,
+            type: "user_message" as const,
+            messageId: message.id,
+            inputIntent: "queued_turn" as const,
+            text: message.text,
+            ...(message.userShell === undefined ? {} : { userShell: message.userShell }),
+            attachments: message.attachments,
+            ...(message.context ? { context: message.context } : {}),
+            createdBy: message.createdBy,
+            creationSource: message.creationSource,
+          },
+        },
+        {
+          ...eventBase,
+          type: "turn-item.updated" as const,
+          payload: {
+            ...itemBase,
+            id: idAllocator.derive.runSignalTurnItem({
+              runId: run.id,
+              signal: "user-shell-check-superseded",
+            }),
+            ordinal: run.ordinal * 100 + 1,
+            status: "failed" as const,
+            title: "Check skipped",
+            type: "error" as const,
+            failure: {
+              class: "validation_error" as const,
+              message:
+                subjectOrdinal === undefined
+                  ? "Check skipped: newer work ran in this folder after the turn it was for."
+                  : `Check skipped: newer work ran in this folder after Turn ${subjectOrdinal}.`,
+              code: USER_SHELL_CHECK_SUPERSEDED_CODE,
+              retryable: false,
+            },
+          },
+        },
+        ...(attempt === undefined || rootNode === undefined
+          ? []
+          : [
+              {
+                ...eventBase,
+                type: "run-attempt.updated" as const,
+                payload: { ...attempt, status: "cancelled" as const, completedAt: now },
+              },
+              {
+                ...eventBase,
+                type: "node.updated" as const,
+                payload: { ...rootNode, status: "cancelled" as const, completedAt: now },
+              },
+            ]),
+        {
+          ...eventBase,
+          type: "run.updated" as const,
+          payload: { ...run, status: "cancelled" as const, queuePosition: null, completedAt: now },
+        },
+      ]);
+    });
+
   const startNextQueuedRun = (
     threadId: ThreadId,
     options?: { readonly failedRunId?: RunId; readonly endedRunId?: RunId },
@@ -1375,7 +1541,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         projectOverride !== undefined
           ? !projectOverride
           : machineInstance !== undefined && !resolveProviderInstanceEnabled(machineInstance);
+      // A bound scheduled run whose thread is now broader than its task's
+      // policy waits with the queue held, visibly, instead of running.
+      const boundRunRefused =
+        queuedRun.permissionCeiling !== undefined &&
+        !PermissionContainment.boundRunAllowed(queuedRun.permissionCeiling, projection.thread);
       if (
+        boundRunRefused ||
         worktreeMissing ||
         instanceDisabledForProject ||
         (settings.allowUserShellCommands === false &&
@@ -1400,6 +1572,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             })),
         );
         return;
+      }
+      // A check queued after a turn may only run while that turn is still the latest work in
+      // the folder. Queued work can be moved ahead of it, so this is checked again here.
+      const queuedRunMessage = projection.messages.find(
+        (message) => message.id === queuedRun.userMessageId,
+      );
+      const queuedCheck = queuedRunMessage?.userShell?.check;
+      if (
+        queuedRunMessage !== undefined &&
+        queuedCheck !== undefined &&
+        !validateUserShellCheckSubject(projection, queuedCheck.subjectRunId, "start").ok
+      ) {
+        return yield* skipSupersededQueuedCheck(
+          projection,
+          queuedRun,
+          queuedRunMessage,
+          queuedCheck.subjectRunId,
+        );
       }
       const rootNodeId = queuedRun.rootNodeId;
       const attemptId = queuedRun.activeAttemptId;
@@ -1797,9 +1987,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           session.status !== "stopped" &&
           session.status !== "error",
       );
+      const selectedThread = selectionChanged
+        ? yield* threadWithSelection(projection.thread, queuedRun.modelSelection, now)
+        : undefined;
       yield* writeSystemEvents(
         [
-          ...(selectionChanged
+          ...(selectedThread !== undefined
             ? [
                 {
                   type:
@@ -1809,12 +2002,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   threadId,
                   providerInstanceId: queuedRun.providerInstanceId,
                   occurredAt: now,
-                  payload: {
-                    ...projection.thread,
-                    providerInstanceId: queuedRun.providerInstanceId,
-                    modelSelection: queuedRun.modelSelection,
-                    updatedAt: now,
-                  },
+                  payload: selectedThread,
                 },
               ]
             : []),
@@ -2307,6 +2495,64 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return { parentThreadId, relationshipToParent: "side_chat", rootThreadId } as const;
   });
 
+  /**
+   * The startup freeze: narrows a saved chat's stored mode to the mode it
+   * already ran with, recorded on the thread as an auditable migration. It is
+   * an event, never a projection patch, so a rebuild reproduces it.
+   */
+  const dispatchThreadPermissionMigrate = Effect.fn(
+    "orchestrationV2.dispatch.threadPermissionMigrate",
+  )(function* (
+    command: Extract<OrchestrationV2ServerCommand, { readonly type: "thread.permission.migrate" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const thread = yield* projectionStore
+      .getThread(command.threadId)
+      .pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+        ),
+      );
+    if (
+      thread.permissionMigrations?.some((entry) => entry.migrationId === command.migrationId) ===
+        true ||
+      permissionSourceOf(thread) !== "override" ||
+      thread.runtimeMode !== command.from
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} no longer needs permission migration ${command.migrationId}.`,
+      });
+    }
+    const now = yield* DateTime.now;
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "thread.permission-migrated",
+      threadId: command.threadId,
+      providerInstanceId: thread.providerInstanceId,
+      occurredAt: now,
+      payload: {
+        ...thread,
+        runtimeMode: command.to,
+        permissionMigrations: [
+          ...(thread.permissionMigrations ?? []),
+          {
+            migrationId: command.migrationId,
+            from: command.from,
+            to: command.to,
+            reason: command.reason,
+            migratedAt: now,
+          },
+        ],
+        // Not an activity: the chat's position in the sidebar stays put.
+        updatedAt: thread.updatedAt,
+      },
+    });
+  });
+
   const dispatchThreadCreate = Effect.fn("orchestrationV2.dispatch.threadCreate")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "thread.create" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -2318,6 +2564,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.driver": command.modelSelection.instanceId,
     });
 
+    const refuse = (cause: string) =>
+      new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause,
+      });
+    // A thread id names one chat for good. Creating it again would replace
+    // that chat's stored permissions and migration history, so only a retry
+    // of the original command (answered from its receipt) reaches it twice.
+    const existing = yield* projectionStore
+      .getThread(command.threadId)
+      .pipe(
+        Effect.as(true),
+        Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(false) }),
+        mapDispatchError(command),
+      );
+    if (existing) return yield* refuse(`Thread ${command.threadId} already exists.`);
+
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
     const sideChatLineage =
@@ -2328,6 +2592,49 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             { id: command.threadId, projectId: command.projectId },
             command.sideChatParentThreadId,
           );
+    // A new chat stores the preset it will actually run with, and inherits
+    // the provider's own settings only where the driver supports that.
+    const permissionCapabilities = yield* runtimePolicy.permissionCapabilities(
+      command.modelSelection.instanceId,
+    );
+    const permissionSource = PermissionPolicy.allowedPermissionSource(
+      command.permissionSource,
+      permissionCapabilities,
+    );
+    const runtimeMode = PermissionPolicy.effectiveRuntimeMode(
+      command.runtimeMode,
+      permissionCapabilities,
+    );
+    // Creating a chat is a permission change like any other (O12): a sender
+    // without settings-write gets what Settings gives every new chat (the
+    // instance's new-chat source and the environment's default preset) or the
+    // narrowest preset, never more.
+    if ((yield* DispatchSettingsWrite) === false) {
+      const settings = yield* serverSettings.getSettings.pipe(mapDispatchError(command));
+      const instanceId = command.modelSelection.instanceId;
+      const configuredSource =
+        permissionCapabilities.driver === undefined
+          ? "override"
+          : newChatPermissionSourceFor({
+              driver: ProviderDriverKind.make(permissionCapabilities.driver),
+              newChatPermissionSource: Object.hasOwn(settings.providerInstances, instanceId)
+                ? settings.providerInstances[instanceId]?.newChatPermissionSource
+                : undefined,
+            });
+      const presetAllowed =
+        runtimeMode === "approval-required" ||
+        runtimeMode ===
+          PermissionPolicy.effectiveRuntimeMode(
+            settings.defaultRuntimeMode,
+            permissionCapabilities,
+          );
+      const sourceAllowed = permissionSource !== "inherit" || configuredSource === "inherit";
+      if (!presetAllowed || !sourceAllowed) {
+        return yield* refuse(
+          "Starting a chat with broader permissions than new chats get needs permission to change settings.",
+        );
+      }
+    }
     const thread: OrchestrationV2AppThread = {
       createdBy: command.createdBy,
       creationSource: command.creationSource,
@@ -2336,8 +2643,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       title: command.title,
       providerInstanceId: command.modelSelection.instanceId,
       modelSelection: command.modelSelection,
-      runtimeMode: command.runtimeMode,
+      runtimeMode,
       interactionMode: command.interactionMode,
+      ...(permissionSource === undefined ? {} : { permissionSource }),
       branch: command.branch,
       worktreePath: command.worktreePath,
       ...(command.localSession === undefined ? {} : { localSession: command.localSession }),
@@ -2500,6 +2808,181 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  /**
+   * What a permission change stores and when it reaches the provider:
+   * - the stored preset is the one the provider actually runs (O3);
+   * - `inherit` only where the driver supports it;
+   * - anything but the narrowest preset needs settings-write (O12), and a
+   *   limited sender may not raise the chat above its own limit;
+   * - a narrowing, or a change of source, restarts the provider session so no
+   *   session grant, cached approval or sticky override outlives it: now when
+   *   idle, and during a run only once the user chose to stop it or to apply
+   *   when it stops. It never waits for "the next turn".
+   */
+  const planPermissionChange = Effect.fn("orchestrationV2.dispatch.planPermissionChange")(
+    function* (
+      command: Extract<
+        OrchestrationV2ServerCommand,
+        { readonly type: "thread.runtime-mode.set" | "thread.permission.set" }
+      >,
+      thread: OrchestrationV2AppThread,
+    ) {
+      const refuse = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      const capabilities = yield* runtimePolicy.permissionCapabilities(thread.providerInstanceId);
+      const revoking = yield* DispatchPermissionRevocation;
+      const requestedSource = revoking
+        ? permissionSourceOf(thread)
+        : command.type === "thread.permission.set"
+          ? command.permissionSource
+          : "override";
+      if (requestedSource === "inherit" && !capabilities.nativePermissionInherit) {
+        return yield* refuse(
+          "This provider cannot use its own permission settings here yet. Choose a preset.",
+        );
+      }
+      const runtimeMode = PermissionPolicy.effectiveRuntimeMode(
+        revoking
+          ? thread.runtimeMode === "full-access"
+            ? "approval-required"
+            : thread.runtimeMode
+          : command.runtimeMode,
+        capabilities,
+      );
+      if (
+        !PermissionPolicy.isNarrowestPreset(requestedSource, runtimeMode) &&
+        (yield* DispatchSettingsWrite) === false
+      ) {
+        return yield* refuse(
+          "Widening this chat's permissions needs permission to change settings.",
+        );
+      }
+      const limit = yield* DispatchModeLimit;
+      if (
+        limit !== undefined &&
+        (requestedSource === "inherit" ||
+          exceededDispatchModeLimit(limit, {
+            runtimeMode,
+            interactionMode: thread.interactionMode,
+          }) !== undefined)
+      ) {
+        return yield* refuse("This caller may not raise the chat's permissions.");
+      }
+      const current = {
+        permissionSource: permissionSourceOf(thread),
+        runtimeMode: thread.runtimeMode,
+      };
+      const next = { permissionSource: requestedSource, runtimeMode };
+      // While a change waits for the run to stop, the provider session still
+      // runs what it ran before it. A further change is judged against that,
+      // not against the stored request, so a second narrowing keeps the
+      // restart pending and Stop and apply now applies it.
+      const running = thread.permissionChangePending?.running ?? current;
+      const narrows = revoking || PermissionPolicy.narrowsPermissions(running, next);
+      const restarts = narrows || running.permissionSource !== next.permissionSource;
+      // A legacy mode change on a chat with no stored source keeps it that way,
+      // so its events stay exactly as before.
+      const permissionSource =
+        command.type === "thread.permission.set" || thread.permissionSource !== undefined
+          ? requestedSource
+          : undefined;
+      const { runs } = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs"])
+        .pipe(mapDispatchError(command));
+      const activeRun = runs.findLast(isBlockingRun);
+      if (!restarts || activeRun === undefined) {
+        return {
+          runtimeMode,
+          permissionSource,
+          detachNow: restarts,
+          applyAfterRun: false,
+          stopRunId: undefined,
+          running,
+        };
+      }
+      if (!narrows) {
+        return yield* refuse("Switch to the provider's own settings once this run stops.");
+      }
+      // Older clients cannot choose; their narrowing applies when the run stops.
+      const whileRunning =
+        command.type === "thread.permission.set" ? command.whileRunning : "apply-after-run";
+      if (whileRunning === undefined) {
+        return yield* refuse(
+          "This chat is running. Choose Stop and apply now, or Apply after this run stops.",
+        );
+      }
+      return {
+        runtimeMode,
+        permissionSource,
+        detachNow: false,
+        applyAfterRun: true,
+        stopRunId: whileRunning === "stop-and-apply" ? activeRun.id : undefined,
+        running,
+      };
+    },
+  );
+
+  /**
+   * Applies a narrowing chosen during a run once the thread has no active run:
+   * the provider sessions restart, so the next turn runs the new settings.
+   */
+  const applyPendingPermissionChange = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const projection = yield* projectionStore.getThreadRecords(threadId, [
+        "runs",
+        "providerSessions",
+      ]);
+      const pending = projection.thread.permissionChangePending;
+      if (pending == null || projection.runs.some(isBlockingRun)) return;
+      const now = yield* DateTime.now;
+      const commandId = CommandId.make(
+        `command:system:permission-apply:${threadId}:${DateTime.toEpochMillis(pending.requestedAt)}`,
+      );
+      const liveSessions = projection.providerSessions.filter(
+        (session) => session.status !== "stopped" && session.status !== "error",
+      );
+      yield* writeSystemEvents(
+        [
+          ...liveSessions.map((session) => ({
+            type: "provider-session.detached" as const,
+            threadId,
+            driver: session.driver,
+            providerInstanceId: session.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              providerSessionId: session.id,
+              detachedAt: now,
+              reason: "Permissions changed.",
+            },
+          })),
+          {
+            type: "thread.permission-updated" as const,
+            threadId,
+            providerInstanceId: projection.thread.providerInstanceId,
+            occurredAt: now,
+            payload: { ...projection.thread, permissionChangePending: null },
+          },
+        ],
+        liveSessions.map(
+          (session) =>
+            ({
+              id: `effect:${commandId}:provider-session.detach:${session.id}`,
+              commandId,
+              threadId,
+              request: {
+                type: "provider-session.detach",
+                providerSessionId: session.id,
+                detail: "Permissions changed.",
+              },
+            }) satisfies PendingOrchestrationEffectV2,
+        ),
+      );
+    });
+
   const dispatchThreadMutation = Effect.fn("orchestrationV2.dispatch.threadMutation")(function* (
     command: Extract<
       OrchestrationV2ServerCommand,
@@ -2526,6 +3009,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           | "thread.pull-request.sync"
           | "thread.title.regeneration.complete"
           | "thread.runtime-mode.set"
+          | "thread.permission.set"
           | "thread.interaction-mode.set"
           | "thread.model-selection.set"
           | "provider.switch";
@@ -2533,7 +3017,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     >,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
-  ) {
+  ): Effect.fn.Return<RunId | undefined, OrchestratorV2Error> {
     const thread = yield* projectionStore.getThread(command.threadId).pipe(
       Effect.mapError(
         (cause) =>
@@ -2800,8 +3284,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     }
 
+    const permissionChange =
+      command.type === "thread.runtime-mode.set" || command.type === "thread.permission.set"
+        ? yield* planPermissionChange(command, thread)
+        : undefined;
     const needsProviderState =
       command.type === "thread.runtime-mode.set" ||
+      command.type === "thread.permission.set" ||
       command.type === "thread.model-selection.set" ||
       command.type === "provider.switch" ||
       command.type === "thread.archive" ||
@@ -2815,7 +3304,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             command.threadId,
             command.type === "thread.model-selection.set" || command.type === "provider.switch"
               ? command.modelSelection.instanceId
-              : undefined,
+              : // A narrowing during a run reaches the chat's live provider
+                // thread (provider-runtime.apply-policy), so load it too.
+                command.type === "thread.runtime-mode.set" ||
+                  command.type === "thread.permission.set"
+                ? thread.providerInstanceId
+                : undefined,
           )
           .pipe(mapDispatchError(command))
       : null;
@@ -2937,6 +3431,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       markUnreadVisitedAt = DateTime.subtract(latestRunCompletedAt, { milliseconds: 1 });
     }
+    // Another provider instance reads a stored preset in its own terms, so the
+    // chat keeps only what the target actually runs (O3), and a chat that
+    // inherited the old provider's settings goes back to an explicit preset
+    // until the user chooses to inherit the new provider's.
+    const switchedPermissions =
+      (command.type === "thread.model-selection.set" || command.type === "provider.switch") &&
+      command.modelSelection.instanceId !== thread.providerInstanceId
+        ? yield* runtimePolicy
+            .permissionCapabilities(command.modelSelection.instanceId)
+            .pipe(
+              Effect.map((capabilities) =>
+                PermissionPolicy.switchedPermissionFields(thread, capabilities),
+              ),
+            )
+        : undefined;
     const updatedThread: OrchestrationV2AppThread = (() => {
       switch (command.type) {
         case "thread.archive":
@@ -3343,7 +3852,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               }
             : thread;
         case "thread.runtime-mode.set":
-          return { ...thread, runtimeMode: command.runtimeMode, updatedAt: now };
+        case "thread.permission.set":
+          return {
+            ...thread,
+            runtimeMode: permissionChange!.runtimeMode,
+            ...(permissionChange!.permissionSource === undefined
+              ? {}
+              : { permissionSource: permissionChange!.permissionSource }),
+            ...(permissionChange!.applyAfterRun
+              ? {
+                  permissionChangePending: { requestedAt: now, running: permissionChange!.running },
+                }
+              : thread.permissionChangePending == null
+                ? {}
+                : { permissionChangePending: null }),
+            updatedAt: now,
+          };
         case "thread.interaction-mode.set":
           return { ...thread, interactionMode: command.interactionMode, updatedAt: now };
         case "thread.model-selection.set":
@@ -3352,6 +3876,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...thread,
             providerInstanceId: command.modelSelection.instanceId,
             modelSelection: command.modelSelection,
+            ...switchedPermissions,
             updatedAt: now,
           };
       }
@@ -3413,6 +3938,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return "thread.pull-request-synced" as const;
         case "thread.runtime-mode.set":
           return "thread.runtime-mode-updated" as const;
+        case "thread.permission.set":
+          return "thread.permission-updated" as const;
         case "thread.interaction-mode.set":
           return "thread.interaction-mode-updated" as const;
         case "thread.model-selection.set":
@@ -3550,13 +4077,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             command.worktreePath !== undefined &&
             command.worktreePath !== thread.worktreePath
           ? (providerContext?.providerSessions ?? []).map((session) => session.id)
-          : command.type === "thread.runtime-mode.set"
-            ? (providerContext?.providerSessions ?? [])
-                .filter(
-                  (session) => !session.capabilities.sessions.supportsRuntimeModeSwitchInSession,
-                )
-                .map((session) => session.id)
-            : (providerSwitchPlan?.releaseProviderSessionIds ?? []),
+          : permissionChange?.detachNow === true
+            ? // A narrowing restarts the provider session so no session grant,
+              // cached approval or sticky override outlives it.
+              (providerContext?.providerSessions ?? []).map((session) => session.id)
+            : permissionChange?.applyAfterRun === true
+              ? // Deferred until the run stops: applyPendingPermissionChange
+                // detaches then. Detaching now would end the running work.
+                []
+              : command.type === "thread.runtime-mode.set" ||
+                  command.type === "thread.permission.set"
+                ? (providerContext?.providerSessions ?? [])
+                    .filter(
+                      (session) =>
+                        !session.capabilities.sessions.supportsRuntimeModeSwitchInSession,
+                    )
+                    .map((session) => session.id)
+                : (providerSwitchPlan?.releaseProviderSessionIds ?? []),
     );
     if (detachSessionIds.size > 0) {
       const liveSessions = (providerContext?.providerSessions ?? []).filter(
@@ -3588,8 +4125,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                       ? "Thread settled."
                       : command.type === "thread.metadata.update"
                         ? "Workspace changed."
-                        : command.type === "thread.runtime-mode.set"
-                          ? "Runtime mode changed."
+                        : command.type === "thread.runtime-mode.set" ||
+                            command.type === "thread.permission.set"
+                          ? "Permissions changed."
                           : "Provider or model selection changed.",
               },
             });
@@ -3607,8 +4145,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                       ? "Thread settled."
                       : command.type === "thread.metadata.update"
                         ? "Workspace changed."
-                        : command.type === "thread.runtime-mode.set"
-                          ? "Runtime mode changed."
+                        : command.type === "thread.runtime-mode.set" ||
+                            command.type === "thread.permission.set"
+                          ? "Permissions changed."
                           : "Provider or model selection changed.",
                 // Terminal detaches revoke the thread's MCP credentials; other
                 // detach reasons keep them so a re-attaching provider process
@@ -3622,6 +4161,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     }
 
+    // A narrowing chosen during a run also goes to a provider that applies
+    // permissions to a live thread (Codex): `now` stops its running work,
+    // including goal turns Stark did not start, and `after-run` lets that work
+    // finish first. Either way the session restarts once the run stops.
+    if (permissionChange?.applyAfterRun === true && providerContext !== null) {
+      const providerThread = providerContext.providerThreads.find(
+        (candidate) => candidate.id === thread.activeProviderThreadId,
+      );
+      const session = providerContext.providerSessions.find(
+        (candidate) =>
+          candidate.id === providerThread?.providerSessionId &&
+          candidate.status !== "stopped" &&
+          candidate.status !== "error",
+      );
+      if (providerThread !== undefined && session !== undefined) {
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:${command.commandId}:provider-runtime.apply-policy:${session.id}`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: {
+              type: "provider-runtime.apply-policy",
+              providerSessionId: session.id,
+              providerThreadId: providerThread.id,
+              timing: permissionChange.stopRunId === undefined ? "after-run" : "now",
+            },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
+      }
+    }
+
     if (command.type === "thread.archive") {
       yield* Ref.update(effects, (existing) => [
         ...existing,
@@ -3633,6 +4204,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         } satisfies PendingOrchestrationEffectV2,
       ]);
     }
+    return permissionChange?.stopRunId;
   });
 
   const dispatchProviderSessionDetach = Effect.fn("orchestrationV2.dispatch.providerSessionDetach")(
@@ -3699,7 +4271,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       },
     ) {
       const limit = yield* DispatchModeLimit;
-      const exceeded = limit === undefined ? undefined : exceededDispatchModeLimit(limit, modes);
+      const exceeded =
+        limit === undefined ? undefined : exceededDispatchModeLimit(limit, modes, threadId);
       if (limit === undefined || exceeded === undefined) return;
       const refusal = {
         threadId,
@@ -3747,7 +4320,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     // The source is not under this command's lock, so check the modes this
     // command copies, not an earlier read the source's user could outrun.
-    yield* refuseAboveDispatchModeLimit(command, command.sourceThreadId, sourceProjection.thread);
+    yield* refuseAboveDispatchModeLimit(
+      command,
+      command.sourceThreadId,
+      PermissionPolicy.dispatchLimitModes(sourceProjection.thread),
+    );
 
     const sourceRun = runForSourcePoint(sourceProjection, command.sourcePoint);
 
@@ -3838,7 +4415,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     // The source is not under this command's lock, so check the modes this
     // command copies, not an earlier read the source's user could outrun.
-    yield* refuseAboveDispatchModeLimit(command, command.sourceThreadId, sourceProjection.thread);
+    yield* refuseAboveDispatchModeLimit(
+      command,
+      command.sourceThreadId,
+      PermissionPolicy.dispatchLimitModes(sourceProjection.thread),
+    );
     const targetProjection = yield* projectionStore
       .getThreadRecords(command.targetThreadId, ["contextTransfers"])
       .pipe(
@@ -4238,12 +4819,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             threadId: input.command.threadId,
             providerInstanceId: input.modelSelection.instanceId,
             occurredAt: now,
-            payload: {
-              ...input.projection.thread,
-              providerInstanceId: input.modelSelection.instanceId,
-              modelSelection: input.modelSelection,
-              updatedAt: now,
-            },
+            payload: yield* threadWithSelection(input.projection.thread, input.modelSelection, now),
           });
         }
         yield* appendSteeringMessage({
@@ -4575,12 +5151,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: input.command.threadId,
           providerInstanceId: input.modelSelection.instanceId,
           occurredAt: now,
-          payload: {
-            ...input.projection.thread,
-            providerInstanceId: input.modelSelection.instanceId,
-            modelSelection: input.modelSelection,
-            updatedAt: now,
-          },
+          payload: yield* threadWithSelection(input.projection.thread, input.modelSelection, now),
         });
       }
       if (requiresProviderThreadHandoff || requiresProviderSessionRestart) {
@@ -5230,6 +5801,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ? {}
             : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
           ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+          ...(command.permissionCeiling === undefined
+            ? {}
+            : { permissionCeiling: command.permissionCeiling }),
         };
         const attempt: OrchestrationV2RunAttempt = {
           id: attemptId,
@@ -5407,12 +5981,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: command.threadId,
           providerInstanceId: modelSelection.instanceId,
           occurredAt: now,
-          payload: {
-            ...projection.thread,
-            providerInstanceId: modelSelection.instanceId,
-            modelSelection,
-            updatedAt: now,
-          },
+          payload: yield* threadWithSelection(projection.thread, modelSelection, now),
         });
       }
       const ordinal = nextRunOrdinal(projection);
@@ -5481,6 +6050,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           historyOrigin: projection.thread.historyOrigin,
           hasCompletedRun: latestCompletedRun !== undefined,
           legacyImportItemCount: legacyImportItems.length,
+          continuesImportedAgentSession: continuesImportedAgentSession({
+            threadId: command.threadId,
+            providerThread: activeProviderThread,
+          }),
         })
           ? yield* contextHandoffService
               .prepareLegacyImport({
@@ -5549,6 +6122,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   ),
                   mapDispatchError(command),
                 );
+        // A scheduled run bound to this thread starts only within the policy
+        // its task had when it was queued; the thread is never widened for it.
+        if (
+          command.permissionCeiling !== undefined &&
+          !PermissionContainment.boundRunAllowed(command.permissionCeiling, projection.thread)
+        ) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "This chat's permissions are broader than the scheduled task allows.",
+          });
+        }
         const run: OrchestrationV2Run = {
           id: runId,
           threadId: command.threadId,
@@ -5575,6 +6160,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             : {}),
           ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
           ...wakeWorkStartedAt(projection.runs, command),
+          ...(command.permissionCeiling === undefined
+            ? {}
+            : { permissionCeiling: command.permissionCeiling }),
         };
         const attempt: OrchestrationV2RunAttempt = {
           id: attemptId,
@@ -5682,6 +6270,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 completedAt: null,
                 updatedAt: now,
                 type: "command_execution",
+                internalOperation: "workspace_preparation",
                 input: WORKSPACE_PREPARATION_INPUT,
               }
             : null;
@@ -6791,6 +7380,48 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+      // The worker's policy is decided here for every sender, under the
+      // parent thread's lock, from the parent's run and the target: never Bypass
+      // (O5), no more than the parent on its own instance, and only the
+      // target's floor elsewhere. A policy the command carries is not trusted.
+      const parentCapabilities = yield* runtimePolicy.permissionCapabilities(
+        parentRun.providerInstanceId,
+      );
+      const parentDriver =
+        parentCapabilities.driver ??
+        (yield* providerAdapters.get(parentRun.providerInstanceId).pipe(
+          Effect.map((adapter): string | undefined => adapter.driver),
+          Effect.orElseSucceed(() => undefined),
+        ));
+      const targetCapabilities = yield* runtimePolicy.permissionCapabilities(
+        command.modelSelection.instanceId,
+      );
+      const workerPolicy = PermissionContainment.decideWorkerPolicy({
+        parent: parentProjection.thread,
+        parentProviderInstanceId: parentRun.providerInstanceId,
+        parentProvider:
+          parentDriver === undefined
+            ? undefined
+            : {
+                driver: parentDriver,
+                supportedRuntimeModes: parentCapabilities.supportedRuntimeModes,
+              },
+        target: {
+          providerInstanceId: command.modelSelection.instanceId,
+          driver: targetCapabilities.driver ?? targetAdapter.driver,
+          supportedRuntimeModes: targetCapabilities.supportedRuntimeModes,
+        },
+        requested: command.runtimeMode,
+        interactionMode: command.interactionMode,
+      });
+      if (workerPolicy._tag === "Failure") {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: workerPolicy.failure.message,
+        });
+      }
+      const childPolicy = PermissionContainment.recordedChildPolicy(workerPolicy.success);
 
       const now = command.createdAt ?? (yield* DateTime.now);
       const taskNodeId = idAllocator.derive.delegatedTaskNode({
@@ -6824,8 +7455,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           createdBy: command.createdBy,
           creationSource: command.creationSource,
         }),
-        runtimeMode: command.runtimeMode,
+        runtimeMode: childPolicy.preset,
         interactionMode: command.interactionMode,
+        // Workers always run an explicit preset, never the provider's own settings.
+        permissionSource: "override",
         ...(command.workspaceStrategy === undefined ? {} : { branch: null, worktreePath: null }),
       };
       const task: OrchestrationV2Subagent = {
@@ -6840,6 +7473,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerThreadId: null,
         childThreadId,
         nativeTaskRef: null,
+        childPolicy,
         prompt: command.task,
         title: command.title ?? null,
         model: command.modelSelection.model,
@@ -7499,6 +8133,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Runtime request ${command.requestId} was not found.`,
         });
       }
+      if (runtimeRequest.status !== "pending" && isOpenLostRuntimeRequest(runtimeRequest)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "This request was lost. Choose Ask again or Dismiss.",
+        });
+      }
       if (runtimeRequest.status !== "pending") {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -7526,18 +8167,77 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
+      // An approval answer must name an option the request offered (or, from
+      // an older client, a decision exactly one narrowest option carries); the
+      // record keeps the exact choice and native response for audit. An
+      // approval answered with neither is refused before anything is recorded:
+      // only questions take answers alone.
+      const approvalRequest =
+        runtimeRequest.kind !== "user_input" &&
+        runtimeRequest.kind !== "dynamic_tool_call" &&
+        runtimeRequest.kind !== "auth_refresh";
+      // The choices live on the request's card, which an adapter publishes
+      // just after the request. An answer that overtakes the card has nothing
+      // to be checked against, so it is refused rather than taken as any
+      // decision; the request stays open and the card answers it once shown.
+      if (
+        approvalRequest &&
+        providerSessionId !== null &&
+        context.item?.type !== "approval_request"
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "This request's choices have not arrived yet. Answer it from its card.",
+        });
+      }
+      const choice =
+        runtimeRequest.kind === "user_input" ||
+        (!approvalRequest && command.optionId === undefined && command.decision === undefined)
+          ? undefined
+          : resolveApprovalChoice({
+              optionId: command.optionId,
+              decision: command.decision,
+              feedback: command.feedback,
+              options: context.item?.type === "approval_request" ? context.item.options : undefined,
+            });
+      if (choice?._tag === "refused") {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: choice.reason,
+        });
+      }
+      if (
+        choice !== undefined &&
+        isPersistentChoice(choice.choice) &&
+        (yield* DispatchSettingsWrite) === false
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Saving this answer as a rule needs permission to change settings.",
+        });
+      }
+      const decision = choice?.choice.decision ?? command.decision;
+
       const now = yield* DateTime.now;
       const resolvedRequest = {
         ...runtimeRequest,
         status: "resolved" as const,
         resolvedAt: now,
-        ...(command.decision === undefined ? {} : { decision: command.decision }),
+        ...(decision === undefined ? {} : { decision }),
         ...(command.answers === undefined ? {} : { answers: command.answers }),
+        ...(choice === undefined ? {} : { chosen: choice.choice }),
+        // Answered is not delivered: the respond effect reports delivery.
+        ...(providerSessionId === null
+          ? {}
+          : { delivery: { state: "pending" as const, attempts: 0, updatedAt: now } }),
       };
       const emitEvent = emit(events, command);
       const requestNode = context.node;
       const resolvedNodeStatus =
-        command.decision === "decline" || command.decision === "cancel"
+        decision === "decline" || decision === "cancel"
           ? ("cancelled" as const)
           : ("completed" as const);
       yield* emitEvent({
@@ -7702,11 +8402,188 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             type: "runtime-request.respond",
             providerSessionId,
             requestId: command.requestId,
-            ...(command.decision === undefined ? {} : { decision: command.decision }),
+            ...(decision === undefined ? {} : { decision }),
+            ...(choice?.choice.optionId === undefined ? {} : { optionId: choice.choice.optionId }),
+            ...(choice?.choice.feedback === undefined ? {} : { feedback: choice.choice.feedback }),
             ...(command.answers === undefined ? {} : { answers: command.answers }),
           },
         } satisfies PendingOrchestrationEffectV2,
       ]);
+    });
+
+  /**
+   * Records how delivering an answer went. Answered is not delivered: a
+   * request leaves `pending` delivery only through this command or a
+   * provider close. A failed delivery opens the request as lost, so the user
+   * can ask again; `uncertain` says the answer may have reached the provider.
+   */
+  const dispatchRuntimeRequestDeliveryUpdate = (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "runtime-request.delivery.update" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const context = yield* projectionStore
+        .getRuntimeResponseContext(command.threadId, command.requestId)
+        .pipe(
+          Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })),
+        );
+      const request = context.request;
+      const delivery = request?.delivery;
+      if (request === undefined || delivery === undefined) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Runtime request ${command.requestId} has no answer awaiting delivery.`,
+        });
+      }
+      if (delivery.state !== "pending" && delivery.state !== "uncertain") {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Runtime request ${command.requestId} delivery is already ${delivery.state}.`,
+        });
+      }
+      const now = yield* DateTime.now;
+      const failed = command.state !== "delivered";
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "runtime-request.updated",
+        threadId: command.threadId,
+        ...(context.node?.runId == null ? {} : { runId: context.node.runId }),
+        nodeId: request.nodeId,
+        ...(context.session === undefined
+          ? {}
+          : {
+              driver: context.session.driver,
+              providerInstanceId: context.session.providerInstanceId,
+            }),
+        occurredAt: now,
+        payload: {
+          ...request,
+          delivery: {
+            state: command.state,
+            attempts: delivery.attempts + 1,
+            updatedAt: now,
+            ...(command.reason === undefined ? {} : { reason: command.reason }),
+          },
+          ...(failed && request.lost === undefined
+            ? {
+                lost: {
+                  cause: "delivery_failed" as const,
+                  lostAt: now,
+                  ...(command.state === "uncertain" ? { deliveryUncertain: true } : {}),
+                },
+              }
+            : !failed
+              ? closeDeliveryLoss(request.lost, now)
+              : {}),
+        },
+      });
+    });
+
+  /**
+   * The provider closed a request on its own. An unanswered one expires; an
+   * answered one needed no delivery. Neither is answered again.
+   */
+  const dispatchRuntimeRequestProviderClosed = (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "runtime-request.provider-closed" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const context = yield* projectionStore
+        .getRuntimeResponseContext(command.threadId, command.requestId)
+        .pipe(
+          Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })),
+        );
+      const request = context.request;
+      if (request === undefined) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Runtime request ${command.requestId} was not found.`,
+        });
+      }
+      const now = yield* DateTime.now;
+      const emitEvent = emit(events, command);
+      const sessionFields =
+        context.session === undefined
+          ? {}
+          : {
+              driver: context.session.driver,
+              providerInstanceId: context.session.providerInstanceId,
+            };
+      if (request.status === "pending") {
+        yield* emitEvent({
+          type: "runtime-request.updated",
+          threadId: command.threadId,
+          ...(context.node?.runId == null ? {} : { runId: context.node.runId }),
+          nodeId: request.nodeId,
+          ...sessionFields,
+          occurredAt: now,
+          payload: { ...request, status: "expired", resolvedAt: now },
+        });
+        if (context.node !== undefined) {
+          yield* emitEvent({
+            type: "node.updated",
+            threadId: command.threadId,
+            ...(context.node.runId === null ? {} : { runId: context.node.runId }),
+            nodeId: context.node.id,
+            ...sessionFields,
+            occurredAt: now,
+            payload: { ...context.node, status: "cancelled", completedAt: now },
+          });
+        }
+        if (context.item !== undefined) {
+          yield* emitEvent({
+            type: "turn-item.updated",
+            threadId: command.threadId,
+            ...(context.item.runId === null ? {} : { runId: context.item.runId }),
+            ...(context.item.nodeId === null ? {} : { nodeId: context.item.nodeId }),
+            ...sessionFields,
+            occurredAt: now,
+            payload: { ...context.item, status: "cancelled", completedAt: now, updatedAt: now },
+          });
+        }
+        return;
+      }
+      if (
+        request.status === "resolved" &&
+        (request.delivery === undefined ||
+          request.delivery.state === "pending" ||
+          request.delivery.state === "uncertain")
+      ) {
+        yield* emitEvent({
+          type: "runtime-request.updated",
+          threadId: command.threadId,
+          ...(context.node?.runId == null ? {} : { runId: context.node.runId }),
+          nodeId: request.nodeId,
+          ...sessionFields,
+          occurredAt: now,
+          payload: {
+            ...request,
+            delivery: {
+              state: "not_needed",
+              attempts: request.delivery?.attempts ?? 0,
+              updatedAt: now,
+            },
+            ...closeDeliveryLoss(request.lost, now),
+          },
+        });
+        return;
+      }
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Runtime request ${command.requestId} is already ${request.status}.`,
+      });
     });
 
   const dispatchThreadUserInputDismiss = (
@@ -7745,6 +8622,142 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         events,
         effects,
       );
+    });
+
+  // The open lost requests a command names, with the records that describe
+  // them. Each named request must be lost and still open on this thread.
+  const readNamedLostRuntimeRequests = (
+    command: Extract<
+      OrchestrationV2Command,
+      { readonly type: "runtime-request.ask-again" | "runtime-request.lost.dismiss" }
+    >,
+  ) =>
+    Effect.gen(function* () {
+      const records = yield* loadProjectionForCommand(command, ["runtimeRequests", "nodes"]);
+      if (records.thread.archivedAt !== null || records.thread.deletedAt !== null) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} is not active.`,
+        });
+      }
+      if (new Set(command.requestIds).size !== command.requestIds.length) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Name each lost request once.",
+        });
+      }
+      const lost = [];
+      for (const requestId of command.requestIds) {
+        const request = records.runtimeRequests.find((candidate) => candidate.id === requestId);
+        if (request?.lost === undefined) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "This request was not lost.",
+          });
+        }
+        if (!isOpenLostRuntimeRequest(request)) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "This request was already asked again or dismissed.",
+          });
+        }
+        lost.push({ ...request, lost: request.lost });
+      }
+      return { records, lost: openLostRuntimeRequests(lost) };
+    });
+
+  // Ask again is a user follow-up the server writes: it takes the same
+  // dispatch route as a typed message, including delegated-child bookkeeping.
+  const dispatchRuntimeRequestAskAgain = (
+    command: Extract<OrchestrationV2Command, { readonly type: "runtime-request.ask-again" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) =>
+    Effect.gen(function* () {
+      const { records, lost } = yield* readNamedLostRuntimeRequests(command);
+      if (isProviderNativeSubagentThread(records.thread)) {
+        return yield* new OrchestratorSubagentThreadReadOnlyError({
+          commandId: command.commandId,
+          threadId: command.threadId,
+        });
+      }
+      if (
+        records.runtimeRequests.some(
+          (request) => request.status === "pending" && isPersonFacingRuntimeRequest(request),
+        )
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Answer the open request first.",
+        });
+      }
+      const nodeRunIds = new Set(
+        lost.map(
+          (request) => records.nodes.find((node) => node.id === request.nodeId)?.runId ?? null,
+        ),
+      );
+      const { turnItems } = yield* loadProjectionForCommand(command, ["turnItems"], {
+        turnItemRunIds: [...nodeRunIds],
+        turnItemTypes: ["approval_request", "user_input_request", "command_execution"],
+      });
+      const now = yield* DateTime.now;
+      const emitEvent = emit(events, command);
+      for (const request of lost) {
+        yield* emitEvent({
+          type: "runtime-request.asked-again",
+          threadId: command.threadId,
+          nodeId: request.nodeId,
+          occurredAt: now,
+          payload: { ...request, lost: { ...request.lost, askedAgainAt: now } },
+        });
+      }
+      const message = {
+        type: "message.dispatch",
+        commandId: command.commandId,
+        threadId: command.threadId,
+        // A request is asked again at most once, so its id names the turn.
+        messageId: MessageId.make(`ask-again:${lost[0]!.id}`),
+        text: askAgainText(
+          lost.map((request) => ({
+            ...lostRuntimeRequestDetail(request, { turnItems, nodes: records.nodes }),
+            kind: request.kind,
+            lost: request.lost,
+            ...(request.decision === undefined ? {} : { decision: request.decision }),
+            ...(request.answers === undefined ? {} : { answers: request.answers }),
+          })),
+        ),
+        attachments: [],
+        createdBy: "user",
+        creationSource: "server",
+        dispatchMode: { type: "start_immediately" },
+      } satisfies Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>;
+      yield* dispatchMessage(message, events, effects);
+      yield* recordSubagentFollowup(message, events).pipe(mapDispatchError(command));
+    });
+
+  // The reverse of Ask again: the user saw the loss and needs no new turn.
+  const dispatchLostRuntimeRequestDismiss = (
+    command: Extract<OrchestrationV2Command, { readonly type: "runtime-request.lost.dismiss" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const { lost } = yield* readNamedLostRuntimeRequests(command);
+      const now = yield* DateTime.now;
+      const emitEvent = emit(events, command);
+      for (const request of lost) {
+        yield* emitEvent({
+          type: "runtime-request.lost-dismissed",
+          threadId: command.threadId,
+          nodeId: request.nodeId,
+          occurredAt: now,
+          payload: { ...request, lost: { ...request.lost, dismissedAt: now } },
+        });
+      }
     });
 
   const dispatchQueuedMessagePromoteToSteer = (
@@ -11042,6 +12055,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "provider.switch":
         yield* dispatchThreadMutation(command, events, effects);
         break;
+      case "thread.permission.set": {
+        const stopRunId = yield* dispatchThreadMutation(command, events, effects);
+        if (stopRunId !== undefined) {
+          cancelUnsettledEffects = yield* dispatchRunInterrupt(
+            {
+              type: "run.interrupt",
+              commandId: command.commandId,
+              threadId: command.threadId,
+              runId: stopRunId,
+              reason: "Permissions changed.",
+            },
+            events,
+            effects,
+          );
+        }
+        break;
+      }
       case "thread.pull-request-watch.sync":
         yield* dispatchPullRequestWatchSync(command, events, effects);
         break;
@@ -11087,6 +12117,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             cause: "This provider does not support ! commands.",
           });
         }
+        if (command.check !== undefined) {
+          const records = yield* projectionStore
+            .getThreadRecords(command.threadId, ["runs", "messages"], { messageRoles: ["user"] })
+            .pipe(
+              Effect.mapError(
+                (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+              ),
+            );
+          const validation = validateUserShellCheckSubject(
+            records,
+            command.check.subjectRunId,
+            "dispatch",
+          );
+          if (!validation.ok) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: USER_SHELL_CHECK_REJECTIONS[validation.reason],
+            });
+          }
+        }
         yield* dispatchMessage(
           {
             type: "message.dispatch",
@@ -11103,6 +12154,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               command: command.command,
               respond: command.respond,
               timeoutMs: command.timeoutMs ?? settings.shellCommandTimeoutMs,
+              ...(command.check === undefined ? {} : { check: command.check }),
             },
           },
           events,
@@ -11283,6 +12335,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "secret_request.record":
         yield* dispatchSecretRequestRecord(command, events);
         break;
+      case "runtime-request.ask-again":
+        yield* dispatchRuntimeRequestAskAgain(command, events, effects);
+        break;
+      case "runtime-request.lost.dismiss":
+        yield* dispatchLostRuntimeRequestDismiss(command, events);
+        break;
+      case "runtime-request.delivery.update":
+        yield* dispatchRuntimeRequestDeliveryUpdate(command, events);
+        break;
+      case "runtime-request.provider-closed":
+        yield* dispatchRuntimeRequestProviderClosed(command, events);
+        break;
+      case "thread.permission.migrate":
+        yield* dispatchThreadPermissionMigrate(command, events);
+        break;
       default:
         return yield* dispatchUnsupported(command);
     }
@@ -11365,7 +12432,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const shell = yield* projectionStore
         .getThreadShell(threadId)
         .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
-      if (shell !== null) yield* refuseAboveDispatchModeLimit(command, threadId, shell);
+      if (shell !== null) {
+        yield* refuseAboveDispatchModeLimit(
+          command,
+          threadId,
+          PermissionPolicy.dispatchLimitModes(shell),
+        );
+      }
     }
 
     const plan = yield* dispatchOnce(command).pipe(
@@ -11585,6 +12658,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           finalizeDelegatedCompletionDelivery(threadId, stored.event.payload.id),
         );
       }
+      // A narrowing chosen during the run applies before the next one starts.
+      yield* threadDispatch
+        .withLock(threadId, applyPendingPermissionChange(threadId))
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to apply a pending permission change", { threadId, cause }),
+          ),
+        );
       yield* threadDispatch
         .withLock(
           threadId,

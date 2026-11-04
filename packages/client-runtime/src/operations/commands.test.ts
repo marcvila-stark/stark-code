@@ -16,7 +16,9 @@ import {
   ThreadId,
   TurnItemId,
   WS_METHODS,
+  ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type OrchestrationV2Command,
+  type OrchestrationV2Run,
   type OrchestrationV2ThreadLaunchInput,
   type OrchestrationV2ThreadProjection,
   type ProjectMutation,
@@ -34,8 +36,8 @@ import {
   type PreparedConnection,
 } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
-import * as RpcSession from "../rpc/session.ts";
 import { RpcPermissionGuard } from "../rpc/client.ts";
+import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import { v2Now, v2Projection, v2ThreadId } from "../state/orchestrationV2TestFixtures.ts";
 import {
@@ -50,7 +52,10 @@ import {
   promoteQueuedRun,
   reorderActiveThread,
   reorderQueuedRun,
+  retryThreadWorker,
+  respondToThreadApproval,
   revertThreadCheckpoint,
+  setThreadPermission,
   settleThread,
   startThreadTurn,
   unsettleThread,
@@ -58,14 +63,15 @@ import {
   updateThreadMetadata,
 } from "./commands.ts";
 
+const layerCryptoOnly = Layer.succeed(
+  Crypto.Crypto,
+  Crypto.make({
+    randomBytes: (size) => new Uint8Array(size),
+    digest: (_algorithm, data) => Effect.succeed(data),
+  }),
+);
 const layerTestCrypto = Layer.mergeAll(
-  Layer.succeed(
-    Crypto.Crypto,
-    Crypto.make({
-      randomBytes: (size) => new Uint8Array(size),
-      digest: (_algorithm, data) => Effect.succeed(data),
-    }),
-  ),
+  layerCryptoOnly,
   // These transport-shaping tests represent an authorized command boundary.
   Layer.succeed(RpcPermissionGuard, { authorize: () => Effect.void }),
 );
@@ -1030,6 +1036,68 @@ describe("V2 environment commands", () => {
     }).pipe(Effect.provide(layerTestCrypto)),
   );
 
+  it.effect("sends a permission change with its source and how it applies to a running chat", () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const supervisor = yield* makeSupervisor({ commands, projects: [] });
+
+      yield* setThreadPermission({
+        commandId: CommandId.make("permission-command"),
+        threadId: v2ThreadId,
+        permissionSource: "override",
+        runtimeMode: "approval-required",
+        whileRunning: "apply-after-run",
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        // The destination grants the scopes these commands need.
+        Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
+      );
+
+      expect(commands).toEqual([
+        {
+          type: "thread.permission.set",
+          commandId: "permission-command",
+          threadId: v2ThreadId,
+          permissionSource: "override",
+          runtimeMode: "approval-required",
+          whileRunning: "apply-after-run",
+        },
+      ]);
+    }).pipe(Effect.provide(layerTestCrypto)),
+  );
+
+  it.effect("answers an approval with the offered option id and a reason", () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const supervisor = yield* makeSupervisor({ commands, projects: [] });
+
+      yield* respondToThreadApproval({
+        commandId: CommandId.make("respond-command"),
+        threadId: v2ThreadId,
+        requestId: RuntimeRequestId.make("request-1"),
+        decision: "decline",
+        optionId: "deny:0",
+        feedback: "Use the fixture instead.",
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        // The destination grants the scopes these commands need.
+        Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
+      );
+
+      expect(commands).toEqual([
+        {
+          type: "runtime-request.respond",
+          commandId: "respond-command",
+          threadId: v2ThreadId,
+          requestId: "request-1",
+          decision: "decline",
+          optionId: "deny:0",
+          feedback: "Use the fixture instead.",
+        },
+      ]);
+    }).pipe(Effect.provide(layerTestCrypto)),
+  );
+
   it.effect("dispatches an explicit idle start without fetching the full projection", () =>
     Effect.gen(function* () {
       const commands: OrchestrationV2Command[] = [];
@@ -1146,5 +1214,193 @@ describe("V2 environment commands", () => {
         },
       ]);
     }).pipe(Effect.provide(layerTestCrypto)),
+  );
+});
+
+describe("retryThreadWorker", () => {
+  const workerId = ThreadId.make("worker-thread");
+  const instanceId = ProviderInstanceId.make("codex");
+  const run = (
+    ordinal: number,
+    status: OrchestrationV2Run["status"],
+    overrides: Partial<OrchestrationV2Run> = {},
+  ): OrchestrationV2Run => ({
+    id: RunId.make(`worker-run-${ordinal}`),
+    threadId: workerId,
+    ordinal,
+    providerInstanceId: instanceId,
+    modelSelection: { instanceId, model: "gpt-5.4" },
+    providerThreadId: null,
+    userMessageId: MessageId.make(`worker-message-${ordinal}`),
+    rootNodeId: null,
+    activeAttemptId: null,
+    status,
+    requestedAt: v2Now,
+    startedAt: status === "queued" ? null : v2Now,
+    completedAt: status === "queued" ? null : v2Now,
+    checkpointId: null,
+    contextHandoffId: null,
+    ...overrides,
+  });
+  const worker = (
+    runs: ReadonlyArray<OrchestrationV2Run>,
+    overrides: Partial<OrchestrationV2ThreadProjection> = {},
+  ): OrchestrationV2ThreadProjection => ({
+    ...v2Projection,
+    thread: { ...v2Projection.thread, id: workerId, worktreePath: "/worktrees/worker" },
+    runs,
+    ...overrides,
+  });
+  // The command boundary that grants orchestration:operate on the destination.
+  const granted = Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void });
+  const retry = (expected: "prepare" | "run_again") => ({
+    commandId: CommandId.make("worker-retry"),
+    threadId: workerId,
+    expected,
+    text: "Run again requested by the user.\n\nBrief",
+    messageId: MessageId.make("worker-retry-message"),
+  });
+
+  it.effect("repeats a failed setup on the run the worker's current state names", () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const projectionRequests: ThreadId[] = [];
+      const failed = run(1, "failed", {
+        workspacePreparation: { type: "worktree", baseRef: "main" },
+      });
+      const supervisor = yield* makeSupervisor({
+        commands,
+        projects: [],
+        projectionRequests,
+        projection: worker([failed], {
+          turnItems: [
+            {
+              id: TurnItemId.make("worker-setup-failure"),
+              threadId: workerId,
+              runId: failed.id,
+              nodeId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 1,
+              status: "failed",
+              title: "Workspace preparation failed",
+              startedAt: v2Now,
+              completedAt: v2Now,
+              updatedAt: v2Now,
+              type: "error",
+              failure: {
+                class: "validation_error",
+                message: "setup failed",
+                code: ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
+                retryable: false,
+              },
+            },
+          ],
+        }),
+      });
+
+      yield* retryThreadWorker(retry("prepare")).pipe(
+        granted,
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+
+      expect(projectionRequests).toEqual([workerId]);
+      expect(commands).toEqual([
+        {
+          type: "prepared-run.retry",
+          commandId: "worker-retry",
+          threadId: workerId,
+          runId: failed.id,
+        },
+      ]);
+    }).pipe(Effect.provide(layerTestCrypto)),
+  );
+
+  it.effect("runs again under the worker's modes at dispatch, not those it was shown with", () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      // The row was drawn while the worker had full access; it has since been
+      // switched to ask first and to plan only.
+      const supervisor = yield* makeSupervisor({
+        commands,
+        projects: [],
+        projection: worker([run(1, "completed")], {
+          thread: {
+            ...v2Projection.thread,
+            id: workerId,
+            worktreePath: "/worktrees/worker",
+            runtimeMode: "approval-required",
+            interactionMode: "plan",
+          },
+        }),
+      });
+
+      yield* retryThreadWorker(retry("run_again")).pipe(
+        granted,
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+
+      // No mode or model travels with the follow-up, so the server applies the
+      // worker's own current settings when the run starts.
+      expect(commands).toEqual([
+        {
+          type: "message.dispatch",
+          commandId: "worker-retry",
+          createdBy: "user",
+          creationSource: "web",
+          threadId: workerId,
+          messageId: "worker-retry-message",
+          text: "Run again requested by the user.\n\nBrief",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        },
+      ]);
+    }).pipe(Effect.provide(layerTestCrypto)),
+  );
+
+  it.effect.each([
+    ["run_again", [run(1, "interrupted"), run(2, "queued", { queueHeld: true })], "queue_held"],
+    ["run_again", [run(1, "running")], "active"],
+    ["prepare", [run(1, "completed")], "run_again"],
+  ] as const)("sends nothing when %s no longer fits the worker (%#)", ([expected, runs, current]) =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const supervisor = yield* makeSupervisor({
+        commands,
+        projects: [],
+        projection: worker(runs),
+      });
+
+      const error = yield* retryThreadWorker(retry(expected)).pipe(
+        granted,
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({ _tag: "ThreadWorkerRetryChangedError", current });
+      expect(commands).toEqual([]);
+    }).pipe(Effect.provide(layerTestCrypto)),
+  );
+
+  it.effect("is refused at the destination without the operate grant", () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const supervisor = yield* makeSupervisor({
+        commands,
+        projects: [],
+        projection: worker([run(1, "completed")]),
+      });
+
+      // No command boundary granted orchestration:operate for this environment.
+      const error = yield* retryThreadWorker(retry("run_again")).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.flip,
+      );
+
+      expect(error._tag).toBe("EnvironmentAuthorizationError");
+      expect(commands).toEqual([]);
+    }).pipe(Effect.provide(layerCryptoOnly)),
   );
 });

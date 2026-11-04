@@ -23,6 +23,34 @@ import * as ElectronProtocol from "./ElectronProtocol.ts";
 
 const layerProtocol = ElectronProtocol.layer.pipe(Layer.provide(NodeServices.layer));
 
+const PROXY_SLOTS = 64;
+
+// Registers the dev proxy and returns a renderer-side loader for it.
+const registerDevProxy = Effect.gen(function* () {
+  let handler: ((request: Request) => Promise<Response>) | undefined;
+  handleMock.mockImplementation((_scheme, nextHandler) => {
+    handler = nextHandler;
+  });
+  const protocol = yield* ElectronProtocol.ElectronProtocol;
+  yield* protocol.registerDesktopProtocol({
+    scheme: "starkcode-dev",
+    targetOrigin: new URL("http://127.0.0.1:5733/"),
+    clerkFrontendApiHostname: undefined,
+  });
+  return (path = "/src/module.ts", init?: RequestInit) =>
+    handler!(new Request(`starkcode-dev://app${path}`, init));
+});
+
+// Takes every proxy slot with a response whose body has not been read.
+const fillSlots = (load: () => Promise<Response>) =>
+  Effect.promise(() => Promise.all(Array.from({ length: PROXY_SLOTS }, () => load())));
+
+const rejectionOf = (promise: Promise<unknown>) =>
+  promise.then(
+    () => null,
+    (error: unknown) => error,
+  );
+
 describe("ElectronProtocol", () => {
   beforeEach(() => {
     handleMock.mockReset();
@@ -231,6 +259,124 @@ describe("ElectronProtocol", () => {
       assert.strictEqual(rejection, lastFailure);
       assert.equal(netFetchMock.mock.calls.length, 3);
     }).pipe(Effect.provide(layerProtocol)),
+  );
+
+  it.effect("holds proxied requests past 64 in flight until earlier bodies settle", () =>
+    Effect.gen(function* () {
+      netFetchMock.mockImplementation(() => Promise.resolve(new Response("export {};")));
+      const load = yield* registerDevProxy;
+
+      // A cold module graph fans out faster than bodies are read.
+      const pending = Array.from({ length: PROXY_SLOTS + 2 }, () => load());
+      const inFlight = yield* Effect.promise(() => Promise.all(pending.slice(0, PROXY_SLOTS)));
+      const queued = pending.slice(PROXY_SLOTS);
+      assert.equal(netFetchMock.mock.calls.length, PROXY_SLOTS);
+
+      // Reading a body to the end frees its slot for one queued request.
+      assert.equal(yield* Effect.promise(() => inFlight[0]!.text()), "export {};");
+      yield* Effect.promise(() => Promise.race(queued));
+      assert.equal(netFetchMock.mock.calls.length, PROXY_SLOTS + 1);
+
+      // So does the renderer cancelling a body.
+      yield* Effect.promise(() => inFlight[1]!.body!.cancel());
+      yield* Effect.promise(() => Promise.all(queued));
+      assert.equal(netFetchMock.mock.calls.length, PROXY_SLOTS + 2);
+    }).pipe(Effect.scoped, Effect.provide(layerProtocol)),
+  );
+
+  it.effect("returns the slot of a failed fetch, a failed body, or an empty response", () =>
+    Effect.gen(function* () {
+      netFetchMock.mockImplementation(() => Promise.resolve(new Response("export {};")));
+      const load = yield* registerDevProxy;
+      const inFlight = yield* fillSlots(load);
+      // Each case below starts on a slot freed by reading a held body, so the
+      // load after it can only start on the slot that case returned.
+
+      const resetError = new Error("socket hang up");
+      netFetchMock.mockRejectedValueOnce(resetError);
+      const failedFetch = rejectionOf(load("/api/upload", { method: "POST", body: "{}" }));
+      yield* Effect.promise(() => inFlight[0]!.text());
+      assert.strictEqual(yield* Effect.promise(() => failedFetch), resetError);
+      yield* Effect.promise(() => load());
+
+      netFetchMock.mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({ pull: (controller) => controller.error(new Error("reset")) }),
+        ),
+      );
+      const failedBody = load();
+      yield* Effect.promise(() => inFlight[1]!.text());
+      const bodyError = yield* Effect.promise(() =>
+        rejectionOf(failedBody.then((response) => response.text())),
+      );
+      assert.instanceOf(bodyError, Error);
+      yield* Effect.promise(() => load());
+
+      netFetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+      const empty = load();
+      yield* Effect.promise(() => inFlight[2]!.text());
+      assert.equal((yield* Effect.promise(() => empty)).status, 204);
+      yield* Effect.promise(() => load());
+      assert.equal(netFetchMock.mock.calls.length, PROXY_SLOTS + 6);
+    }).pipe(Effect.scoped, Effect.provide(layerProtocol)),
+  );
+
+  it.effect("drops an aborted request from the queue and aborts its upstream fetch", () =>
+    Effect.gen(function* () {
+      netFetchMock.mockImplementation(() => Promise.resolve(new Response("export {};")));
+      const load = yield* registerDevProxy;
+      const inFlight = yield* fillSlots(load);
+
+      // Aborted while queued: it leaves the queue and never fetches.
+      const queuedAbort = new AbortController();
+      const queued = rejectionOf(load("/src/queued.ts", { signal: queuedAbort.signal }));
+      queuedAbort.abort();
+      yield* Effect.promise(() => inFlight[0]!.text());
+      yield* Effect.promise(() => inFlight[1]!.text());
+      yield* Effect.promise(() => load());
+      assert.isNotNull(yield* Effect.promise(() => queued));
+      assert.isFalse(
+        netFetchMock.mock.calls.some(([url]) => String(url).endsWith("/src/queued.ts")),
+      );
+
+      // Aborted while fetching: the upstream fetch is aborted and its slot returned.
+      let upstreamSignal: AbortSignal | undefined;
+      const fetchStarted = new Promise<void>((resolve) => {
+        netFetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+          upstreamSignal = init.signal ?? undefined;
+          resolve();
+          return new Promise<never>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+              once: true,
+            });
+          });
+        });
+      });
+      const fetchingAbort = new AbortController();
+      const fetching = rejectionOf(load("/src/fetching.ts", { signal: fetchingAbort.signal }));
+      yield* Effect.promise(() => fetchStarted);
+      fetchingAbort.abort();
+      assert.isNotNull(yield* Effect.promise(() => fetching));
+      assert.isTrue(upstreamSignal?.aborted);
+      yield* Effect.promise(() => load());
+      assert.equal(netFetchMock.mock.calls.length, PROXY_SLOTS + 3);
+    }).pipe(Effect.scoped, Effect.provide(layerProtocol)),
+  );
+
+  it.effect("returns the slots of abandoned bodies after a 2 second lease", () =>
+    Effect.gen(function* () {
+      netFetchMock.mockImplementation(() => Promise.resolve(new Response("export {};")));
+      const load = yield* registerDevProxy;
+      // A reload abandons these bodies without reading or cancelling them.
+      yield* fillSlots(load);
+      const afterReload = load();
+
+      yield* TestClock.adjust("1999 millis");
+      assert.equal(netFetchMock.mock.calls.length, PROXY_SLOTS);
+      yield* TestClock.adjust("1 millis");
+      yield* Effect.promise(() => afterReload);
+      assert.equal(netFetchMock.mock.calls.length, PROXY_SLOTS + 1);
+    }).pipe(Effect.scoped, Effect.provide(layerProtocol)),
   );
 
   it.effect("preserves protocol registration failures", () =>

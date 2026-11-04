@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vite-plus/test";
 
+import * as Cause from "effect/Cause";
+
+import { StarkUpdateFeedInvalidError } from "./updateFeedPolicy.ts";
 import {
+  classifyDesktopUpdateError,
   createInitialDesktopUpdateState,
+  describeDesktopUpdateFailure,
+  nextDesktopUpdateDownloadRetryDelay,
+  reduceDesktopUpdateStateOnDisabled,
+  reduceDesktopUpdateStateOnDownloadCancelled,
+  reduceDesktopUpdateStateOnInstallBlocked,
+  reduceDesktopUpdateStateOnInstallPreparing,
+  reduceDesktopUpdateStateOnPostpone,
+  reduceDesktopUpdateStateOnVerifyFailure,
+  reduceDesktopUpdateStateOnVerifyStart,
+  summarizeDesktopUpdateInstallBlockers,
   reduceDesktopUpdateStateOnCheckFailure,
   reduceDesktopUpdateStateOnCheckStart,
   reduceDesktopUpdateStateOnDownloadComplete,
@@ -10,8 +24,10 @@ import {
   reduceDesktopUpdateStateOnDownloadStart,
   reduceDesktopUpdateStateOnInstallFailure,
   reduceDesktopUpdateStateOnNoUpdate,
+  reduceDesktopUpdateStateOnSkippedUpdate,
   reduceDesktopUpdateStateOnUpdateAvailable,
   resolveNotAppliedInstallVersion,
+  shouldSkipFailedUpdate,
 } from "./updateMachine.ts";
 
 const runtimeInfo = {
@@ -19,6 +35,16 @@ const runtimeInfo = {
   appArch: "x64",
   runningUnderArm64Translation: false,
 } as const;
+
+const NETWORK_DOWN = { kind: "unreachable", message: "Couldn't reach the update server." } as const;
+const enabledState = (
+  overrides: Partial<ReturnType<typeof createInitialDesktopUpdateState>> = {},
+) => ({
+  ...createInitialDesktopUpdateState("1.0.0", runtimeInfo, "latest"),
+  enabled: true,
+  status: "idle" as const,
+  ...overrides,
+});
 
 describe("updateMachine", () => {
   it("clears transient errors when a check starts", () => {
@@ -47,12 +73,14 @@ describe("updateMachine", () => {
         enabled: true,
         status: "checking",
       },
-      "network unavailable",
+      NETWORK_DOWN,
       "2026-03-04T00:00:00.000Z",
     );
 
     expect(state.status).toBe("error");
     expect(state.errorContext).toBe("check");
+    expect(state.errorKind).toBe("unreachable");
+    expect(state.message).toBe("Couldn't reach the update server.");
     expect(state.canRetry).toBe(true);
   });
 
@@ -73,7 +101,7 @@ describe("updateMachine", () => {
     );
     const failed = reduceDesktopUpdateStateOnCheckFailure(
       checking,
-      "network unavailable",
+      NETWORK_DOWN,
       "2026-03-04T00:00:01.000Z",
     );
 
@@ -121,7 +149,10 @@ describe("updateMachine", () => {
         availableVersion: "1.1.0",
         downloadPercent: 43,
       },
-      "checksum mismatch",
+      {
+        kind: "invalid-artifact",
+        message: "The download for 1.1.0 was damaged, so it was deleted.",
+      },
     );
 
     expect(state.status).toBe("available");
@@ -140,10 +171,10 @@ describe("updateMachine", () => {
       },
       "1.1.0",
     );
-    const failedInstall = reduceDesktopUpdateStateOnInstallFailure(
-      downloaded,
-      "backend shutdown timed out",
-    );
+    const failedInstall = reduceDesktopUpdateStateOnInstallFailure(downloaded, {
+      kind: "install-stalled",
+      message: "Couldn't install 1.1.0: the installer didn't respond. Stark Code kept running.",
+    });
 
     expect(downloaded.status).toBe("downloaded");
     expect(downloaded.downloadedVersion).toBe("1.1.0");
@@ -239,21 +270,314 @@ describe("updateMachine", () => {
     expect(progress.errorContext).toBeNull();
   });
 
-  it("clears release notes when checking again", () => {
-    const state = reduceDesktopUpdateStateOnCheckStart(
-      {
-        ...createInitialDesktopUpdateState("1.0.0", runtimeInfo, "nightly"),
-        enabled: true,
-        status: "available",
-        availableVersion: "1.1.0-nightly.1",
-        releaseNotes: [{ version: "1.1.0-nightly.1", items: ["feat: old note"], totalItems: 1 }],
-        omittedReleaseCount: 2,
-      },
-      "2026-03-04T00:00:00.000Z",
-    );
+  it("keeps release notes through a manual check until its result replaces them", () => {
+    const available = {
+      ...createInitialDesktopUpdateState("1.0.0", runtimeInfo, "nightly"),
+      enabled: true,
+      status: "available" as const,
+      availableVersion: "1.1.0-nightly.1",
+      releaseNotes: [{ version: "1.1.0-nightly.1", items: ["feat: old note"], totalItems: 1 }],
+      omittedReleaseCount: 2,
+    };
+    const checking = reduceDesktopUpdateStateOnCheckStart(available, "2026-03-04T00:00:00.000Z");
+    expect(checking.status).toBe("checking");
+    expect(checking.releaseNotes).toEqual(available.releaseNotes);
 
-    expect(state.releaseNotes).toEqual([]);
-    expect(state.omittedReleaseCount).toBe(0);
+    const failed = reduceDesktopUpdateStateOnCheckFailure(
+      checking,
+      NETWORK_DOWN,
+      "2026-03-04T00:00:01.000Z",
+    );
+    expect(failed.status).toBe("available");
+    expect(failed.releaseNotes).toEqual(available.releaseNotes);
+    expect(failed.lastCheckError?.kind).toBe("unreachable");
+    expect(failed.message).toBeNull();
+  });
+
+  it("leaves the visible state alone during and after a failed background check", () => {
+    const upToDate = enabledState({ status: "up-to-date", checkedAt: "2026-03-04T00:00:00.000Z" });
+    const polling = reduceDesktopUpdateStateOnCheckStart(
+      upToDate,
+      "2026-03-04T01:00:00.000Z",
+      "background",
+    );
+    expect(polling).toBe(upToDate);
+
+    const failed = reduceDesktopUpdateStateOnCheckFailure(
+      polling,
+      NETWORK_DOWN,
+      "2026-03-04T01:00:01.000Z",
+      "background",
+    );
+    expect(failed.status).toBe("up-to-date");
+    expect(failed.message).toBeNull();
+    expect(failed.lastCheckError).toEqual({ ...NETWORK_DOWN, at: "2026-03-04T01:00:01.000Z" });
+
+    // Nothing was known yet: the first background check shows its failure.
+    const first = reduceDesktopUpdateStateOnCheckFailure(
+      reduceDesktopUpdateStateOnCheckStart(
+        enabledState(),
+        "2026-03-04T00:00:00.000Z",
+        "background",
+      ),
+      NETWORK_DOWN,
+      "2026-03-04T00:00:01.000Z",
+      "background",
+    );
+    expect(first.status).toBe("error");
+  });
+
+  it("names the reason updates are off and drops it from no other state", () => {
+    const state = reduceDesktopUpdateStateOnDisabled(enabledState(), {
+      code: "development-build",
+      message: "Automatic updates are off: this is a development build.",
+    });
+    expect(state.status).toBe("disabled");
+    expect(state.enabled).toBe(false);
+    expect(state.disabledReason?.code).toBe("development-build");
+  });
+
+  it("verifies a finished download before offering it, and drops a rejected one", () => {
+    const verifying = reduceDesktopUpdateStateOnVerifyStart(
+      enabledState({ status: "downloading", availableVersion: "1.1.0", downloadPercent: 99 }),
+      "1.1.0",
+    );
+    expect(verifying.status).toBe("verifying");
+    expect(verifying.downloadedVersion).toBeNull();
+
+    const rejected = reduceDesktopUpdateStateOnVerifyFailure(verifying, {
+      kind: "signature",
+      message: "The download for 1.1.0 isn't signed by Stark Future, so it was deleted.",
+    });
+    expect(rejected.status).toBe("available");
+    expect(rejected.downloadedVersion).toBeNull();
+    expect(rejected.errorKind).toBe("signature");
+    expect(rejected.canRetry).toBe(true);
+  });
+
+  it("cancels a download back to the offered update", () => {
+    const state = reduceDesktopUpdateStateOnDownloadCancelled(
+      enabledState({
+        status: "downloading",
+        availableVersion: "1.1.0",
+        downloadPercent: 40,
+        downloadProgress: { transferredBytes: 40, totalBytes: 100, bytesPerSecond: 10 },
+      }),
+    );
+    expect(state.status).toBe("available");
+    expect(state.downloadPercent).toBeNull();
+    expect(state.downloadProgress).toBeUndefined();
+  });
+
+  it("keeps the ready update when a restart is blocked and clears the block on the next try", () => {
+    const ready = reduceDesktopUpdateStateOnDownloadComplete(
+      enabledState({ status: "downloading", availableVersion: "1.1.0" }),
+      "1.1.0",
+    );
+    const blocked = reduceDesktopUpdateStateOnInstallBlocked(
+      reduceDesktopUpdateStateOnInstallPreparing(ready),
+      [{ kind: "pending-approval", message: "A task needs your approval.", count: 1 }],
+    );
+    expect(blocked.status).toBe("downloaded");
+    expect(blocked.downloadedVersion).toBe("1.1.0");
+    expect(blocked.message).toBe(
+      "Stark Code can't restart yet: 1 task is waiting for your approval.",
+    );
+    const retrying = reduceDesktopUpdateStateOnInstallPreparing(blocked);
+    expect(retrying.status).toBe("preparing");
+    expect(retrying.installBlockers).toBeUndefined();
+  });
+
+  it("drops a download the installer rejected as unsigned so it is downloaded again", () => {
+    const ready = reduceDesktopUpdateStateOnDownloadComplete(
+      enabledState({ status: "downloading", availableVersion: "1.1.0" }),
+      "1.1.0",
+    );
+    const failed = reduceDesktopUpdateStateOnInstallFailure(ready, {
+      kind: "signature",
+      message: describeDesktopUpdateFailure("signature", "install", "1.1.0"),
+    });
+    expect(failed.status).toBe("available");
+    expect(failed.downloadedVersion).toBeNull();
+    expect(failed.errorContext).toBe("install");
+  });
+
+  it("postpones only a ready update, and a newer download prompts again", () => {
+    expect(reduceDesktopUpdateStateOnPostpone(enabledState(), "2026-03-05T00:00:00.000Z")).toEqual(
+      enabledState(),
+    );
+    const ready = reduceDesktopUpdateStateOnDownloadComplete(
+      enabledState({ status: "downloading", availableVersion: "1.1.0" }),
+      "1.1.0",
+    );
+    const postponed = reduceDesktopUpdateStateOnPostpone(ready, "2026-03-05T00:00:00.000Z");
+    expect(postponed.postponedUntil).toBe("2026-03-05T00:00:00.000Z");
+    expect(reduceDesktopUpdateStateOnPostpone(postponed, null).postponedUntil).toBeUndefined();
+    expect(reduceDesktopUpdateStateOnDownloadComplete(postponed, "1.1.0").postponedUntil).toBe(
+      "2026-03-05T00:00:00.000Z",
+    );
+    expect(reduceDesktopUpdateStateOnDownloadComplete(postponed, "1.2.0").postponedUntil).toBe(
+      undefined,
+    );
+  });
+});
+
+describe("failed updates", () => {
+  const failed = { failedVersion: "1.1.0", reason: "migration-failed" } as const;
+
+  it("skips the version that failed on this data only for a background check", () => {
+    const state = enabledState({ status: "up-to-date" });
+    expect(shouldSkipFailedUpdate({ state, version: "1.1.0", failed, origin: "background" })).toBe(
+      true,
+    );
+    // The user asked: the failed version is offered again.
+    expect(shouldSkipFailedUpdate({ state, version: "1.1.0", failed, origin: "manual" })).toBe(
+      false,
+    );
+    // Another version is offered as usual.
+    expect(shouldSkipFailedUpdate({ state, version: "1.2.0", failed, origin: "background" })).toBe(
+      false,
+    );
+    expect(
+      shouldSkipFailedUpdate({ state, version: "1.1.0", failed: null, origin: "background" }),
+    ).toBe(false);
+    // Once the user took it up, a later poll does not hide it again.
+    expect(
+      shouldSkipFailedUpdate({
+        state: enabledState({ status: "downloaded", downloadedVersion: "1.1.0" }),
+        version: "1.1.0",
+        failed,
+        origin: "background",
+      }),
+    ).toBe(false);
+  });
+
+  it("reports a skipped version without offering it, until something replaces it", () => {
+    const skipped = reduceDesktopUpdateStateOnSkippedUpdate(
+      enabledState(),
+      "1.1.0",
+      "2026-10-31T00:00:00.000Z",
+    );
+    expect(skipped).toMatchObject({
+      status: "up-to-date",
+      availableVersion: null,
+      downloadedVersion: null,
+      skippedVersion: "1.1.0",
+    });
+    expect(
+      reduceDesktopUpdateStateOnUpdateAvailable(skipped, "1.1.0", "2026-10-31T01:00:00.000Z")
+        .skippedVersion,
+    ).toBeUndefined();
+    expect(
+      reduceDesktopUpdateStateOnNoUpdate(skipped, "2026-10-31T01:00:00.000Z").skippedVersion,
+    ).toBeUndefined();
+  });
+});
+
+describe("classifyDesktopUpdateError", () => {
+  const withCode = (code: string, message = code) => Object.assign(new Error(message), { code });
+
+  it.each([
+    ["ENOTFOUND", true, "unreachable"],
+    ["ECONNREFUSED", true, "unreachable"],
+    ["ECONNRESET", null, "unreachable"],
+    ["ETIMEDOUT", true, "unreachable"],
+    ["ENOTFOUND", false, "offline"],
+    ["ERR_UPDATER_CHANNEL_FILE_NOT_FOUND", true, "feed-unavailable"],
+    ["HTTP_ERROR_503", true, "feed-unavailable"],
+    ["ERR_UPDATER_INVALID_UPDATE_INFO", true, "feed-invalid"],
+    ["ERR_UPDATER_INVALID_VERSION", true, "feed-invalid"],
+    ["ERR_UPDATER_ZIP_FILE_NOT_FOUND", true, "feed-invalid"],
+    ["ERR_STARK_UPDATE_FEED_INVALID", true, "feed-invalid"],
+    ["ERR_STARK_UPDATE_REQUEST_REFUSED", true, "feed-invalid"],
+    ["ERR_CHECKSUM_MISMATCH", true, "invalid-artifact"],
+    ["ENOSPC", true, "disk-full"],
+    ["ESOMETHINGELSE", true, "unknown"],
+  ] as const)("%s with online=%s is %s", (code, isOnline, kind) => {
+    expect(classifyDesktopUpdateError(withCode(code), isOnline)).toBe(kind);
+  });
+
+  it("reads codes through tagged-error causes and Effect causes", () => {
+    const nested = { _tag: "ElectronUpdaterCheckForUpdatesError", cause: withCode("ENOTFOUND") };
+    expect(classifyDesktopUpdateError(Cause.fail(nested), true)).toBe("unreachable");
+    // A hostile manifest refused by isUpdateSupported, as electron-updater rethrows it.
+    const hostile = {
+      _tag: "ElectronUpdaterCheckForUpdatesError",
+      cause: new StarkUpdateFeedInvalidError({ problem: "file-url" }),
+    };
+    expect(classifyDesktopUpdateError(Cause.fail(hostile), true)).toBe("feed-invalid");
+    expect(classifyDesktopUpdateError(Cause.die(withCode("ENOSPC")), true)).toBe("disk-full");
+  });
+
+  it("reads HTTP status codes, Chromium network errors and Squirrel signature errors", () => {
+    expect(
+      classifyDesktopUpdateError(Object.assign(new Error("Not Found"), { statusCode: 404 }), true),
+    ).toBe("feed-unavailable");
+    expect(classifyDesktopUpdateError(new Error("net::ERR_INTERNET_DISCONNECTED"), null)).toBe(
+      "unreachable",
+    );
+    expect(
+      classifyDesktopUpdateError(
+        new Error(
+          "Code signature at URL file:///x did not pass validation: code failed to satisfy specified code requirement(s)",
+        ),
+        true,
+      ),
+    ).toBe("signature");
+    expect(classifyDesktopUpdateError({ name: "YAMLException", message: "bad" }, true)).toBe(
+      "feed-invalid",
+    );
+  });
+
+  it("never claims offline without evidence", () => {
+    expect(classifyDesktopUpdateError(new Error("something odd"), null)).toBe("unknown");
+    expect(classifyDesktopUpdateError(new Error("something odd"), false)).toBe("offline");
+  });
+});
+
+describe("describeDesktopUpdateFailure", () => {
+  it("never shows raw causes and names the version", () => {
+    expect(describeDesktopUpdateFailure("feed-invalid", "check", null)).toBe(
+      "The update server returned an invalid release.",
+    );
+    expect(describeDesktopUpdateFailure("invalid-artifact", "download", "1.2.4")).toBe(
+      "The download for 1.2.4 was damaged, so it was deleted.",
+    );
+    expect(describeDesktopUpdateFailure("install-stalled", "install", "1.2.4")).toBe(
+      "Couldn't install 1.2.4: the installer didn't respond. Stark Code kept running.",
+    );
+  });
+});
+
+describe("nextDesktopUpdateDownloadRetryDelay", () => {
+  it("backs off three times for network failures and stops for the user's problems", () => {
+    expect(
+      [0, 1, 2, 3].map((attempt) => nextDesktopUpdateDownloadRetryDelay("unreachable", attempt)),
+    ).toEqual([30_000, 120_000, 600_000, null]);
+    expect(nextDesktopUpdateDownloadRetryDelay("invalid-artifact", 0)).toBe(30_000);
+    expect(nextDesktopUpdateDownloadRetryDelay("invalid-artifact", 1)).toBeNull();
+    for (const kind of ["disk-full", "signature", "feed-invalid"] as const) {
+      expect(nextDesktopUpdateDownloadRetryDelay(kind, 0)).toBeNull();
+    }
+  });
+});
+
+describe("summarizeDesktopUpdateInstallBlockers", () => {
+  it("reads as one sentence with counts", () => {
+    expect(
+      summarizeDesktopUpdateInstallBlockers([
+        { kind: "active-task", message: "", count: 2 },
+        { kind: "pending-approval", message: "", count: 1 },
+        { kind: "upload-in-progress", message: "", count: 1 },
+      ]),
+    ).toBe(
+      "Stark Code can't restart yet: 2 tasks are running, 1 task is waiting for your approval and a file is still uploading.",
+    );
+    expect(
+      summarizeDesktopUpdateInstallBlockers([{ kind: "maintenance-unavailable", message: "" }]),
+    ).toBe(
+      "Stark Code can't restart yet: it can't yet confirm that no task or approval would be interrupted.",
+    );
   });
 });
 

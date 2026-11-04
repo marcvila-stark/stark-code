@@ -97,9 +97,11 @@ For a production macOS app with bundle ID `com.starkfuture.starkcode`:
    This setting also configures Electron/macOS passkeys.
 4. Check `https://<frontend-api>/.well-known/apple-app-site-association`. Its
    `webcredentials.apps` must include `<TEAM_ID>.com.starkfuture.starkcode`.
-5. Configure signing as described in the [release runbook](./release.md#package-a-local-desktop-build).
+5. Configure signing as described in the [release runbook](./release.md#signed-macos-builds).
 
-Local signed builds additionally use:
+Setting `STARK_CODE_MACOS_PROVISIONING_PROFILE` is what turns passkey signing on; without it a
+signed build carries no provisioning profile or passkey entitlements. Local signed passkey
+builds use:
 
 ```dotenv
 STARK_CODE_APPLE_TEAM_ID=ABC1234567

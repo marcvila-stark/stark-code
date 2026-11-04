@@ -36,6 +36,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
+  type OrchestrationV2TurnItem,
   ProjectId,
   ProviderInstanceId,
   type ProviderInstanceEnvironment,
@@ -100,6 +101,7 @@ import {
 } from "../../shell/UserShellCommandRunner.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import { ClaudeOrchestratorReplayHarness } from "./ClaudeAdapterV2.testkit.ts";
+import { STARK_PAGES_PUBLISH_UNCERTAIN } from "./StarkPagesGuard.ts";
 import { provideDeterministicTestRuntime } from "../testkit/DeterministicRuntime.ts";
 import { runOrchestratorV2Scenario } from "../testkit/OrchestratorScenario.ts";
 import { layerProviderReplay } from "../testkit/ProviderReplayHarness.ts";
@@ -114,6 +116,9 @@ import {
 // Integration fixtures deliberately run in Bypass to isolate provider protocol behavior.
 const OPTED_IN_CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({
   allowBypassPermissions: true,
+});
+const OPTED_OUT_CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({
+  allowBypassPermissions: false,
 });
 const AUTO_COMPACT_CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({
   allowBypassPermissions: true,
@@ -311,8 +316,9 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
     ]);
     assert.notProperty(options.extraArgs, "plugin-dir");
     assert.equal(options.permissionMode, "plan");
+    // The user's own disableAllHooks is never overridden.
+    assert.notProperty(options.settings, "disableAllHooks");
     assert.deepInclude(options.settings, {
-      disableAllHooks: false,
       permissions: { disableBypassPermissionsMode: "disable" },
     });
     assert.equal(options.env?.STARK_WORKBENCH_NODE, "/app/Stark Code");
@@ -340,7 +346,14 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
         ["mcp__stark__pages_delete", { page: "page" }],
         ["proxy", { name: "pages_upload_files", arguments: {} }],
         ["Bash", { command: 'node "/kit/spage.js" publish prepare pages/page' }],
-        ["Bash", { command: "curl -X PUT https://s3.amazonaws.com/bucket/page" }],
+        ["Bash", { command: "curl -X PUT https://vibecoded-apps.s3.amazonaws.com/page" }],
+        // Ordinary shell syntax (review finding 6).
+        ["Bash", { command: "spage \\\npublish ./site" }],
+        ["Bash", { command: 'env -S "spage publish ./site"' }],
+        ["Bash", { command: "curl -T a.html --url=https://pages.starkfuture.com/demo/a.html" }],
+        ["Bash", { command: "ls site | spage publish ./site" }],
+        ["Bash", { command: "bash <<EOF\nspage publish ./site\nEOF" }],
+        ["Bash", { command: "CMD=spage; $CMD publish ./site" }],
       ] as const) {
         const result = await hook(
           {
@@ -378,7 +391,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
           session_id: "guard",
           transcript_path: "/tmp/guard",
           cwd: "/workspace",
-          tool_name: "mcp__stark__pages_get",
+          tool_name: "mcp__stark__pages_read_file",
           tool_input: { slug: "page" },
           tool_use_id: "read-1",
           permission_mode: permissionMode,
@@ -388,13 +401,280 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
       );
       assert.deepEqual(read, {});
       await options.canUseTool!(
-        "mcp__stark__pages_get",
+        "mcp__stark__pages_read_file",
         { slug: "page" },
         { signal, toolUseID: "read-1", requestId: "read-request-1" },
       );
       assert.equal(calls, 1);
     },
   );
+
+  it("lets ordinary calls that mention pages or S3 through and denies the Pages connector natively", async () => {
+    const options = safetyOptions({ canUseTool: async () => ({ behavior: "deny", message: "x" }) });
+    assert.includeMembers(options.disallowedTools ?? [], [
+      "mcp__claude_ai_Pages__pages_upload_begin",
+      "mcp__claude_ai_Pages__pages_update_project",
+    ]);
+    assert.notInclude(options.disallowedTools ?? [], "mcp__claude_ai_Pages__pages_read_file");
+    const hook = options.hooks!.PreToolUse![0]!.hooks[0]!;
+    for (const [tool_name, tool_input] of [
+      ["Edit", { file_path: "/repo/src/page.ts", old_string: "a", new_string: "page.save()" }],
+      ["Read", { file_path: "/repo/docs/output-to-s3.md" }],
+      ["Bash", { command: "vp test run apps/server/src/s3/inputParser.test.ts" }],
+      // Text and file operations that mention a publish run nothing (review finding 7).
+      ["Bash", { command: "printf '%s\\n' '$(spage publish ./site)'" }],
+      ["Bash", { command: "git add /kit/spage.js publish" }],
+      ["Bash", { command: "# spage publish ./site" }],
+      ["Bash", { command: 'grep -r "spage publish" docs' }],
+      ["Bash", { command: "mv spage.js old/ && ls pages/" }],
+    ] as const) {
+      assert.deepEqual(
+        await hook(
+          {
+            hook_event_name: "PreToolUse",
+            session_id: "guard",
+            transcript_path: "/tmp/guard",
+            cwd: "/workspace",
+            tool_name,
+            tool_input,
+            tool_use_id: "ordinary-1",
+            permission_mode: "default",
+          },
+          "ordinary-1",
+          { signal: new AbortController().signal },
+        ),
+        {},
+      );
+    }
+  });
+
+  it.each(["auto", "acceptEdits"] as const)(
+    "asks about a command that may publish in SDK %s mode instead of running or denying it",
+    async (permissionMode) => {
+      const options = safetyOptions({
+        permissionMode,
+        canUseTool: async () => ({ behavior: "deny", message: "x" }),
+      });
+      const hook = options.hooks!.PreToolUse![0]!.hooks[0]!;
+      const result = await hook(
+        {
+          hook_event_name: "PreToolUse",
+          session_id: "guard",
+          transcript_path: "/tmp/guard",
+          cwd: "/workspace",
+          tool_name: "Bash",
+          tool_input: { command: "$CMD publish ./site" },
+          tool_use_id: "maybe-1",
+          permission_mode: permissionMode,
+        },
+        "maybe-1",
+        { signal: new AbortController().signal },
+      );
+      assert.include(JSON.stringify(result), '"permissionDecision":"ask"');
+    },
+  );
+
+  it.each([
+    { settings: OPTED_IN_CLAUDE_SETTINGS, mode: "bypassPermissions" as const },
+    { settings: OPTED_IN_CLAUDE_SETTINGS, mode: "default" as const },
+    {
+      settings: OPTED_OUT_CLAUDE_SETTINGS,
+      mode: "default" as const,
+    },
+    {
+      settings: OPTED_OUT_CLAUDE_SETTINGS,
+      mode: undefined,
+    },
+  ])(
+    "never turns the user's hooks back on ($mode, Bypass opt-in $settings.allowBypassPermissions)",
+    async ({ settings, mode }) => {
+      const options = safetyOptions({
+        settings,
+        ...(mode === undefined
+          ? { permissionSource: "inherit" as const }
+          : { permissionMode: mode }),
+        canUseTool: async () => ({ behavior: "deny", message: "x" }),
+      });
+      // Stark's flag settings leave disableAllHooks to the user's own settings.
+      assert.notProperty(options.settings ?? {}, "disableAllHooks");
+      // Stark's guard is an SDK callback hook, which Claude runs even when
+      // settings hooks are disabled, so the chat still opens and is guarded.
+      const hook = options.hooks?.PreToolUse?.[0]?.hooks[0];
+      assert.isFunction(hook);
+      const denied = await hook!(
+        {
+          hook_event_name: "PreToolUse",
+          session_id: "guard",
+          transcript_path: "/tmp/guard",
+          cwd: "/workspace",
+          tool_name: "Bash",
+          tool_input: { command: "spage publish prepare pages/demo" },
+          tool_use_id: "hooks-1",
+          permission_mode: mode ?? "default",
+        },
+        "hooks-1",
+        { signal: new AbortController().signal },
+      );
+      assert.include(JSON.stringify(denied), '"permissionDecision":"deny"');
+    },
+  );
+
+  it("sends no mode for a chat that inherits Claude's settings", () => {
+    const inherit = (
+      runtimeMode: "approval-required" | "full-access",
+      interaction: "default" | "plan",
+    ) => {
+      const policy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode,
+        interactionMode: interaction,
+        permissionSource: "inherit",
+        cwd: "/workspace",
+      });
+      return ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(policy);
+    };
+    assert.deepEqual(inherit("full-access", "default"), {
+      permissionMode: undefined,
+      permissionSource: "inherit",
+      installPermissionCallback: true,
+    });
+    // Plan is Stark's interaction mode, so it is still sent.
+    assert.equal(inherit("approval-required", "plan").permissionMode, "plan");
+
+    const optedOut = safetyOptions({
+      permissionSource: "inherit",
+      sdkSettings: { permissions: { defaultMode: "acceptEdits", deny: ["Bash(rm:*)"] } },
+    });
+    assert.notProperty(optedOut, "permissionMode");
+    assert.notProperty(optedOut, "allowDangerouslySkipPermissions");
+    // Without the opt-in, Bypass stays off natively even if the profile asks for it,
+    // and Stark's own settings tier carries no defaultMode of its own.
+    assert.deepInclude(optedOut.settings, {
+      permissions: { deny: ["Bash(rm:*)"], disableBypassPermissionsMode: "disable" },
+    });
+    const optedIn = safetyOptions({
+      permissionSource: "inherit",
+      settings: OPTED_IN_CLAUDE_SETTINGS,
+    });
+    assert.notProperty(optedIn, "permissionMode");
+    assert.notProperty(optedIn, "allowDangerouslySkipPermissions");
+    assert.notProperty(optedIn.settings ?? {}, "permissions");
+    // The account's own --permission-mode flag is still the account's choice.
+    assert.equal(
+      safetyOptions({
+        permissionSource: "inherit",
+        settings: { ...OPTED_IN_CLAUDE_SETTINGS, launchArgs: "--permission-mode acceptEdits" },
+      }).permissionMode,
+      "acceptEdits",
+    );
+    // An override without a mode keeps today's Manual default.
+    assert.equal(safetyOptions().permissionMode, "default");
+  });
+
+  it.each([
+    {
+      name: "inherit keeps a mode Claude changed itself",
+      input: { permissionSource: "inherit", openedMode: undefined, liveMode: "acceptEdits" },
+      expected: undefined,
+    },
+    {
+      name: "override keeps a mode the user approved for the session",
+      input: { openedMode: "default", liveMode: "acceptEdits", approvedSessionMode: "acceptEdits" },
+      expected: undefined,
+    },
+    {
+      name: "override puts back a mode nobody approved",
+      input: { openedMode: "default", liveMode: "acceptEdits" },
+      expected: "default",
+    },
+    {
+      name: "plan mode Claude entered stays for an ordinary prompt",
+      input: { openedMode: "default", liveMode: "plan", modeBeforePlan: "default" },
+      expected: undefined,
+    },
+    {
+      name: "Implement restores the mode before plan",
+      input: {
+        openedMode: "default",
+        liveMode: "plan",
+        modeBeforePlan: "acceptEdits",
+        approvedSessionMode: "acceptEdits",
+        implementsPlan: true,
+      },
+      expected: "acceptEdits",
+    },
+    {
+      name: "Implement never restores an unapproved override mode",
+      input: {
+        openedMode: "default",
+        liveMode: "plan",
+        modeBeforePlan: "auto",
+        implementsPlan: true,
+      },
+      expected: "default",
+    },
+    {
+      name: "Implement restores Bypass with the opt-in",
+      input: {
+        openedMode: "bypassPermissions",
+        liveMode: "plan",
+        modeBeforePlan: "bypassPermissions",
+        implementsPlan: true,
+        allowBypassPermissions: true,
+      },
+      expected: "bypassPermissions",
+    },
+    {
+      name: "Implement never restores Bypass without the opt-in",
+      input: {
+        permissionSource: "inherit",
+        openedMode: undefined,
+        liveMode: "plan",
+        modeBeforePlan: "bypassPermissions",
+        implementsPlan: true,
+      },
+      expected: "default",
+    },
+    {
+      name: "a chat in Stark's Plan leaves it through a new process, not here",
+      input: { openedMode: "plan", liveMode: "plan", implementsPlan: true },
+      expected: undefined,
+    },
+  ] as const)("$name", ({ input, expected }) => {
+    assert.equal(
+      ClaudeAdapterV2.claudeModeBeforePrompt({
+        permissionSource: "override",
+        approvedSessionMode: undefined,
+        modeBeforePlan: undefined,
+        implementsPlan: false,
+        allowBypassPermissions: false,
+        ...input,
+      }),
+      expected,
+    );
+  });
+
+  it("recognises Stark's Implement prompt only in the default interaction mode", () => {
+    const turn = (text: string, interactionMode = "default") => ({
+      message: { text },
+      runtimePolicy: { interactionMode },
+    });
+    assert.isTrue(
+      ClaudeAdapterV2.isClaudePlanImplementationTurn(turn("PLEASE IMPLEMENT THIS PLAN:\n# Plan")),
+    );
+    assert.isTrue(
+      ClaudeAdapterV2.isClaudePlanImplementationTurn(
+        turn("Ultrathink:\nPLEASE IMPLEMENT THIS PLAN:\n# Plan"),
+      ),
+    );
+    assert.isFalse(
+      ClaudeAdapterV2.isClaudePlanImplementationTurn(
+        turn("PLEASE IMPLEMENT THIS PLAN:\n# Plan", "plan"),
+      ),
+    );
+    assert.isFalse(
+      ClaudeAdapterV2.isClaudePlanImplementationTurn(turn("Please implement the plan")),
+    );
+  });
 
   it.each(["Agent", "Task"])("denies inherited Bypass for Claude's %s tool", async (toolName) => {
     const options = safetyOptions({
@@ -550,7 +830,8 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
         },
       });
       assert.equal(options.permissionMode, expected);
-      assert.equal(policy.installPermissionCallback, expected !== "bypassPermissions");
+      // Every mode, Bypass included, shows the asks Claude raises.
+      assert.equal(policy.installPermissionCallback, true);
       assert.equal(
         options.allowDangerouslySkipPermissions === true,
         expected === "bypassPermissions",
@@ -658,9 +939,10 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "dontAsk",
+      permissionSource: "override",
       tools: ClaudeAdapterV2.CLAUDE_READ_ONLY_ALLOWED_TOOLS,
       allowedTools: ClaudeAdapterV2.CLAUDE_READ_ONLY_ALLOWED_TOOLS,
-      installPermissionCallback: false,
+      installPermissionCallback: true,
     });
   });
 
@@ -681,6 +963,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "default",
+      permissionSource: "override",
       tools: ClaudeAdapterV2.CLAUDE_READ_ONLY_ALLOWED_TOOLS,
       allowedTools: ClaudeAdapterV2.CLAUDE_READ_ONLY_ALLOWED_TOOLS,
       installPermissionCallback: true,
@@ -708,8 +991,9 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "dontAsk",
+      permissionSource: "override",
       tools: ClaudeAdapterV2.CLAUDE_READ_ONLY_ALLOWED_TOOLS,
-      installPermissionCallback: false,
+      installPermissionCallback: true,
     });
   });
 
@@ -724,8 +1008,9 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "bypassPermissions",
+      permissionSource: "override",
       allowDangerouslySkipPermissions: true,
-      installPermissionCallback: false,
+      installPermissionCallback: true,
     });
   });
 
@@ -740,6 +1025,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "auto",
+      permissionSource: "override",
       installPermissionCallback: true,
     });
   });
@@ -758,6 +1044,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "default",
+      permissionSource: "override",
       installPermissionCallback: true,
     });
   });
@@ -773,6 +1060,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "plan",
+      permissionSource: "override",
       installPermissionCallback: true,
     });
   });
@@ -792,7 +1080,8 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "dontAsk",
-      installPermissionCallback: false,
+      permissionSource: "override",
+      installPermissionCallback: true,
     });
   });
 
@@ -811,8 +1100,9 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
     assert.deepEqual(queryPolicy, {
       permissionMode: "bypassPermissions",
+      permissionSource: "override",
       allowDangerouslySkipPermissions: true,
-      installPermissionCallback: false,
+      installPermissionCallback: true,
     });
   });
 });
@@ -924,7 +1214,7 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
     ]);
   });
 
-  it("keys live-query reuse on the MCP-derived pre-approvals", () => {
+  it("keys live-query reuse on effective MCP pre-approvals rather than the sandbox label", () => {
     const threadId = ThreadId.make("thread-claude-mcp-query-key");
     const mcpSession = mcpSessionFor(threadId);
     const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(
@@ -951,8 +1241,21 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
     );
     const detachedKey = ClaudeAdapterV2.claudeEffectiveQueryPolicyKey(queryPolicy, {});
 
-    assert.notEqual(readOnlyKey, fullAccessKey);
+    // Both modes now pre-approve the same read-only MCP tools. The broader
+    // sandbox must not add the old wildcard or require a pointless restart.
+    assert.equal(readOnlyKey, fullAccessKey);
     assert.notEqual(fullAccessKey, detachedKey);
+    assert.notEqual(
+      readOnlyKey,
+      ClaudeAdapterV2.claudeEffectiveQueryPolicyKey(
+        queryPolicy,
+        ClaudeAdapterV2.claudeMcpQueryOverrides({
+          mcpSession,
+          readOnlySandbox: true,
+          allowedTools: ["Read"],
+        }),
+      ),
+    );
   });
 
   it("invalidates live-query reuse when MCP credentials rotate", () => {
@@ -1320,7 +1623,7 @@ describe("ClaudeAdapterV2 session permissions", () => {
     ]);
   });
 
-  it("adds a whole-tool session rule when Claude offers no suggestion", () => {
+  it("never makes up a whole-tool session rule when Claude offers no suggestion", () => {
     const result = ClaudeAdapterV2.permissionResultFromDecision({
       toolName: "mcp__stark-code__custom_tool",
       decision: "acceptForSession",
@@ -1328,19 +1631,135 @@ describe("ClaudeAdapterV2 session permissions", () => {
       toolUseID: "tool-2",
     });
 
-    assert.equal(result.behavior, "allow");
-    if (result.behavior !== "allow") {
-      return;
-    }
-    assert.deepEqual(result.updatedPermissions, [
-      {
-        type: "addRules",
-        rules: [{ toolName: "mcp__stark-code__custom_tool" }],
-        behavior: "allow",
-        destination: "session",
-      },
-    ]);
+    assert.equal(result.behavior, "deny");
   });
+
+  it.effect("offers and sends Claude's own mode suggestion for a session approval", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "stark-claude-session-grant-",
+        });
+        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: OPTED_IN_CLAUDE_SETTINGS,
+          environment: {},
+          attachmentsDir,
+          fileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-thread-claude-session-grant"),
+            open: (input) =>
+              Effect.sync(() => {
+                openedOptions = input.options;
+                return {
+                  messages: Stream.never,
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: attachmentsDir,
+        });
+        const threadId = ThreadId.make("thread-claude-session-grant");
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-session-grant"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy,
+        });
+        yield* runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-session-grant"),
+            text: "Write a file.",
+            attachments: [],
+            runtimePolicy,
+          }),
+        );
+        const approvalItem =
+          yield* Deferred.make<Extract<OrchestrationV2TurnItem, { type: "approval_request" }>>();
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "approval_request"
+              ? Deferred.succeed(approvalItem, event.turnItem).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        const suggestion = {
+          type: "setMode" as const,
+          mode: "acceptEdits" as const,
+          destination: "session" as const,
+        };
+        const decision = yield* Effect.promise(() =>
+          openedOptions!.canUseTool!(
+            "Write",
+            { file_path: `${attachmentsDir}/out.txt`, content: "x" },
+            {
+              signal: new AbortController().signal,
+              toolUseID: "tool-write-session-grant",
+              requestId: "request-write-session-grant",
+              suggestions: [suggestion],
+            },
+          ),
+        ).pipe(Effect.forkScoped);
+        const item = yield* Deferred.await(approvalItem);
+        assert.deepEqual(
+          item.options?.find((option) => option.decision === "acceptForSession"),
+          {
+            decision: "acceptForSession",
+            label: "Allow for this session",
+            detail: "Edits allowed without asking for this session",
+            optionId: "session:0",
+            scope: "session",
+            effect: "allow",
+            // Exactly what Claude receives for this choice, less the unchanged tool input.
+            nativePayload: {
+              behavior: "allow",
+              toolUseID: "tool-write-session-grant",
+              decisionClassification: "user_permanent",
+              updatedPermissions: [suggestion],
+            },
+          },
+        );
+        yield* runtime.respondToRuntimeRequest({
+          requestId: item.requestId,
+          decision: "acceptForSession",
+        });
+        const result = yield* Fiber.join(decision);
+        assert.equal(result?.behavior, "allow");
+        if (result?.behavior !== "allow") return;
+        assert.deepEqual(result.updatedPermissions, [suggestion]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 });
 
 describe("ClaudeAdapterV2 Auto-accept edits", () => {
@@ -1349,6 +1768,8 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
     { runtimeMode: "auto", hook: false, nativeHookType: false },
     { runtimeMode: "full-access", hook: true, nativeHookType: true },
     { runtimeMode: "full-access", hook: true, nativeHookType: false },
+    // An ask without a reason in Bypass is still shown, never answered by Stark.
+    { runtimeMode: "full-access", hook: false, nativeHookType: false },
   ] as const)("asks before a command with runtime $runtimeMode, hook=$hook", (scenario) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1487,6 +1908,28 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
   );
 });
 
+describe("ClaudeAdapterV2 HTML tool approval prompt", () => {
+  it("names the page instead of cutting the HTML to a JSON preview", () => {
+    const html = `<!doctype html><style>${"p{}".repeat(200)}</style><img src="/tmp/a.png">`;
+    assert.equal(
+      ClaudeAdapterV2.starkHtmlToolApprovalPrompt("mcp__stark-code__html_render", {
+        html,
+        title: "Lunch proposal",
+        height: 400,
+      }),
+      "Render an HTML page: Lunch proposal",
+    );
+    assert.equal(
+      ClaudeAdapterV2.starkHtmlToolApprovalPrompt("mcp__stark-code__html_preview", { html }),
+      "Preview an HTML page",
+    );
+    // Same tool name on another server is not Stark's tool.
+    assert.isUndefined(
+      ClaudeAdapterV2.starkHtmlToolApprovalPrompt("mcp__other__html_render", { html }),
+    );
+  });
+});
+
 describe("ClaudeAdapterV2 approval cancellation", () => {
   it.effect("observes an approval signal that was already aborted", () =>
     Effect.gen(function* () {
@@ -1497,6 +1940,7 @@ describe("ClaudeAdapterV2 approval cancellation", () => {
       const result = yield* ClaudeAdapterV2.awaitClaudeApprovalDecision(
         decision,
         controller.signal,
+        "cancel",
       );
 
       assert.equal(result, "cancel");
@@ -1514,7 +1958,7 @@ describe("ClaudeAdapterV2 approval cancellation", () => {
         return removeEventListener(...args);
       };
       const fiber = yield* Effect.forkChild(
-        ClaudeAdapterV2.awaitClaudeApprovalDecision(decision, controller.signal),
+        ClaudeAdapterV2.awaitClaudeApprovalDecision(decision, controller.signal, "cancel"),
       );
       yield* Effect.yieldNow;
       yield* Deferred.succeed(decision, "accept");
@@ -1652,6 +2096,75 @@ describe("ClaudeAdapterV2 executable path", () => {
   );
 });
 
+describe("claudeSubagentDisplayName", () => {
+  it("names a subagent by its task, never by its raw id", () => {
+    assert.equal(
+      ClaudeAdapterV2.claudeSubagentDisplayName({ title: "Review the diff", prompt: "x" }),
+      "Review the diff",
+    );
+    assert.equal(
+      ClaudeAdapterV2.claudeSubagentDisplayName({ title: null, prompt: "Check tests\nthen fix" }),
+      "Check tests",
+    );
+    assert.equal(ClaudeAdapterV2.claudeSubagentDisplayName(undefined), "Subagent");
+  });
+});
+
+describe("ClaudeAdapterV2 answer delivery", () => {
+  it.effect(
+    "counts an answer handed over only when the SDK took it while the request was open",
+    () =>
+      Effect.gen(function* () {
+        const settled = (
+          signal: AbortSignal,
+          callback: () => Promise<string>,
+          abort?: () => void,
+        ) =>
+          Effect.gen(function* () {
+            const handedOver = yield* Deferred.make<void, string>();
+            yield* Effect.promise(() =>
+              ClaudeAdapterV2.claudeSdkHandover(signal, handedOver, callback()).then(
+                () => abort?.(),
+                () => abort?.(),
+              ),
+            );
+            return yield* Deferred.await(handedOver).pipe(Effect.flip, Effect.option);
+          });
+        // Taken while open: handed over.
+        assert.isTrue(
+          Option.isNone(
+            yield* settled(new AbortController().signal, () => Promise.resolve("allow")),
+          ),
+        );
+        // The SDK closed the request before the answer came back: it sends nothing.
+        const closing = new AbortController();
+        assert.deepEqual(
+          yield* settled(closing.signal, () => {
+            closing.abort();
+            return Promise.resolve("allow");
+          }),
+          Option.some("Claude cancelled the request before the answer was sent."),
+        );
+        // A cancellation after the answer went back does not undo the handover.
+        const later = new AbortController();
+        assert.isTrue(
+          Option.isNone(
+            yield* settled(
+              later.signal,
+              () => Promise.resolve("allow"),
+              () => later.abort(),
+            ),
+          ),
+        );
+        // The callback failed: nothing was handed over.
+        assert.deepEqual(
+          yield* settled(new AbortController().signal, () => Promise.reject(new Error("closed"))),
+          Option.some("The answer was not handed to Claude."),
+        );
+      }),
+  );
+});
+
 describe("ClaudeAdapterV2 resume compaction", () => {
   it.effect("resolves and cancels the SDK resume dialog through structured runtime input", () =>
     Effect.scoped(
@@ -1718,6 +2231,13 @@ describe("ClaudeAdapterV2 resume compaction", () => {
         assert.isFunction(callback);
         const canUseTool = openedOptions?.canUseTool;
         assert.isFunction(canUseTool);
+        // In Bypass, Claude asks only for what it insists a person decides;
+        // even an ask without a reason is shown, never answered by Stark.
+        const ordinaryRequestEvent = yield* runtime.events.pipe(
+          Stream.filter((event) => event.type === "runtime_request.updated"),
+          Stream.runHead,
+          Effect.forkScoped,
+        );
         const ordinaryToolResult = yield* Effect.promise(() =>
           canUseTool!(
             "Bash",
@@ -1728,8 +2248,18 @@ describe("ClaudeAdapterV2 resume compaction", () => {
               requestId: "request-bash-full-access",
             },
           ),
-        );
-        assert.deepEqual(ordinaryToolResult, {
+        ).pipe(Effect.forkScoped);
+        const ordinaryRequest = yield* Fiber.join(ordinaryRequestEvent);
+        if (
+          Option.isNone(ordinaryRequest) ||
+          ordinaryRequest.value.type !== "runtime_request.updated"
+        )
+          return assert.fail("the Bypass ask was not shown");
+        yield* runtime.respondToRuntimeRequest({
+          requestId: ordinaryRequest.value.runtimeRequest.id,
+          decision: "accept",
+        });
+        assert.deepInclude(yield* Fiber.join(ordinaryToolResult), {
           behavior: "allow",
           updatedInput: { command: "pwd" },
           toolUseID: "tool-bash-full-access",
@@ -2689,6 +3219,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
+    readonly onEvent?: (event: ProviderAdapter.ProviderAdapterV2Event) => Effect.Effect<unknown>;
     readonly captureUsageLimits?: ClaudeAdapterV2.ClaudeAdapterV2Options["captureUsageLimits"];
     readonly beforeOpen?: Effect.Effect<void>;
     readonly acknowledgeShellAppends?: boolean;
@@ -2900,6 +3431,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         Stream.runForEach((event) =>
           Effect.gen(function* () {
             events.push(event);
+            if (options?.onEvent) yield* options.onEvent(event);
             if (event.type === "subagent.updated") {
               yield* Queue.offer(subagentReceipts, event);
             }
@@ -2957,6 +3489,111 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
 
+  it.effect("shows the Claude edit before the permission callback can proceed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const ready =
+          yield* Deferred.make<
+            Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn_item.updated" }>
+          >();
+        const harness = yield* makeWakeHarnessWithOptions({
+          onEvent: (event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "approval_request"
+              ? Deferred.succeed(ready, event)
+              : Effect.void,
+        });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: "/workspace",
+        });
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("proposed-claude-edit"),
+            text: "Propose an edit.",
+            attachments: [],
+            runtimePolicy,
+          }),
+        );
+        const permission = yield* Effect.promise(() =>
+          harness.getOpenedOptions()!.canUseTool!(
+            "Edit",
+            {
+              file_path: "/workspace/existing.ts",
+              old_string: "old",
+              new_string: "new",
+              replace_all: true,
+            },
+            {
+              signal: new AbortController().signal,
+              toolUseID: "edit-exact",
+              requestId: "edit-request",
+            },
+          ),
+        ).pipe(Effect.forkScoped);
+        const event = yield* Deferred.await(ready);
+        if (event.turnItem.type !== "approval_request")
+          return yield* Effect.die("Expected edit approval");
+        // The target cannot be read here, so the card falls back to the edit text.
+        assert.deepEqual(event.turnItem.proposedChanges, [
+          {
+            operation: "update",
+            path: "/workspace/existing.ts",
+            approximate: true,
+            patch:
+              "--- /workspace/existing.ts\n+++ /workspace/existing.ts\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+          },
+        ]);
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: event.turnItem.requestId,
+          decision: "decline",
+        });
+        assert.equal((yield* Fiber.join(permission))?.behavior, "deny");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  // Every ask Claude raises is shown, Bypass included; this answers one.
+  const approveAsk = <A>(
+    harness: {
+      readonly events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>;
+      readonly runtime: Pick<
+        ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        "respondToRuntimeRequest"
+      >;
+    },
+    ask: () => Promise<A>,
+    decision: ProviderApprovalDecision = "accept",
+  ) =>
+    Effect.gen(function* () {
+      const seen = harness.events.length;
+      const answer = yield* Effect.promise(ask).pipe(Effect.forkChild);
+      const request = () =>
+        harness.events
+          .slice(seen)
+          .find(
+            (
+              event,
+            ): event is Extract<
+              ProviderAdapter.ProviderAdapterV2Event,
+              { type: "runtime_request.updated" }
+            > => event.type === "runtime_request.updated",
+          );
+      yield* awaitUntil(() => request() !== undefined, "the permission request");
+      yield* harness.runtime.respondToRuntimeRequest({
+        requestId: request()!.runtimeRequest.id,
+        decision,
+      });
+      return { result: yield* Fiber.join(answer), event: request()! };
+    });
+
   const localShellResult: UserShellCommandResult = {
     stdout: "/workspace\n",
     stderr: "",
@@ -3010,6 +3647,59 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ClaudeAdapterV2.USER_SHELL_CAVEAT,
       "<local-command-caveat>The command below was run directly in Stark Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>",
     );
+  });
+
+  it.effect("tells Claude ahead of the prompt that html_preview has no browser", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+        environmentId: EnvironmentId.make("environment-preview-browser"),
+        threadId: harness.threadId,
+        providerSessionId: "mcp-session-preview-browser",
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer preview-browser-token",
+        browserToolsAvailable: true,
+      });
+      yield* harness.runtime.startTurn({
+        ...makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("preview-browser"),
+          text: "Draw the release flow",
+          attachments: [],
+        }),
+        previewBrowser: { state: "not-installed", totalBytes: 99_221_129 },
+      });
+
+      const content = harness.offeredMessages[0]!.message.content;
+      assert.isArray(content);
+      const [note, prompt] = content as ReadonlyArray<{ readonly text: string }>;
+      assert.match(note!.text, /^<stark_code_preview_browser>.*not installed.*```mermaid/s);
+      assert.equal(prompt!.text, "Ultrathink:\nDraw the release flow");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it("sends the preview browser note only when it changes, and stays quiet while ready", () => {
+    const missing = { state: "not-installed", totalBytes: 99_221_129 } as const;
+    const ready = { state: "ready", totalBytes: 99_221_129 } as const;
+    const send = (
+      status: ProviderAdapter.ProviderAdapterV2TurnInput["previewBrowser"],
+      lastSent?: string,
+      hasStarkMcp = true,
+    ) => ClaudeAdapterV2.claudePreviewBrowserContextToSend({ status, hasStarkMcp, lastSent });
+
+    assert.isUndefined(send(ready));
+    assert.isUndefined(send(missing, undefined, false));
+    const first = send(missing);
+    assert.isDefined(first);
+    assert.isUndefined(send(missing, first));
+    assert.include(send(ready, first), "is installed");
   });
 
   it.effect("reports hook blocks without ending the provider turn", () =>
@@ -3745,7 +4435,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       );
       const toolName = "mcp__weather__get_weather";
       const id = "weather-call";
-      yield* Effect.promise(() =>
+      yield* approveAsk(harness, () =>
         harness.getOpenedOptions()!.canUseTool!(
           toolName,
           { city: "Berlin" },
@@ -4636,6 +5326,88 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   );
 
   it.effect.each([
+    { name: "credits only", alsoWindow: false },
+    { name: "credits and a rejected window", alsoWindow: true },
+  ])("keeps a credits-required rejection apart from usage windows ($name)", ({ alsoWindow }) =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const now = yield* DateTime.now;
+      const resetsAt = Math.floor(DateTime.toEpochMillis(now) / 1000) + 40 * 3_600;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make(`attempt-claude-credits-${alsoWindow}`),
+          text: "Continue.",
+          attachments: [],
+        }),
+      );
+      yield* Queue.offerAll(harness.sdkMessages, [
+        claudeSdkFrame({
+          type: "rate_limit_event",
+          rate_limit_info: {
+            status: "rejected",
+            resetsAt,
+            overageStatus: "rejected",
+            errorCode: "credits_required",
+          },
+          uuid: "00000000-0000-4000-8000-000000000611",
+          session_id: WAKE_NATIVE_SESSION,
+        }),
+        ...(alsoWindow
+          ? [
+              claudeSdkFrame({
+                type: "rate_limit_event",
+                rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt },
+                uuid: "00000000-0000-4000-8000-000000000612",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            ]
+          : []),
+        // The CLI's own reply for the rejection is marked as a rate limit.
+        makeAssistantErrorFrame({
+          uuid: "00000000-0000-4000-8000-000000000613",
+          error: "rate_limit",
+        }),
+        makeResultFrame({
+          uuid: "00000000-0000-4000-8000-000000000614",
+          result: "API Error",
+          isError: true,
+          apiErrorStatus: 429,
+          terminalReason: "api_error",
+        }),
+      ]);
+
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      if (alsoWindow) {
+        // A real window still pauses the turn with its reset time.
+        assert.equal(terminal.failure.class, "usage_limit");
+        assert.equal(
+          terminal.failure.resetAt,
+          DateTime.formatIso(DateTime.makeUnsafe(resetsAt * 1000)),
+        );
+        const notice = (yield* Queue.take(harness.systemNoticeReceipts)).turnItem;
+        assert.equal(notice.type, "system_notice");
+        if (notice.type === "system_notice") assert.include(notice.message, "5-hour limit");
+      } else {
+        assert.equal(terminal.failure.class, "provider_error");
+        assert.equal(terminal.failure.code, "credits_required");
+        assert.equal(terminal.failure.retryable, false);
+        assert.isUndefined(terminal.failure.resetAt);
+        assert.include(terminal.failure.message, "requires usage credits");
+        assert.isTrue(Option.isNone(yield* Queue.poll(harness.systemNoticeReceipts)));
+      }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each([
     { name: "parent limit", parentErrors: ["rate_limit"], expectedLimit: true },
     {
       name: "parent limit then nested response",
@@ -5320,9 +6092,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         );
         const proposedPlan = [...plans.values()].find((plan) => plan.kind === "proposed_plan");
         assert.equal(proposedPlan?.status, "active");
-        // The second prompt reuses the live process, which is still in the
-        // plan mode Claude entered, so it is put back in the thread's mode.
-        assert.deepEqual(harness.permissionModeChanges, ["bypassPermissions"]);
+        // The second prompt reuses the live process, which stays in the plan
+        // mode Claude entered: only Stark's Implement action leaves it.
+        assert.deepEqual(harness.permissionModeChanges, []);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -5330,6 +6102,578 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
     ),
   );
+
+  describe("Claude approval answers", () => {
+    const POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      cwd: "/workspace",
+    });
+    const provide = Effect.provide(
+      Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+    );
+    const SUGGESTION = {
+      type: "addRules" as const,
+      rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+      behavior: "allow" as const,
+      destination: "session" as const,
+    };
+    const startTurn = (
+      harness: Effect.Success<typeof makeWakeHarness>,
+      runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy = POLICY,
+    ) =>
+      Effect.gen(function* () {
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-approval-answers"),
+            text: "Run the tests.",
+            attachments: [],
+            runtimePolicy,
+          }),
+        );
+      });
+    // Raises one Bash ask and returns its approval item and Claude's pending answer.
+    const ask = (
+      harness: Effect.Success<typeof makeWakeHarness>,
+      toolUseID: string,
+      extra: Record<string, unknown> = {},
+      command = "npm test",
+    ) =>
+      Effect.gen(function* () {
+        const seen = harness.events.length;
+        const answer = yield* Effect.promise(() =>
+          harness.getOpenedOptions()!.canUseTool!(
+            "Bash",
+            { command },
+            {
+              signal: new AbortController().signal,
+              toolUseID,
+              requestId: `request-${toolUseID}`,
+              suggestions: [SUGGESTION],
+              ...extra,
+            },
+          ),
+        ).pipe(Effect.forkChild);
+        const item = () =>
+          harness.events
+            .slice(seen)
+            .flatMap((event) =>
+              event.type === "turn_item.updated" && event.turnItem.type === "approval_request"
+                ? [event.turnItem]
+                : [],
+            )
+            .at(0);
+        yield* awaitUntil(() => item() !== undefined, "the approval item");
+        return { item: item()!, answer };
+      });
+
+    it.effect("sends exactly the PermissionResult bound to the chosen option id", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startTurn(harness);
+        const { item, answer } = yield* ask(harness, "tool-always");
+        const always = item.options?.find((option) => option.optionId === "persistent:0");
+        assert.deepEqual(always?.nativePayload, {
+          behavior: "allow",
+          toolUseID: "tool-always",
+          decisionClassification: "user_permanent",
+          updatedPermissions: [{ ...SUGGESTION, destination: "localSettings" }],
+        });
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: item.requestId,
+          optionId: "persistent:0",
+        });
+        assert.deepEqual(yield* Fiber.join(answer), {
+          behavior: "allow",
+          updatedInput: { command: "npm test" },
+          toolUseID: "tool-always",
+          decisionClassification: "user_permanent",
+          updatedPermissions: [{ ...SUGGESTION, destination: "localSettings" }],
+        });
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("sends the user's reason with a decline, and Decline and stop ends the work", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startTurn(harness);
+        const first = yield* ask(harness, "tool-decline");
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: first.item.requestId,
+          optionId: "deny:0",
+          feedback: "Use pnpm instead.",
+        });
+        assert.deepEqual(yield* Fiber.join(first.answer), {
+          behavior: "deny",
+          message: "User declined tool execution. Their reason: Use pnpm instead.",
+          toolUseID: "tool-decline",
+          decisionClassification: "user_reject",
+        });
+        const second = yield* ask(harness, "tool-stop");
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: second.item.requestId,
+          optionId: "deny-stop:0",
+        });
+        assert.deepInclude(yield* Fiber.join(second.answer), {
+          behavior: "deny",
+          message: "User cancelled tool execution.",
+          interrupt: true,
+        });
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("maps an older client's plain decision to the narrowest matching option", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startTurn(harness);
+        const { item, answer } = yield* ask(harness, "tool-plain-decline");
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: item.requestId,
+          decision: "decline",
+        });
+        // Decline, not Decline and stop: the plain decision never stops Claude.
+        assert.notProperty(yield* Fiber.join(answer), "interrupt");
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("refuses an id it did not offer and a reason an allow cannot carry", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startTurn(harness);
+        const { item, answer } = yield* ask(harness, "tool-refused");
+        const unknownId = yield* harness.runtime
+          .respondToRuntimeRequest({
+            requestId: item.requestId,
+            optionId: "session:4",
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(unknownId));
+        const reasonOnAllow = yield* harness.runtime
+          .respondToRuntimeRequest({
+            requestId: item.requestId,
+            optionId: "once:0",
+            feedback: "because",
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(reasonOnAllow));
+        // The request still waits for a valid answer.
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: item.requestId,
+          optionId: "once:0",
+        });
+        assert.deepInclude(yield* Fiber.join(answer), { behavior: "allow" });
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("does not call a path outside the folder when a symlink is all that differs", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "stark-claude-symlink-" });
+        const project = path.join(root, "project");
+        const linked = path.join(root, "linked");
+        yield* fileSystem.makeDirectory(project);
+        yield* fileSystem.symlink(project, linked);
+        const harness = yield* makeWakeHarness;
+        // The chat runs in the symlinked folder; Claude reports the resolved path.
+        yield* startTurn(
+          harness,
+          ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({ ...POLICY, cwd: linked }),
+        );
+        const inside = yield* ask(harness, "tool-symlink-inside", {
+          blockedPath: path.join(yield* fileSystem.realPath(project), "stamp.md"),
+        });
+        assert.notProperty(inside.item, "blockedPath");
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: inside.item.requestId,
+          decision: "decline",
+        });
+        yield* Fiber.join(inside.answer);
+        const outside = yield* ask(harness, "tool-symlink-outside", {
+          blockedPath: path.join(root, "elsewhere.md"),
+        });
+        assert.equal(outside.item.blockedPath, path.join(root, "elsewhere.md"));
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: outside.item.requestId,
+          decision: "decline",
+        });
+        yield* Fiber.join(outside.answer);
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("carries who asked and what the request reaches onto the approval", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startTurn(harness);
+        const { item, answer } = yield* ask(harness, "tool-scope", {
+          agentID: "agent-reviewer",
+          blockedPath: "/etc/hosts",
+          mcpServer: { name: "github", source: "user" },
+          defaultToNo: true,
+          title: "Claude wants to run npm test",
+          description: "Runs the project's test suite",
+        });
+        assert.deepInclude(item, {
+          agentId: "agent-reviewer",
+          // A subagent Stark has no record of is named, never shown as its id.
+          agentName: "Subagent",
+          blockedPath: "/etc/hosts",
+          mcpServerSource: { name: "github", source: "user" },
+          defaultToNo: true,
+          prompt: "Claude wants to run npm test\nRuns the project's test suite",
+          // The exact command, even when no command item links to the request.
+          command: "npm test",
+        });
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: item.requestId,
+          decision: "decline",
+        });
+        yield* Fiber.join(answer);
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("carries Stark's Pages reason onto a command that may publish to Stark Pages", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* startTurn(harness);
+        const command = 'spage "$sub" ./site';
+        // Claude's own title fills the prompt; the guard's reason comes only as decisionReason.
+        const hooked = yield* ask(
+          harness,
+          "tool-pages-hook",
+          {
+            title: `Claude wants to run ${command}`,
+            decisionReason: STARK_PAGES_PUBLISH_UNCERTAIN,
+            decision_reason_type: "hook",
+          },
+          command,
+        );
+        assert.equal(
+          hooked.item.prompt,
+          `Asked by a hook\nClaude wants to run ${command}\n${STARK_PAGES_PUBLISH_UNCERTAIN}`,
+        );
+        assert.equal(hooked.item.command, command);
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: hooked.item.requestId,
+          decision: "decline",
+        });
+        yield* Fiber.join(hooked.answer);
+
+        // An SDK that reports neither the hook nor its reason still gets the
+        // reason: Stark's guard asks about this command in every mode.
+        const unreported = yield* ask(
+          harness,
+          "tool-pages-unreported",
+          { title: `Claude wants to run ${command}` },
+          command,
+        );
+        assert.equal(
+          unreported.item.prompt,
+          `Claude wants to run ${command}\n${STARK_PAGES_PUBLISH_UNCERTAIN}`,
+        );
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: unreported.item.requestId,
+          decision: "decline",
+        });
+        yield* Fiber.join(unreported.answer);
+
+        // A prompt that already is the reason does not repeat it.
+        const bare = yield* ask(
+          harness,
+          "tool-pages-bare",
+          { decisionReason: STARK_PAGES_PUBLISH_UNCERTAIN, decision_reason_type: "hook" },
+          command,
+        );
+        assert.equal(bare.item.prompt, `Asked by a hook\n${STARK_PAGES_PUBLISH_UNCERTAIN}`);
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: bare.item.requestId,
+          decision: "decline",
+        });
+        yield* Fiber.join(bare.answer);
+
+        // An ordinary command carries no Pages reason.
+        const plain = yield* ask(harness, "tool-pages-plain", {
+          title: "Claude wants to run npm test",
+        });
+        assert.equal(plain.item.prompt, "Claude wants to run npm test");
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: plain.item.requestId,
+          decision: "decline",
+        });
+        yield* Fiber.join(plain.answer);
+      }).pipe(Effect.scoped, provide),
+    );
+  });
+
+  describe("permission mode between prompts", () => {
+    const MANUAL_POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      cwd: "/workspace",
+    });
+    const INHERIT_POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      ...MANUAL_POLICY,
+      permissionSource: "inherit",
+    });
+    const statusFrame = (uuid: string, permissionMode: string) =>
+      claudeSdkFrame({
+        type: "system",
+        subtype: "status",
+        status: null,
+        permissionMode,
+        uuid,
+        session_id: WAKE_NATIVE_SESSION,
+      });
+    const promptTurn = (
+      harness: Effect.Success<typeof makeWakeHarness>,
+      ordinal: number,
+      text: string,
+      runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+    ) =>
+      Effect.gen(function* () {
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make(`attempt-mode-${ordinal}`),
+            providerTurnOrdinal: ordinal,
+            text,
+            attachments: [],
+            runtimePolicy,
+          }),
+        );
+      });
+    const settle = (harness: Effect.Success<typeof makeWakeHarness>, uuid: string) =>
+      Queue.offer(harness.sdkMessages, makeResultFrame({ uuid, result: "done" })).pipe(
+        Effect.andThen(Queue.take(harness.terminalReceipts)),
+      );
+    const provide = Effect.provide(
+      Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+    );
+
+    it.effect("reports the mode Claude says it runs in on the provider session", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* promptTurn(harness, 1, "Write a file.", INHERIT_POLICY);
+        const reports = () =>
+          harness.events.flatMap((event) =>
+            event.type === "provider_session.updated" &&
+            event.providerSession.activePermissions !== undefined
+              ? [event.providerSession.activePermissions]
+              : [],
+          );
+        yield* harness.offerAndWait(statusFrame("00000000-0000-4000-8000-000000000731", "default"));
+        // The same mode again is not a new report.
+        yield* harness.offerAndWait(statusFrame("00000000-0000-4000-8000-000000000732", "default"));
+        yield* approveAsk(
+          harness,
+          () =>
+            harness.getOpenedOptions()!.canUseTool!(
+              "Write",
+              { file_path: "/workspace/a.txt", content: "a" },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-report-session-mode",
+                requestId: "request-report-session-mode",
+                suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+              },
+            ),
+          "acceptForSession",
+        );
+        // Claude confirming the approved mode changes nothing.
+        yield* harness.offerAndWait(
+          statusFrame("00000000-0000-4000-8000-000000000733", "acceptEdits"),
+        );
+        yield* awaitUntil(() => reports().length === 2, "both permission reports");
+        assert.deepEqual(
+          reports().map(({ nativeMode, interactionMode, reportedBy }) => ({
+            nativeMode,
+            interactionMode,
+            reportedBy,
+          })),
+          [
+            { nativeMode: "default", interactionMode: "default", reportedBy: "session-status" },
+            {
+              nativeMode: "acceptEdits",
+              interactionMode: "default",
+              reportedBy: "approved-session-update",
+            },
+          ],
+        );
+        // The session manager writes this object again at each turn start.
+        assert.deepEqual(harness.runtime.providerSession.activePermissions, reports()[1]);
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("keeps a mode the user approved for the session", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* promptTurn(harness, 1, "Write a file.", MANUAL_POLICY);
+        const suggestion = {
+          type: "setMode" as const,
+          mode: "acceptEdits" as const,
+          destination: "session" as const,
+        };
+        const { result } = yield* approveAsk(
+          harness,
+          () =>
+            harness.getOpenedOptions()!.canUseTool!(
+              "Write",
+              { file_path: "/workspace/a.txt", content: "a" },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-session-mode",
+                requestId: "request-session-mode",
+                suggestions: [suggestion],
+              },
+            ),
+          "acceptForSession",
+        );
+        assert.deepInclude(result, { behavior: "allow", updatedPermissions: [suggestion] });
+        yield* harness.offerAndWait(
+          statusFrame("00000000-0000-4000-8000-000000000701", "acceptEdits"),
+        );
+        yield* settle(harness, "00000000-0000-4000-8000-000000000702");
+        yield* promptTurn(harness, 2, "Next.", MANUAL_POLICY);
+        assert.deepEqual(harness.permissionModeChanges, []);
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect.each([
+      { source: "override", policy: MANUAL_POLICY, changes: ["default"] },
+      { source: "inherit", policy: INHERIT_POLICY, changes: [] },
+    ])("$source: a mode change nobody approved is put back only for an override", (scenario) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* promptTurn(harness, 1, "Work.", scenario.policy);
+        assert.equal(
+          harness.getOpenedOptions()?.permissionMode,
+          scenario.source === "inherit" ? undefined : "default",
+        );
+        yield* harness.offerAndWait(
+          statusFrame("00000000-0000-4000-8000-000000000711", "acceptEdits"),
+        );
+        yield* settle(harness, "00000000-0000-4000-8000-000000000712");
+        yield* promptTurn(harness, 2, "More work.", scenario.policy);
+        assert.deepEqual(harness.permissionModeChanges, scenario.changes);
+      }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect.each([
+      {
+        name: "Bypass opt-in on",
+        settings: OPTED_IN_CLAUDE_SETTINGS,
+        policy: CLAUDE_TEST_RUNTIME_POLICY,
+        before: "bypassPermissions",
+      },
+      {
+        name: "Bypass opt-in off",
+        settings: OPTED_OUT_CLAUDE_SETTINGS,
+        policy: MANUAL_POLICY,
+        before: "default",
+      },
+      {
+        name: "inherited settings",
+        settings: OPTED_IN_CLAUDE_SETTINGS,
+        policy: INHERIT_POLICY,
+        before: "acceptEdits",
+      },
+    ])(
+      "$name: plan mode Claude entered stays until Implement restores the mode before it",
+      (scenario) =>
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarnessWithOptions({ settings: scenario.settings });
+          yield* promptTurn(harness, 1, "Plan the work.", scenario.policy);
+          // init reports the mode the process runs in, then Claude enters plan mode.
+          yield* harness.offerAndWait(
+            statusFrame("00000000-0000-4000-8000-000000000721", scenario.before),
+          );
+          yield* harness.offerAndWait(statusFrame("00000000-0000-4000-8000-000000000722", "plan"));
+          const exitPlan = yield* Effect.promise(() =>
+            harness.getOpenedOptions()!.canUseTool!(
+              "ExitPlanMode",
+              { plan: "# Plan\n\n1. Ship it." },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-exit-plan-mode",
+                requestId: "request-exit-plan-mode",
+              },
+            ),
+          );
+          assert.equal(exitPlan?.behavior, "deny");
+          yield* settle(harness, "00000000-0000-4000-8000-000000000723");
+          yield* promptTurn(harness, 2, "Tell me more first.", scenario.policy);
+          assert.deepEqual(harness.permissionModeChanges, []);
+          yield* settle(harness, "00000000-0000-4000-8000-000000000724");
+          yield* promptTurn(
+            harness,
+            3,
+            "PLEASE IMPLEMENT THIS PLAN:\n# Plan\n\n1. Ship it.",
+            scenario.policy,
+          );
+          assert.deepEqual(harness.permissionModeChanges, [scenario.before]);
+        }).pipe(Effect.scoped, provide),
+    );
+
+    it.effect("shows an ask raised between turns on the thread instead of refusing it", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* promptTurn(harness, 1, "Start a background agent.", MANUAL_POLICY);
+        yield* settle(harness, "00000000-0000-4000-8000-000000000731");
+        // A background agent keeps working after the turn settled and asks.
+        const { result, event } = yield* approveAsk(harness, () =>
+          harness.getOpenedOptions()!.canUseTool!(
+            "Bash",
+            { command: "npm test" },
+            {
+              signal: new AbortController().signal,
+              toolUseID: "tool-between-turns",
+              requestId: "request-between-turns",
+              agentID: "agent-background",
+            },
+          ),
+        );
+        assert.equal(event.threadId, harness.threadId);
+        assert.isNull(event.runtimeRequest.providerTurnId);
+        assert.equal(event.runtimeRequest.status, "pending");
+        const item = harness.events.find(
+          (candidate) =>
+            candidate.type === "turn_item.updated" &&
+            candidate.turnItem.type === "approval_request" &&
+            candidate.turnItem.requestId === event.runtimeRequest.id,
+        );
+        assert.isDefined(item);
+        if (item?.type !== "turn_item.updated") return;
+        assert.isNull(item.turnItem.runId);
+        assert.equal(item.turnItem.threadId, harness.threadId);
+        assert.deepInclude(result, { behavior: "allow", toolUseID: "tool-between-turns" });
+
+        // A plan proposed between turns is captured for the run its frame
+        // is replayed into, never refused unseen.
+        const exitPlan = yield* Effect.promise(() =>
+          harness.getOpenedOptions()!.canUseTool!(
+            "ExitPlanMode",
+            { plan: "# Later plan" },
+            {
+              signal: new AbortController().signal,
+              toolUseID: "tool-exit-plan-between-turns",
+              requestId: "request-exit-plan-between-turns",
+            },
+          ),
+        );
+        assert.deepEqual(exitPlan, {
+          behavior: "deny",
+          message:
+            "The client captured your proposed plan. Stop here and wait for the user's feedback or implementation request in a later turn.",
+          toolUseID: "tool-exit-plan-between-turns",
+        });
+      }).pipe(Effect.scoped, provide),
+    );
+  });
 
   type TaskToolCall =
     | { name: "TaskCreate"; input: TaskCreateInput; output: TaskCreateOutput }
@@ -15377,5 +16721,146 @@ describe("ClaudeAdapterV2 query message stream", () => {
       yield* Scope.close(scope, Exit.void);
       assert.isTrue(closed);
     }),
+  );
+});
+
+describe("ClaudeAdapterV2 file change approval previews", () => {
+  it.effect("shows the diff an Edit would make and never reads outside the turn's folder", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "stark-claude-preview-" });
+        const cwd = path.join(root, "repo");
+        yield* fileSystem.makeDirectory(cwd);
+        const file = path.join(cwd, "a.ts");
+        yield* fileSystem.writeFileString(
+          file,
+          Array.from({ length: 10 }, (_, index) => `line ${index + 1}\n`).join(""),
+        );
+        const secret = path.join(root, "secret.txt");
+        yield* fileSystem.writeFileString(secret, "PRIVATE_TOKEN\n");
+        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: OPTED_IN_CLAUDE_SETTINGS,
+          environment: {},
+          attachmentsDir: path.join(root, "attachments"),
+          fileSystem,
+          path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-thread-claude-preview"),
+            open: (input) =>
+              Effect.sync(() => {
+                openedOptions = input.options;
+                return {
+                  messages: Stream.never,
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd,
+        });
+        const threadId = ThreadId.make("thread-claude-preview");
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-preview"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy,
+        });
+        yield* runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-preview"),
+            text: "Edit the file.",
+            attachments: [],
+            runtimePolicy,
+          }),
+        );
+        const canUseTool = openedOptions?.canUseTool;
+        assert.isFunction(canUseTool);
+        const approvals =
+          yield* Queue.unbounded<Extract<OrchestrationV2TurnItem, { type: "approval_request" }>>();
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "approval_request"
+              ? Queue.offer(approvals, event.turnItem)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        const ask = (toolName: string, toolInput: Record<string, unknown>, toolUseID: string) =>
+          Effect.gen(function* () {
+            const decision = yield* Effect.promise(() =>
+              canUseTool!(toolName, toolInput, {
+                signal: new AbortController().signal,
+                toolUseID,
+                requestId: `request-${toolUseID}`,
+              }),
+            ).pipe(Effect.forkScoped);
+            const approval = yield* Queue.take(approvals);
+            yield* runtime.respondToRuntimeRequest({
+              requestId: approval.requestId,
+              decision: "decline",
+            });
+            assert.equal((yield* Fiber.join(decision))?.behavior, "deny");
+            return approval;
+          });
+
+        const edit = yield* ask(
+          "Edit",
+          { file_path: file, old_string: "line 7\n", new_string: "line seven\n" },
+          "tool-edit-preview",
+        );
+        assert.equal(edit.requestKind, "file-change");
+        assert.deepEqual(edit.proposedChanges, [
+          {
+            path: file,
+            operation: "update",
+            patch: `--- ${file}\n+++ ${file}\n@@ -4,7 +4,7 @@\n line 4\n line 5\n line 6\n-line 7\n+line seven\n line 8\n line 9\n line 10\n`,
+          },
+        ]);
+
+        const outside = yield* ask(
+          "Write",
+          { file_path: secret, content: "replaced\n" },
+          "tool-write-outside",
+        );
+        assert.deepEqual(outside.proposedChanges, [
+          {
+            path: secret,
+            operation: "update",
+            approximate: true,
+            patch: `--- ${secret}\n+++ ${secret}\n@@ -0,0 +1,1 @@\n+replaced\n`,
+          },
+        ]);
+        assert.notInclude(JSON.stringify(outside), "PRIVATE_TOKEN");
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
   );
 });

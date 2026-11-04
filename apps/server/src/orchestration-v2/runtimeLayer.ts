@@ -29,6 +29,7 @@ import * as EventStore from "./EventStore.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as MaintenanceGatedOrchestrator from "../maintenance/MaintenanceGatedOrchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -45,6 +46,7 @@ import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
+import * as PermissionFreeze from "./PermissionFreeze.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -135,6 +137,7 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
       ProjectionStore.layer,
+      EffectOutbox.layer,
     ),
   ),
 );
@@ -217,7 +220,7 @@ const layerRunFinalizationServiceProvided = RunFinalizationService.layer.pipe(
   Layer.provide(Layer.merge(layerCheckpointCaptureServiceProvided, ProjectionStore.layer)),
 );
 
-const layerOrchestratorProvided = Orchestrator.layer.pipe(
+const layerOrchestratorUngated = Orchestrator.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,
@@ -240,6 +243,11 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
       ThreadForkService.layer,
     ),
   ),
+);
+
+// Every consumer gets the dispatch the maintenance gate decorates.
+const layerOrchestratorProvided = MaintenanceGatedOrchestrator.layer.pipe(
+  Layer.provide(layerOrchestratorUngated),
 );
 
 const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
@@ -329,6 +337,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
       layerRuntimeRequestServiceProvided,
       layerThreadTitleRegenerationProvided,
       layerThreadManagementProvided,
+      layerRuntimePolicyProvided,
     ),
   ),
 );
@@ -358,9 +367,14 @@ const layerMcpAppRequestsProvided = McpAppRequests.layer.pipe(
   ),
 );
 
+const layerPermissionFreezeProvided = PermissionFreeze.layer.pipe(
+  Layer.provide(Layer.mergeAll(layerOrchestratorProvided, ProjectionStore.layer)),
+);
+
 export const layer = Layer.mergeAll(
   layerCheckpointFileRestoreProvided,
   layerOrchestratorProvided,
+  layerPermissionFreezeProvided,
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
   layerEffectWorkerProvided,

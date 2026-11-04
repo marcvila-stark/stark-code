@@ -691,7 +691,8 @@ it("shows the matching child agent details and refreshes them when the agent set
   expect(text()).not.toContain("(1)");
   expect(text()).not.toContain("Done");
   expect(text()).not.toContain("running");
-  expect(text()).not.toContain("Worker");
+  // The agent titled "Worker" is gone; the header's Workers link stays.
+  expect(text()).not.toMatch(/\bWorker\b/);
   await act(async () =>
     renderer.root.findByProps({ type: "button", "aria-expanded": true }).props.onClick(),
   );

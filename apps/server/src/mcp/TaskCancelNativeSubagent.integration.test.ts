@@ -220,7 +220,7 @@ it.effect("task_cancel ends a delegated child's background native subagent", () 
           parentNodeId: parentRun.rootNodeId!,
           task: "Review the change",
           modelSelection,
-          runtimeMode: "full-access",
+          runtimeMode: "approval-required",
           interactionMode: "default",
           completionWake: "always",
           createdBy: "agent",

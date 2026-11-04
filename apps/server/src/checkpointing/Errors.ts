@@ -92,3 +92,29 @@ export type CheckpointServiceError =
   | CheckpointWorkspacePathMissingError
   | CheckpointTurnRangeUnavailableError
   | CheckpointRefUnavailableError;
+
+/**
+ * The reason a diff request failed, in words a user can act on. The RPC sends this as its
+ * message, so clients show it instead of a generic failure.
+ */
+export function describeCheckpointDiffFailure(cause: CheckpointServiceError): string {
+  switch (cause._tag) {
+    case "CheckpointTurnRangeUnavailableError":
+      return `Turn ${cause.requestedTurnCount} has no saved checkpoint yet. A checkpoint is saved when a turn finishes.`;
+    case "CheckpointRefUnavailableError":
+      return cause.checkpoint === "to"
+        ? `Turn ${cause.turnCount} has no saved checkpoint, so its changes can't be shown. Uncommitted shows the folder's current changes.`
+        : `The checkpoint before this turn wasn't saved, so its changes can't be shown. Uncommitted shows the folder's current changes.`;
+    case "CheckpointThreadNotFoundError":
+      return "This chat isn't on the server any more, so its changes can't be shown.";
+    case "CheckpointWorkspacePathMissingError":
+      return "The folder this chat ran in is unknown, so its changes can't be shown.";
+    case "CheckpointDiffResultInvalidError":
+      return "The server produced a diff it couldn't send. Try again.";
+    case "PersistenceSqlError":
+    case "PersistenceDecodeError":
+      return "The server couldn't read this chat's checkpoints. Try again.";
+    default:
+      return `Git couldn't compare this turn's checkpoints: ${cause.message}`;
+  }
+}

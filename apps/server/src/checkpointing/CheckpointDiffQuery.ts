@@ -12,6 +12,7 @@ import {
   type OrchestrationGetFullThreadDiffResult,
   type OrchestrationGetTurnDiffInput,
   type OrchestrationGetTurnDiffResult as OrchestrationGetTurnDiffResultType,
+  type CheckpointScopeId,
   type ThreadId,
 } from "@starkfuture/contracts";
 import * as Context from "effect/Context";
@@ -21,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { checkpointRefForScopeOrdinal } from "../orchestration-v2/CheckpointService.ts";
+import type { ProjectionCheckpointContext } from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import {
   CheckpointDiffResultInvalidError,
@@ -105,6 +107,48 @@ export const make = Effect.gen(function* () {
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
   const crypto = yield* Crypto.Crypto;
 
+  const refForScopeOrdinal = (scopeId: CheckpointScopeId, ordinalWithinScope: number) =>
+    checkpointRefForScopeOrdinal({ scopeId, ordinalWithinScope }).pipe(
+      Effect.provideService(Crypto.Crypto, crypto),
+    );
+
+  /**
+   * Finds the checkpoint a turn diff starts from. It is the same snapshot that the turn's
+   * file summary was measured from at capture: the root scope's ref one ordinal earlier.
+   * That snapshot can be a stopped turn's checkpoint, or a baseline saved when the turn
+   * started because the earlier attempt never finished (for example, a server restart).
+   */
+  const resolveFromCheckpointRef = Effect.fn("resolveFromCheckpointRef")(function* (input: {
+    readonly fromTurnCount: number;
+    readonly projection: ProjectionCheckpointContext;
+    readonly readyCheckpoints: ProjectionCheckpointContext["checkpoints"];
+    readonly turnCheckpoints: ProjectionCheckpointContext["checkpoints"];
+    readonly toScope: ProjectionCheckpointContext["checkpointScopes"][number];
+  }) {
+    if (input.fromTurnCount === 0) {
+      // The root scope is shared by every run in this thread. Its runId
+      // tracks the latest owner, while ordinal zero stays the baseline.
+      const firstScope = input.projection.checkpointScopes.find(
+        (scope) => scope.kind === "root_run",
+      );
+      return firstScope === undefined ? undefined : yield* refForScopeOrdinal(firstScope.id, 0);
+    }
+    const projected =
+      input.readyCheckpoints.find(
+        (checkpoint) =>
+          checkpoint.scopeId === input.toScope.id &&
+          checkpoint.ordinalWithinScope === input.fromTurnCount,
+      ) ??
+      input.turnCheckpoints.find((checkpoint) => checkpoint.appRunOrdinal === input.fromTurnCount);
+    if (projected !== undefined) return projected.ref;
+    // Capture diffs against this ref whenever Git has it, even when no checkpoint row exists.
+    const ref = yield* refForScopeOrdinal(input.toScope.id, input.fromTurnCount);
+    const exists = yield* checkpointStore
+      .hasCheckpointRef({ cwd: input.toScope.cwd, checkpointRef: ref })
+      .pipe(Effect.orElseSucceed(() => false));
+    return exists ? ref : undefined;
+  });
+
   const getTurnDiff: CheckpointDiffQuery["Service"]["getTurnDiff"] = Effect.fn("getTurnDiff")(
     function* (input) {
       const operation = "CheckpointDiffQuery.getTurnDiff";
@@ -137,17 +181,20 @@ export const make = Effect.gen(function* () {
         ),
         Effect.withSpan("checkpoint.turnDiff.lookupContext"),
       );
-      const completedRunIds = new Set(
-        projection.runs.filter((run) => run.status === "completed").map((run) => run.id),
+      // A stopped or restart-cancelled turn still saved a usable checkpoint, and the next
+      // turn's file summary was measured from it. Only a rollback discards checkpoints.
+      const rolledBackRunIds = new Set(
+        projection.runs.filter((run) => run.status === "rolled_back").map((run) => run.id),
       );
       const readyCheckpoints = projection.checkpoints.filter(
         (checkpoint) =>
           checkpoint.status === "ready" &&
-          checkpoint.appRunOrdinal !== null &&
-          checkpoint.runId !== null &&
-          completedRunIds.has(checkpoint.runId),
+          (checkpoint.runId === null || !rolledBackRunIds.has(checkpoint.runId)),
       );
-      const maxTurnCount = readyCheckpoints.reduce(
+      const turnCheckpoints = readyCheckpoints.filter(
+        (checkpoint) => checkpoint.appRunOrdinal !== null && checkpoint.runId !== null,
+      );
+      const maxTurnCount = turnCheckpoints.reduce(
         (max, checkpoint) => Math.max(max, checkpoint.appRunOrdinal ?? 0),
         0,
       );
@@ -160,7 +207,7 @@ export const make = Effect.gen(function* () {
         });
       }
 
-      const toCheckpoint = readyCheckpoints.find(
+      const toCheckpoint = turnCheckpoints.find(
         (checkpoint) => checkpoint.appRunOrdinal === input.toTurnCount,
       );
       if (toCheckpoint === undefined) {
@@ -182,22 +229,13 @@ export const make = Effect.gen(function* () {
         });
       }
 
-      // The root scope is shared by every run in this thread. Its runId
-      // tracks the latest owner, while ordinal zero stays the baseline.
-      const firstScope =
-        input.fromTurnCount === 0
-          ? projection.checkpointScopes.find((scope) => scope.kind === "root_run")
-          : undefined;
-      const fromCheckpointRef =
-        input.fromTurnCount === 0
-          ? firstScope === undefined
-            ? undefined
-            : yield* checkpointRefForScopeOrdinal({
-                scopeId: firstScope.id,
-                ordinalWithinScope: 0,
-              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
-          : readyCheckpoints.find((checkpoint) => checkpoint.appRunOrdinal === input.fromTurnCount)
-              ?.ref;
+      const fromCheckpointRef = yield* resolveFromCheckpointRef({
+        fromTurnCount: input.fromTurnCount,
+        projection,
+        readyCheckpoints,
+        turnCheckpoints,
+        toScope,
+      });
       if (fromCheckpointRef === undefined) {
         return yield* new CheckpointRefUnavailableError({
           operation,

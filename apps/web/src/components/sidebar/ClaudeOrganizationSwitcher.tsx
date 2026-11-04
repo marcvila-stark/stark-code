@@ -19,6 +19,8 @@ interface ClaudeOrganizationSwitcherProps {
   readonly isConnected: boolean;
   readonly onManage: () => void;
   readonly onUsage?: () => void;
+  readonly trigger?: React.ReactElement<React.ComponentProps<"button">> | undefined;
+  readonly popupSide?: "top" | "right" | undefined;
 }
 
 function organizationLabel(account: ClaudeAccount) {
@@ -53,6 +55,8 @@ function ClaudeOrganizationSwitcherContent({
   isConnected,
   onManage,
   onUsage,
+  trigger,
+  popupSide = "top",
 }: ClaudeOrganizationSwitcherProps) {
   const canRead = useAtomValue(claudeAccountsEnvironment.snapshot.permissionAtom(environmentId));
   const canWrite = useAtomValue(claudeAccountsEnvironment.command.permissionAtom(environmentId));
@@ -200,25 +204,33 @@ function ClaudeOrganizationSwitcherContent({
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         render={
-          <button
-            type="button"
-            className="stark-sidebar-account-trigger"
-            aria-label="Switch Claude organization"
-          />
+          trigger ?? (
+            <button
+              type="button"
+              className="stark-sidebar-account-trigger"
+              aria-label="Switch Claude organization"
+            />
+          )
         }
       >
-        <span className="stark-sidebar-account-avatar stark-sidebar-account-avatar-claude">
-          <ClaudeAI />
-        </span>
-        <span className="stark-sidebar-account-identity">
-          <span>{active?.email ?? "Claude organizations"}</span>
-          <span>{active ? organizationLabel(active) : environmentLabel}</span>
-        </span>
-        <ChevronDownIcon className="stark-sidebar-account-chevron" />
+        {trigger ? (
+          trigger.props.children
+        ) : (
+          <>
+            <span className="stark-sidebar-account-avatar stark-sidebar-account-avatar-claude">
+              <ClaudeAI />
+            </span>
+            <span className="stark-sidebar-account-identity">
+              <span>{active?.email ?? "Claude organizations"}</span>
+              <span>{active ? organizationLabel(active) : environmentLabel}</span>
+            </span>
+            <ChevronDownIcon className="stark-sidebar-account-chevron" />
+          </>
+        )}
       </PopoverTrigger>
       <PopoverPopup
-        side="top"
-        align="start"
+        side={popupSide}
+        align={popupSide === "right" ? "end" : "start"}
         width="account"
         variant="account"
         padding="none"

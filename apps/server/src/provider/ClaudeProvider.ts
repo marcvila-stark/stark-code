@@ -1,6 +1,8 @@
 import {
   type ClaudeSettings,
   type ModelCapabilities,
+  type ProviderInstanceId,
+  type ProviderSessionId,
   type ServerProvider,
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
@@ -18,8 +20,13 @@ import { createModelCapabilities } from "@starkfuture/shared/model";
 import { resolveSpawnCommand } from "@starkfuture/shared/shell";
 import { resolveStarkWorkbenchRoot } from "@starkfuture/shared/starkWorkbench";
 import {
+  filterEscalatingDefaultMode,
   query as claudeQuery,
+  resolveSettings,
   type Options as ClaudeQueryOptions,
+  type PermissionMode,
+  type ResolvedSettings,
+  type ResolvedSettingSource,
   type SlashCommand as ClaudeSlashCommand,
   type SDKControlGetUsageResponse,
   type SDKUserMessage,
@@ -38,6 +45,11 @@ import {
 } from "@starkfuture/provider-core/server/snapshotProbe";
 import { resolveClaudeSdkExecutablePath } from "./Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment } from "./Drivers/ClaudeHome.ts";
+import {
+  CLAUDE_BYPASS_OPT_IN_POLICY,
+  CLAUDE_CHILD_BYPASS_POLICY,
+  type ClaudeStarkPolicy,
+} from "../orchestration-v2/Adapters/ApprovalRulePolicy.ts";
 import { discoverClaudeSkills } from "./Drivers/ClaudeSkills.ts";
 import {
   CLAUDE_PLUGIN_PERMISSION_WARNING,
@@ -66,6 +78,8 @@ const CLAUDE_PRESENTATION = {
   displayName: "Claude",
   showInteractionModeToggle: true,
   reportsContextWindow: true,
+  // The adapter omits permissionMode for a chat that inherits the profile's own settings.
+  nativePermissionInherit: true,
 } as const;
 function claudePresentation(settings: ClaudeSettings) {
   return {
@@ -433,6 +447,14 @@ const probeClaudeCapabilities = (
     });
   }).pipe(
     Effect.timeout(CAPABILITIES_PROBE_TIMEOUT_MS),
+    Effect.tapError((error) =>
+      Effect.logWarning("Claude capability initialization did not complete.", {
+        // CLI errors can include credentials or private server URLs. Keep only
+        // the bounded failure category; this is not evidence of an expired login.
+        reason: error._tag === "TimeoutError" ? "timeout" : "initialization_failed",
+        timeoutMs: CAPABILITIES_PROBE_TIMEOUT_MS,
+      }),
+    ),
     Effect.flatMap(({ q, init, workbenchRoot, claudeEnvironment }) =>
       Effect.gen(function* () {
         const slashCommands = parseClaudeInitializationCommands(init.commands);
@@ -783,5 +805,165 @@ export const makePendingClaudeProvider = (
       },
     });
   });
+
+// ── Configured permission settings ──────────────────────────────────
+
+/** Environment variables that move where Claude reads its settings from. */
+const CLAUDE_SETTINGS_LOCATION_ENV = [
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+  "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+] as const;
+
+/**
+ * What the selected Claude profile's settings files say about permissions for a launch in
+ * `cwd`: the configuration the next Claude process starts from. It is never proof of what a
+ * live session does (Claude may have changed mode, the admin's policyHelper is not run, and
+ * session grants are not in files), so it is labelled "configured", never "effective".
+ */
+export type ClaudeConfiguredPermissions = {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly providerSessionId: ProviderSessionId | null;
+  readonly cwd: string;
+  /** Stark's own rules on top of Claude's, each with the label the UI shows. */
+  readonly starkPolicies: ReadonlyArray<ClaudeStarkPolicy>;
+  /** Live session rules: the SDK in use exposes no typed way to read them. */
+  readonly liveRules: { readonly status: "unknown"; readonly reason: string };
+} & (
+  | {
+      readonly status: "configured";
+      readonly label: "configured";
+      /** `permissions.defaultMode` after Claude's trust filter for repo-committed settings. */
+      readonly defaultMode: PermissionMode | null;
+      readonly defaultModeSource: ResolvedSettingSource | null;
+      readonly bypassDisabled: boolean;
+      /** The highest-precedence settings source that set `disableBypassPermissionsMode`. */
+      readonly bypassDisabledSource: ResolvedSettingSource | null;
+      readonly hooksDisabled: boolean;
+      /** The highest-precedence settings source that set `disableAllHooks`. */
+      readonly hooksDisabledSource: ResolvedSettingSource | null;
+      readonly rules: { readonly allow: number; readonly ask: number; readonly deny: number };
+      /** The same rules by the settings source that holds them, low to high precedence. */
+      readonly ruleSources: ReadonlyArray<{
+        readonly source: ResolvedSettingSource;
+        readonly allow: number;
+        readonly ask: number;
+        readonly deny: number;
+      }>;
+      readonly additionalDirectories: ReadonlyArray<string>;
+      /** The highest-precedence settings source that adds folders. */
+      readonly additionalDirectoriesSource: ResolvedSettingSource | null;
+    }
+  | { readonly status: "unknown"; readonly reason: string }
+);
+
+const CLAUDE_LIVE_RULES_UNKNOWN = {
+  status: "unknown",
+  reason: "Not reported by Claude SDK 0.3.276.",
+} as const;
+
+/** The highest-precedence settings source that sets the value `pick` reads. */
+function settingSource(
+  resolved: ResolvedSettings,
+  pick: (settings: ResolvedSettings["sources"][number]["settings"]) => unknown,
+): ResolvedSettingSource | null {
+  for (let index = resolved.sources.length - 1; index >= 0; index--) {
+    const source = resolved.sources[index]!;
+    if (pick(source.settings) !== undefined) return source.source;
+  }
+  return null;
+}
+
+/**
+ * Reads the configured permissions of one Claude provider instance, keyed by instance, cwd
+ * and session. Claude resolves settings in this process, so only an instance that reads its
+ * settings from the same places as the server can be answered; any other is "unknown".
+ */
+export const readClaudeConfiguredPermissions = Effect.fn("readClaudeConfiguredPermissions")(
+  function* (input: {
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly providerSessionId: ProviderSessionId | null;
+    readonly cwd: string;
+    readonly settings: Pick<ClaudeSettings, "homePath" | "allowBypassPermissions">;
+    readonly environment?: NodeJS.ProcessEnv;
+    /** The server's own environment, which Claude's in-process resolver reads. */
+    readonly serverEnvironment?: NodeJS.ProcessEnv;
+    readonly resolve?: typeof resolveSettings;
+  }) {
+    const key = {
+      providerInstanceId: input.providerInstanceId,
+      providerSessionId: input.providerSessionId,
+      cwd: input.cwd,
+      starkPolicies: [
+        input.settings.allowBypassPermissions === true
+          ? CLAUDE_CHILD_BYPASS_POLICY
+          : CLAUDE_BYPASS_OPT_IN_POLICY,
+      ],
+      liveRules: CLAUDE_LIVE_RULES_UNKNOWN,
+    };
+    const instanceEnvironment = yield* makeClaudeEnvironment(input.settings, input.environment);
+    const serverEnvironment = input.serverEnvironment ?? process.env;
+    if (
+      CLAUDE_SETTINGS_LOCATION_ENV.some(
+        (name) => (instanceEnvironment[name] ?? "") !== (serverEnvironment[name] ?? ""),
+      )
+    ) {
+      return {
+        ...key,
+        status: "unknown",
+        reason:
+          "This Claude account keeps its settings in its own folder, which Stark cannot read.",
+      } satisfies ClaudeConfiguredPermissions;
+    }
+    const resolve = input.resolve ?? resolveSettings;
+    return yield* Effect.tryPromise(() => resolve({ cwd: input.cwd })).pipe(
+      Effect.map((resolved): ClaudeConfiguredPermissions => {
+        const filtered = filterEscalatingDefaultMode(resolved);
+        const permissions = filtered.permissions;
+        const defaultMode = permissions?.defaultMode ?? null;
+        return {
+          ...key,
+          status: "configured",
+          label: "configured",
+          defaultMode,
+          defaultModeSource:
+            defaultMode === null
+              ? null
+              : settingSource(resolved, (settings) => settings.permissions?.defaultMode),
+          bypassDisabled: permissions?.disableBypassPermissionsMode === "disable",
+          bypassDisabledSource: settingSource(
+            resolved,
+            (settings) => settings.permissions?.disableBypassPermissionsMode,
+          ),
+          hooksDisabled: filtered.disableAllHooks === true,
+          hooksDisabledSource: settingSource(resolved, (settings) => settings.disableAllHooks),
+          rules: {
+            allow: permissions?.allow?.length ?? 0,
+            ask: permissions?.ask?.length ?? 0,
+            deny: permissions?.deny?.length ?? 0,
+          },
+          ruleSources: resolved.sources.flatMap(({ source, settings }) => {
+            const counts = {
+              allow: settings.permissions?.allow?.length ?? 0,
+              ask: settings.permissions?.ask?.length ?? 0,
+              deny: settings.permissions?.deny?.length ?? 0,
+            };
+            return counts.allow + counts.ask + counts.deny === 0 ? [] : [{ source, ...counts }];
+          }),
+          additionalDirectories: permissions?.additionalDirectories ?? [],
+          additionalDirectoriesSource: settingSource(
+            resolved,
+            (settings) => settings.permissions?.additionalDirectories,
+          ),
+        };
+      }),
+      Effect.orElseSucceed((): ClaudeConfiguredPermissions => ({
+        ...key,
+        status: "unknown",
+        reason: "Claude's settings could not be read.",
+      })),
+    );
+  },
+);
 
 export { probeClaudeCapabilities };

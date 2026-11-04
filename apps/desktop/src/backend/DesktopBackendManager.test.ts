@@ -1,4 +1,9 @@
 import {
+  SERVER_EXIT_CODE_BACKUP_FAILED,
+  SERVER_EXIT_CODE_MAINTENANCE_IN_PROGRESS,
+  SERVER_EXIT_CODE_MIGRATION_FAILED,
+  SERVER_EXIT_CODE_SCHEMA_DIVERGENT,
+  SERVER_EXIT_CODE_SCHEMA_NEWER,
   SERVER_EXIT_CODE_STATE_DIR_OWNED,
   DesktopBackendBootstrap,
   type DesktopBackendBootstrap as DesktopBackendBootstrapValue,
@@ -126,6 +131,7 @@ interface MakeInstanceInput {
   readonly onReady?: Effect.Effect<void>;
   readonly onShutdown?: Effect.Effect<void>;
   readonly onStateDirOwned?: Effect.Effect<void>;
+  readonly onTerminalExit?: (exitCode: number) => Effect.Effect<void>;
   readonly onPreflightFailed?: (
     failure: DesktopBackendManager.PreflightFailure,
   ) => Effect.Effect<boolean>;
@@ -174,6 +180,8 @@ function makeTestInstance(input: MakeInstanceInput) {
       updateRequests: Stream.empty,
       updateCommits: Stream.empty,
       updateCancellations: Stream.empty,
+      sendMaintenanceRequest: () => Effect.void,
+      maintenanceStatuses: Stream.empty,
       ...input.desktopTelemetryPublisher,
     }),
     DesktopBrowserHost.layer,
@@ -189,6 +197,7 @@ function makeTestInstance(input: MakeInstanceInput) {
     ...(input.onReady ? { onReady: () => input.onReady! } : {}),
     ...(input.onShutdown ? { onShutdown: () => input.onShutdown! } : {}),
     ...(input.onStateDirOwned ? { onStateDirOwned: () => input.onStateDirOwned! } : {}),
+    ...(input.onTerminalExit ? { onTerminalExit: input.onTerminalExit } : {}),
     ...(input.onPreflightFailed ? { onPreflightFailed: input.onPreflightFailed } : {}),
   });
 
@@ -1614,6 +1623,197 @@ describe("DesktopBackendManager", () => {
         const finished = yield* Queue.takeN(teardownFinished, 2);
         assert.deepEqual(finished.toSorted(), ["instance1", "instance2"]);
       }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+  it.effect("stops for good on every data-protection exit code and keeps the code", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const codes = [
+          SERVER_EXIT_CODE_SCHEMA_NEWER,
+          SERVER_EXIT_CODE_SCHEMA_DIVERGENT,
+          SERVER_EXIT_CODE_BACKUP_FAILED,
+          SERVER_EXIT_CODE_MIGRATION_FAILED,
+          SERVER_EXIT_CODE_MAINTENANCE_IN_PROGRESS,
+        ];
+        for (const code of codes) {
+          let startCount = 0;
+          const reported = yield* Deferred.make<number>();
+          const instance = yield* makeTestInstance({
+            spawnerLayer: Layer.succeed(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make(() =>
+                Effect.sync(() => {
+                  startCount += 1;
+                  return makeProcess({
+                    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(code)),
+                  });
+                }),
+              ),
+            ),
+            httpClientLayer: layerHttpClient(() => Effect.never),
+            onTerminalExit: (exitCode) => Deferred.succeed(reported, exitCode).pipe(Effect.asVoid),
+          });
+          yield* instance.start;
+          assert.equal(yield* Deferred.await(reported), code);
+          const snapshot = yield* instance.snapshot;
+          assert.isFalse(snapshot.desiredRunning);
+          assert.isFalse(snapshot.restartScheduled);
+          assert.equal(snapshot.terminalExitCode, code);
+          yield* TestClock.adjust(Duration.minutes(1));
+          assert.equal(startCount, 1);
+        }
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect("clears the terminal exit code when the backend is started again", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let startCount = 0;
+        const spawned = yield* Queue.unbounded<number>();
+        const reported = yield* Deferred.make<void>();
+        const instance = yield* makeTestInstance({
+          spawnerLayer: Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() =>
+              Effect.sync(() => {
+                startCount += 1;
+                Queue.offerUnsafe(spawned, startCount);
+                return makeProcess({
+                  exitCode:
+                    startCount === 1
+                      ? Effect.succeed(ChildProcessSpawner.ExitCode(SERVER_EXIT_CODE_SCHEMA_NEWER))
+                      : Effect.never,
+                });
+              }),
+            ),
+          ),
+          httpClientLayer: layerHttpClient(() => Effect.never),
+          onTerminalExit: () => Deferred.succeed(reported, undefined).pipe(Effect.asVoid),
+        });
+        yield* instance.start;
+        yield* Deferred.await(reported);
+        assert.equal((yield* instance.snapshot).terminalExitCode, SERVER_EXIT_CODE_SCHEMA_NEWER);
+
+        yield* instance.start;
+        const restarted = yield* instance.snapshot;
+        assert.isTrue(restarted.desiredRunning);
+        assert.isUndefined(restarted.terminalExitCode);
+        assert.deepEqual(yield* Queue.takeN(spawned, 2), [1, 2]);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect("an awaited stop returns once the backend exits on SIGTERM", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const signals: Array<string | undefined> = [];
+        const exit = yield* Deferred.make<void>();
+        const started = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        let startCount = 0;
+        const instance = yield* makeTestInstance({
+          spawnerLayer: Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() =>
+              Effect.gen(function* () {
+                startCount += 1;
+                yield* Deferred.succeed(started, undefined);
+                return makeProcess({
+                  exitCode: Deferred.await(exit).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+                  kill: (options) =>
+                    Effect.sync(() => {
+                      signals.push(options?.killSignal);
+                    }).pipe(
+                      Effect.andThen(
+                        options?.killSignal === "SIGTERM"
+                          ? Deferred.succeed(exit, undefined)
+                          : Effect.void,
+                      ),
+                      Effect.andThen(Deferred.await(exit)),
+                    ),
+                });
+              }),
+            ),
+          ),
+          onReady: Deferred.succeed(ready, undefined).pipe(Effect.asVoid),
+        });
+        yield* instance.start;
+        yield* Deferred.await(ready);
+
+        const outcome = yield* instance.stopAndAwaitExit!();
+
+        assert.deepEqual(outcome, { exited: true, forced: false });
+        assert.deepEqual(signals, ["SIGTERM"]);
+        const snapshot = yield* instance.snapshot;
+        assert.isFalse(snapshot.desiredRunning);
+        assert.isTrue(Option.isNone(snapshot.activePid));
+        yield* TestClock.adjust(Duration.minutes(1));
+        assert.equal(startCount, 1);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect("an awaited stop sends SIGKILL after 10 seconds and reports it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const signals = yield* Queue.unbounded<string | undefined>();
+        const exit = yield* Deferred.make<void>();
+        const started = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        const instance = yield* makeTestInstance({
+          spawnerLayer: Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() =>
+              Deferred.succeed(started, undefined).pipe(
+                Effect.as(
+                  makeProcess({
+                    exitCode: Deferred.await(exit).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+                    // The backend ignores SIGTERM; only SIGKILL ends it.
+                    kill: (options) =>
+                      Queue.offer(signals, options?.killSignal).pipe(
+                        Effect.andThen(
+                          options?.killSignal === "SIGKILL"
+                            ? Deferred.succeed(exit, undefined)
+                            : Effect.void,
+                        ),
+                        Effect.andThen(Deferred.await(exit)),
+                      ),
+                  }),
+                ),
+              ),
+            ),
+          ),
+          onReady: Deferred.succeed(ready, undefined).pipe(Effect.asVoid),
+        });
+        yield* instance.start;
+        yield* Deferred.await(ready);
+
+        const stopFiber = yield* instance.stopAndAwaitExit!().pipe(Effect.forkChild);
+        assert.equal(yield* Queue.take(signals), "SIGTERM");
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust(Duration.millis(9_999));
+        assert.equal(yield* Queue.size(signals), 0);
+        yield* TestClock.adjust(Duration.millis(1));
+        assert.equal(yield* Queue.take(signals), "SIGKILL");
+
+        assert.deepEqual(yield* Fiber.join(stopFiber), { exited: true, forced: true });
+        assert.isTrue(Option.isNone((yield* instance.snapshot).activePid));
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect("an awaited stop of a backend that is not running reports it gone", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const instance = yield* makeTestInstance({
+          spawnerLayer: Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() => Effect.die("unexpected spawn")),
+          ),
+        });
+        assert.deepEqual(yield* instance.stopAndAwaitExit!(), { exited: true, forced: false });
+      }),
     ),
   );
 });

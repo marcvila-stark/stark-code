@@ -14,6 +14,7 @@ import {
   CheckpointRefUnavailableError,
   CheckpointThreadNotFoundError,
   CheckpointTurnRangeUnavailableError,
+  describeCheckpointDiffFailure,
 } from "./Errors.ts";
 
 const threadId = ThreadId.make("thread:checkpoint-diff-v2");
@@ -37,6 +38,7 @@ function makeProjection(): ProjectionCheckpointContext {
       {
         scopeId: secondScopeId,
         runId: secondRunId,
+        ordinalWithinScope: 2,
         appRunOrdinal: 2,
         status: "ready",
         ref: secondRef,
@@ -49,6 +51,7 @@ function layerFor(input: {
   readonly projection: Effect.Effect<ProjectionCheckpointContext, OrchestratorProjectionError>;
   readonly diffCheckpoints?: CheckpointStore.CheckpointStore["Service"]["diffCheckpoints"];
   readonly authoredPaths?: ReadonlySet<string>;
+  readonly existingRefs?: ReadonlyArray<string>;
 }) {
   return CheckpointDiffQuery.layer.pipe(
     Layer.provide(
@@ -59,6 +62,8 @@ function layerFor(input: {
         Layer.mock(CheckpointStore.CheckpointStore)({
           diffCheckpoints: input.diffCheckpoints ?? (() => Effect.succeed("diff")),
           listAuthoredPaths: () => Effect.succeed(input.authoredPaths ?? null),
+          hasCheckpointRef: ({ checkpointRef }) =>
+            Effect.succeed(input.existingRefs?.includes(checkpointRef) ?? false),
         }),
       ),
     ),
@@ -175,6 +180,7 @@ it.effect("excludes ready checkpoints from rolled-back runs", () => {
           ...projection.checkpoints[0]!,
           scopeId: firstScopeId,
           runId: firstRunId,
+          ordinalWithinScope: 1,
           appRunOrdinal: 1,
           ref: CheckpointRef.make("refs/stark-code/test/first"),
         },
@@ -225,3 +231,43 @@ it.effect("preserves the typed missing-baseline-ref error contract", () => {
     );
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("starts a turn diff from the Git baseline when no checkpoint row was saved", () => {
+  const diffCheckpoints = vi.fn((_input: CheckpointStore.DiffCheckpointsInput) =>
+    Effect.succeed("diff --git a/plan.txt b/plan.txt"),
+  );
+  return Effect.gen(function* () {
+    const baseline = yield* checkpointRefForScopeOrdinal({
+      scopeId: secondScopeId,
+      ordinalWithinScope: 1,
+    });
+    const query = yield* CheckpointDiffQuery.CheckpointDiffQuery.pipe(
+      Effect.provide(
+        layerFor({
+          projection: Effect.succeed(makeProjection()),
+          diffCheckpoints,
+          existingRefs: [baseline],
+        }),
+      ),
+    );
+    const result = yield* query.getTurnDiff({ threadId, fromTurnCount: 1, toTurnCount: 2 });
+
+    assert.equal(result.diff, "diff --git a/plan.txt b/plan.txt");
+    assert.equal(diffCheckpoints.mock.calls[0]?.[0].fromCheckpointRef, baseline);
+  }).pipe(Effect.provide(NodeCrypto.layer));
+});
+
+it.effect("reports a missing starting checkpoint when Git has no baseline either", () =>
+  Effect.gen(function* () {
+    const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
+    const error = yield* query
+      .getTurnDiff({ threadId, fromTurnCount: 1, toTurnCount: 2 })
+      .pipe(Effect.flip);
+
+    assert.instanceOf(error, CheckpointRefUnavailableError);
+    assert.equal(
+      describeCheckpointDiffFailure(error),
+      "The checkpoint before this turn wasn't saved, so its changes can't be shown. Uncommitted shows the folder's current changes.",
+    );
+  }).pipe(Effect.provide(layerFor({ projection: Effect.succeed(makeProjection()) }))),
+);

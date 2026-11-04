@@ -6,6 +6,7 @@ import {
   type ModelSelection,
   NodeId,
   TurnItemId,
+  type OrchestrationV2ChildPolicy,
   type OrchestrationV2Run,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
@@ -49,6 +50,7 @@ import {
   type OrchestratorMcpThreadTimelineItem,
   type OrchestratorMcpThreadWaitInput,
   type OrchestratorMcpThreadWaitResult,
+  type ProviderInstanceId,
   type ProviderInteractionMode,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
@@ -59,6 +61,7 @@ import {
   ThreadId,
 } from "@starkfuture/contracts";
 import { runRanAfter } from "@starkfuture/shared/orchestrationV2ThreadError";
+import { resolveProjectSettings } from "@starkfuture/shared/projectSettings";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -69,9 +72,11 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import * as PermissionContainment from "../orchestration-v2/PermissionContainment.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import {
   subagentResultForRun,
@@ -98,6 +103,7 @@ import {
 } from "./McpInvocationContext.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -522,42 +528,27 @@ function canExposeTaskRunResult(run: OrchestrationV2Run | undefined): run is Orc
   );
 }
 
-function runtimeModeRank(mode: RuntimeMode): number {
-  switch (mode) {
-    case "approval-required":
-      return 0;
-    case "auto-accept-edits":
-      return 1;
-    case "auto":
-      return 2;
-    case "full-access":
-      return 3;
-  }
-}
-
-function interactionModeRank(mode: ProviderInteractionMode): number {
-  return mode === "plan" ? 0 : 1;
-}
-
 /**
- * The mode a new thread runs in: the requested mode, else the parent's, never
- * broader than the parent's. Pass `target` when the thread runs on a known
+ * The mode a thread runs in: the requested mode, else `limit`, never broader
+ * than `limit`. Presets only order within one provider instance, so callers
+ * use this for a limit on that same instance, or for the ceiling an outside
+ * client was approved with. Pass `target` when the thread runs on a known
  * provider. A provider runs a mode it does not offer as Supervised, so an
  * explicit request for one is refused, and an inherited one steps down to the
  * broadest mode the provider offers.
  */
 export function resolveRuntimeMode(
-  parentMode: RuntimeMode,
+  limit: RuntimeMode,
   requested: OrchestratorMcpRuntimeMode | undefined,
   target?: Pick<ResolvedTarget, "modelSelection" | "supportedRuntimeModes">,
 ): Effect.Effect<RuntimeMode, OrchestratorMcpFailure> {
   const inherited = requested === undefined || requested === "inherit";
-  const resolved = inherited ? parentMode : requested;
-  if (runtimeModeRank(resolved) > runtimeModeRank(parentMode)) {
+  const resolved = inherited ? limit : requested;
+  if (!PermissionContainment.presetWithin(resolved, limit)) {
     return Effect.fail(
       failure(
         "runtime_mode_escalation_denied",
-        `Child runtime mode ${resolved} is broader than parent mode ${parentMode}.`,
+        `Child runtime mode ${resolved} is broader than parent mode ${limit}.`,
       ),
     );
   }
@@ -573,43 +564,68 @@ export function resolveRuntimeMode(
       ),
     );
   }
+  const offered = supported.filter((mode) => PermissionContainment.presetWithin(mode, resolved));
   return Effect.succeed(
-    supported
-      .filter((mode) => runtimeModeRank(mode) <= runtimeModeRank(resolved))
-      .toSorted((left, right) => runtimeModeRank(right) - runtimeModeRank(left))[0] ??
-      "approval-required",
+    offered.find((mode) =>
+      offered.every((other) => PermissionContainment.presetWithin(other, mode)),
+    ) ?? "approval-required",
   );
 }
 
-/** Only new child work is downgraded; stopping an existing Bypass run must remain possible. */
-export function resolveChildRuntimeMode(
-  parentMode: RuntimeMode,
-  requested: OrchestratorMcpRuntimeMode | undefined,
-  target?: Pick<ResolvedTarget, "modelSelection" | "supportedRuntimeModes">,
-): Effect.Effect<RuntimeMode, OrchestratorMcpFailure> {
-  if (requested === "full-access") {
-    return Effect.fail(
-      failure(
-        "runtime_mode_escalation_denied",
-        "Child agents cannot use Bypass permissions. Select Manual, Accept edits, Auto or Plan.",
-      ),
-    );
-  }
-  return resolveRuntimeMode(
-    parentMode === "full-access" ? "auto" : parentMode,
-    parentMode === "full-access" && (requested === undefined || requested === "inherit")
-      ? "approval-required"
-      : requested,
-    target,
-  );
+// The contract has no code of its own for a policy Stark cannot establish, so
+// it reports as an escalation and its message gives the reason.
+const childPolicyFailureCode = (reason: PermissionContainment.ChildPolicyRefusal["reason"]) =>
+  reason === "unsupported"
+    ? ("invalid_request" as const)
+    : ("runtime_mode_escalation_denied" as const);
+
+/**
+ * The explicit policy a delegated or created child starts with (see
+ * `PermissionContainment.decideChildPolicy`). Only new child work is limited;
+ * stopping an existing Bypass run must remain possible.
+ */
+export function resolveChildPolicy(
+  input: Parameters<typeof PermissionContainment.decideChildPolicy>[0],
+): Effect.Effect<PermissionContainment.ChildPolicy, OrchestratorMcpFailure> {
+  const result = PermissionContainment.decideChildPolicy(input);
+  return Result.isSuccess(result)
+    ? Effect.succeed(result.success)
+    : Effect.fail(failure(childPolicyFailureCode(result.failure.reason), result.failure.message));
 }
+
+/** The chosen policy as the delegation records it on the worker's task. */
+const recordedChildPolicy = ({
+  label: _label,
+  ...policy
+}: PermissionContainment.ChildPolicy): OrchestrationV2ChildPolicy => policy;
+
+/**
+ * The audit record of the policy Stark chose for a child: who started it, on
+ * which provider instance, at which preset and containment. The delegation
+ * also records the policy on the worker's task.
+ */
+const auditChildPolicy = (input: {
+  readonly operation: "delegate_task" | "create_threads";
+  readonly parentThreadId: ThreadId;
+  readonly policy: PermissionContainment.ChildPolicy;
+  readonly interactionMode: ProviderInteractionMode;
+}) =>
+  Effect.logInfo("permissions.child-policy", {
+    operation: input.operation,
+    parentThreadId: input.parentThreadId,
+    providerInstanceId: input.policy.providerInstanceId,
+    runtimeMode: input.policy.preset,
+    interactionMode: input.interactionMode,
+    containment: input.policy.containment,
+    ...(input.policy.label === undefined ? {} : { label: input.policy.label }),
+  });
 
 export function resolveInteractionMode(
   parentMode: ProviderInteractionMode,
   requested: OrchestratorMcpInteractionMode | undefined,
 ): Effect.Effect<ProviderInteractionMode, OrchestratorMcpFailure> {
   const resolved = requested === undefined || requested === "inherit" ? parentMode : requested;
-  return interactionModeRank(resolved) > interactionModeRank(parentMode)
+  return resolved === "default" && parentMode === "plan"
     ? Effect.fail(
         failure(
           "interaction_mode_escalation_denied",
@@ -965,7 +981,18 @@ const make = Effect.gen(function* () {
           ),
         )
       : Effect.succeed(project.defaultModelSelection);
+  /** The preset new threads in the project start at; never Bypass. */
+  const projectDefaultPreset = (project: Effect.Success<ReturnType<typeof requireProject>>) =>
+    serverSettings.getSettings.pipe(
+      Effect.map(
+        (settings) =>
+          resolveProjectSettings(settings, project.id, project).settings.defaultRuntimeMode,
+      ),
+      Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
+    );
   const secretRequests = yield* SecretRequests.SecretRequests;
+  // The server always provides it; harnesses without one leave the field out.
+  const previewBrowser = yield* Effect.serviceOption(PreviewBrowser.PreviewBrowser);
 
   const requireCapability = (scope: McpInvocationScope) =>
     scope.capabilities.has("orchestration")
@@ -1024,9 +1051,48 @@ const make = Effect.gen(function* () {
       .pipe(Effect.mapError(threadManagementFailure));
 
   /**
+   * What Stark knows about the provider instance a thread runs on: the live
+   * catalog first, else the thread's own provider records.
+   */
+  const providerFactsFor = (
+    providerInstanceId: ProviderInstanceId,
+    providers: ReadonlyArray<ServerProvider>,
+    records: Pick<OrchestrationV2ThreadProjection, "providerThreads">,
+  ): PermissionContainment.ProviderFacts | undefined => {
+    const provider = providers.find((candidate) => candidate.instanceId === providerInstanceId);
+    return provider !== undefined
+      ? { driver: provider.driver, supportedRuntimeModes: provider.supportedRuntimeModes }
+      : PermissionContainment.providerFactsFromRecords({
+          providerInstanceId,
+          providerThreads: records.providerThreads,
+        });
+  };
+
+  /**
+   * A calling thread's limits, from the preset its provider really runs on the
+   * instance its MCP credential belongs to, not the one stored on the thread.
+   */
+  const callerThreadLimits = (
+    scope: McpThreadInvocationScope,
+    parent: Pick<OrchestrationV2ThreadProjection, "thread" | "providerThreads">,
+  ) =>
+    loadProviders.pipe(
+      Effect.map((providers) => {
+        const facts = providerFactsFor(scope.thread.providerInstanceId, providers, parent);
+        return {
+          effective:
+            facts === undefined
+              ? PermissionContainment.grantingPreset(parent.thread, undefined)
+              : PermissionContainment.effectivePreset(parent.thread, facts),
+          limits: PermissionContainment.threadLimits(parent.thread, facts),
+        };
+      }),
+    );
+
+  /**
    * The caller's own thread and the most it may hand to threads it targets. A
-   * thread caller is capped by its own modes; an OAuth client by the ceiling
-   * chosen when it was approved.
+   * thread caller is capped by the preset its provider really runs; an OAuth
+   * client by the ceiling chosen when it was approved.
    */
   const loadCaller = (scope: McpInvocationScope) =>
     Effect.gen(function* () {
@@ -1034,21 +1100,61 @@ const make = Effect.gen(function* () {
       if (scope.thread === undefined) {
         return {
           parent: undefined,
-          limits: {
-            runtimeMode: clientRuntimeModeCeiling(scope.client),
-            interactionMode: "default",
-          } satisfies { runtimeMode: RuntimeMode; interactionMode: ProviderInteractionMode },
+          limits: PermissionContainment.clientLimits(clientRuntimeModeCeiling(scope.client)),
         } as const;
       }
       const parent = yield* loadProjection(scope.thread.threadId);
-      return {
-        parent,
-        limits: {
-          runtimeMode: parent.thread.runtimeMode,
-          interactionMode: parent.thread.interactionMode,
-        },
-      } as const;
+      const { limits } = yield* callerThreadLimits({ ...scope, thread: scope.thread }, parent);
+      return { parent, limits } as const;
     });
+
+  /**
+   * The explicit policy a child of the calling thread starts with. The parent
+   * is the provider instance its MCP credential belongs to, at the preset that
+   * provider really runs.
+   */
+  const childPolicyFor = (
+    scope: McpThreadInvocationScope,
+    parent: Pick<OrchestrationV2ThreadProjection, "thread" | "providerThreads">,
+    target: ResolvedTarget,
+    requested: OrchestratorMcpRuntimeMode | undefined,
+  ) =>
+    callerThreadLimits(scope, parent).pipe(
+      Effect.flatMap(({ effective }) =>
+        resolveChildPolicy({
+          parent: { providerInstanceId: scope.thread.providerInstanceId, effective },
+          target: {
+            providerInstanceId: target.modelSelection.instanceId,
+            supportedRuntimeModes: target.supportedRuntimeModes,
+          },
+          requested,
+        }),
+      ),
+    );
+
+  /** Fails unless `target` runs within `limits`; a thread that inherits counts as the broadest. */
+  const assertWithinLimits = (
+    limits: PermissionContainment.StarkLimits,
+    target: {
+      readonly runtimeMode: RuntimeMode;
+      readonly interactionMode: ProviderInteractionMode;
+    },
+  ) => {
+    const exceeded = PermissionContainment.exceededLimit(limits, target);
+    return exceeded === undefined
+      ? Effect.void
+      : Effect.fail(
+          exceeded === "runtime"
+            ? failure(
+                "runtime_mode_escalation_denied",
+                `Thread runtime mode ${PermissionContainment.targetPreset(target)} is broader than this caller's ${limits.runtimeMode}.`,
+              )
+            : failure(
+                "interaction_mode_escalation_denied",
+                `Thread interaction mode ${target.interactionMode} is broader than this caller's ${limits.interactionMode}.`,
+              ),
+        );
+  };
 
   /** The caller's own thread, for operations that act as the caller. */
   const loadThreadCaller = (scope: McpInvocationScope, operation: string) =>
@@ -1483,6 +1589,7 @@ const make = Effect.gen(function* () {
           : null,
         latestTerminalResultContextTransferId: resultTransferForRun(terminalRun)?.id ?? null,
         waitTimedOut,
+        ...(task.childPolicy === undefined ? {} : { childPolicy: task.childPolicy }),
       } satisfies OrchestratorMcpDelegateTaskResult;
       if (
         acknowledgeTerminal &&
@@ -1568,16 +1675,6 @@ const make = Effect.gen(function* () {
       return bound === null || bound.deletedAt !== null ? modes : [...modes, bound];
     });
 
-  const withinLimits = (
-    limits: {
-      readonly runtimeMode: RuntimeMode;
-      readonly interactionMode: ProviderInteractionMode;
-    },
-    modes: { readonly runtimeMode: RuntimeMode; readonly interactionMode: ProviderInteractionMode },
-  ) =>
-    runtimeModeRank(modes.runtimeMode) <= runtimeModeRank(limits.runtimeMode) &&
-    interactionModeRank(modes.interactionMode) <= interactionModeRank(limits.interactionMode);
-
   /**
    * A task as the caller may see it. Its webhook URL starts runs, so only a
    * caller that may start one sees it: never a client approved for read-only
@@ -1588,10 +1685,7 @@ const make = Effect.gen(function* () {
     scope: McpInvocationScope,
     caller: {
       readonly parent: Pick<OrchestrationV2ThreadProjection, "thread" | "runs"> | undefined;
-      readonly limits: {
-        readonly runtimeMode: RuntimeMode;
-        readonly interactionMode: ProviderInteractionMode;
-      };
+      readonly limits: PermissionContainment.StarkLimits;
     },
     task: ScheduledTask,
   ) =>
@@ -1607,7 +1701,9 @@ const make = Effect.gen(function* () {
         task,
         live &&
           Option.isSome(modes) &&
-          modes.value.every((mode) => withinLimits(caller.limits, mode)),
+          modes.value.every(
+            (mode) => PermissionContainment.exceededLimit(caller.limits, mode) === undefined,
+          ),
       );
     });
 
@@ -1618,10 +1714,7 @@ const make = Effect.gen(function* () {
    */
   const loadScheduledTask = (
     scheduledTaskId: ScheduledTask["id"],
-    limits: {
-      readonly runtimeMode: RuntimeMode;
-      readonly interactionMode: ProviderInteractionMode;
-    },
+    limits: PermissionContainment.StarkLimits,
   ): Effect.Effect<ScheduledTask, OrchestratorMcpFailure> =>
     Effect.gen(function* () {
       const { tasks } = yield* scheduledTasks
@@ -1636,8 +1729,7 @@ const make = Effect.gen(function* () {
         return yield* failure("task_not_found", `Scheduled task ${scheduledTaskId} was not found.`);
       }
       for (const modes of yield* scheduledTaskRunModes(task)) {
-        yield* resolveRuntimeMode(limits.runtimeMode, modes.runtimeMode);
-        yield* resolveInteractionMode(limits.interactionMode, modes.interactionMode);
+        yield* assertWithinLimits(limits, modes);
       }
       return task;
     });
@@ -1669,9 +1761,19 @@ const make = Effect.gen(function* () {
         const derivedTitle = input.prompt.split("\n")[0]?.trim() ?? "";
         const title =
           input.title ?? (derivedTitle.length > 0 ? derivedTitle.slice(0, 80) : "Scheduled task");
+        // A bound task's runs use this thread's own settings, so its limit is
+        // the preset this caller really holds; a run is refused if the thread
+        // later asks for more. A task that launches its own thread starts at
+        // the project default, never above the caller and never Bypass.
         const runtimeMode = bindToCurrentThread
           ? limits.runtimeMode
-          : yield* resolveChildRuntimeMode(limits.runtimeMode, undefined);
+          : yield* projectDefaultPreset(project).pipe(
+              Effect.map((preset) =>
+                PermissionContainment.presetWithin(preset, limits.runtimeMode)
+                  ? preset
+                  : limits.runtimeMode,
+              ),
+            );
         const upsertInput: ScheduledTaskUpsertInput = {
           title,
           prompt: input.prompt,
@@ -1983,6 +2085,9 @@ const make = Effect.gen(function* () {
             scheduledTasks: true,
             maxBatchThreads: 20,
           },
+          ...(Option.isSome(previewBrowser)
+            ? { previewBrowser: yield* previewBrowser.value.status }
+            : {}),
         };
       }),
     delegateTask: (callerScope, input) =>
@@ -2019,15 +2124,18 @@ const make = Effect.gen(function* () {
           providers,
           skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
         });
-        const runtimeMode = yield* resolveChildRuntimeMode(
-          parent.thread.runtimeMode,
-          input.runtimeMode,
-          target,
-        );
+        const policy = yield* childPolicyFor(scope, parent, target, input.runtimeMode);
+        const runtimeMode = policy.preset;
         const interactionMode = yield* resolveInteractionMode(
           parent.thread.interactionMode,
           input.interactionMode,
         );
+        yield* auditChildPolicy({
+          operation: "delegate_task",
+          parentThreadId: scope.thread.threadId,
+          policy,
+          interactionMode,
+        });
         let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
         if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
           const project = yield* requireProject(parent.thread.projectId);
@@ -2063,6 +2171,7 @@ const make = Effect.gen(function* () {
             modelSelection: target.modelSelection,
             runtimeMode,
             interactionMode,
+            childPolicy: recordedChildPolicy(policy),
             ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
             // Async delegations wake the parent on every child terminal; wait
             // delegations deliver through the blocking tool call, so a wake is
@@ -2170,6 +2279,7 @@ const make = Effect.gen(function* () {
         const current = yield* readTask(scope, input.taskId);
         const key = yield* requestKey(input.clientRequestId);
         const parentProjection = yield* loadProjection(scope.thread.threadId);
+        const { limits: parentLimits } = yield* callerThreadLimits(scope, parentProjection);
         // Cancelling stops the child and every task under it, each a write to a
         // thread its user may have raised above the parent's modes since it was
         // delegated. All of them are checked before anything is stopped.
@@ -2180,11 +2290,7 @@ const make = Effect.gen(function* () {
               .pipe(Effect.mapError(threadManagementFailure));
             // A deleted thread takes no stop, but the tasks under it still do.
             if (shell !== null && shell.deletedAt === null) {
-              yield* resolveRuntimeMode(parentProjection.thread.runtimeMode, shell.runtimeMode);
-              yield* resolveInteractionMode(
-                parentProjection.thread.interactionMode,
-                shell.interactionMode,
-              );
+              yield* assertWithinLimits(parentLimits, shell);
             }
             const { subagents } = yield* threadManagement
               .getThreadRecords(threadId, ["subagents"])
@@ -2260,8 +2366,8 @@ const make = Effect.gen(function* () {
         const refused = yield* Ref.make<DispatchModeRefusal | undefined>(undefined);
         const stopWithinLimit = stopChild.pipe(
           Effect.provideService(DispatchModeLimit, {
-            runtimeMode: parentProjection.thread.runtimeMode,
-            interactionMode: parentProjection.thread.interactionMode,
+            runtimeMode: parentLimits.runtimeMode,
+            interactionMode: parentLimits.interactionMode,
             refused,
           }),
           Effect.catch((error) =>
@@ -2339,15 +2445,18 @@ const make = Effect.gen(function* () {
                 target: request.target,
                 providers,
               });
-              const runtimeMode = yield* resolveChildRuntimeMode(
-                parent.thread.runtimeMode,
-                request.runtimeMode,
-                target,
-              );
+              const policy = yield* childPolicyFor(scope, parent, target, request.runtimeMode);
+              const runtimeMode = policy.preset;
               const interactionMode = yield* resolveInteractionMode(
                 parent.thread.interactionMode,
                 request.interactionMode,
               );
+              yield* auditChildPolicy({
+                operation: "create_threads",
+                parentThreadId: scope.thread.threadId,
+                policy,
+                interactionMode,
+              });
               const threadId = stableThreadId({
                 scope,
                 requestKey: key,
@@ -2610,8 +2719,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
         yield* assertLiveCallerForOtherThread(scope, parent, target);
-        yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
-        yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
+        yield* assertWithinLimits(limits, target.thread);
 
         const mode = input.mode ?? "auto";
         const key = yield* requestKey(input.clientRequestId);
@@ -2684,8 +2792,7 @@ const make = Effect.gen(function* () {
         const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
         yield* assertLiveCallerForOtherThread(scope, parent, target);
         // Stopping another thread's work is a write: it must run within the caller's modes.
-        yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
-        yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
+        yield* assertWithinLimits(limits, target.thread);
         const key = yield* requestKey(input.clientRequestId);
         const result = yield* threadManagement
           .interruptThread({

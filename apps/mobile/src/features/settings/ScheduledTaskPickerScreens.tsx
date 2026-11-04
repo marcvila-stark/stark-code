@@ -1,4 +1,6 @@
 import { useNavigation } from "@react-navigation/native";
+import { runtimeModeDisabledReason } from "@starkfuture/client-runtime/approvals/permission-presentation";
+import { AuthSettingsWriteScope } from "@starkfuture/contracts";
 import * as Haptics from "expo-haptics";
 import { useMemo, useState } from "react";
 
@@ -6,11 +8,13 @@ import { AppText as Text } from "../../components/AppText";
 import { buildModelOptions, groupByProvider } from "../../lib/modelOptions";
 import { resolveProviderOptionDescriptors } from "../../lib/providerOptions";
 import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
+import { useEnvironmentScope } from "../../state/session";
 import { useDebouncedValue, usePaginatedBranches } from "../../state/queries";
 import { BranchPickerScreen } from "../threads/NewTaskContextPickerScreens";
 import { ThreadSettingsPickerScreen } from "../threads/ThreadSettingsSheet";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { useScheduledTaskEditor } from "./scheduled-task-editor";
+import { scheduledTaskProjectRuntimeMode } from "./scheduledTaskDraft";
 
 function MissingTaskDraft() {
   return (
@@ -24,8 +28,16 @@ export function ScheduledTaskModelPickerRouteScreen() {
   const navigation = useNavigation();
   const { editor, setEditor } = useScheduledTaskEditor();
   const config = useEnvironmentServerConfig(editor?.environmentId ?? null);
+  const canWriteSettings = useEnvironmentScope(
+    editor?.environmentId ?? null,
+    AuthSettingsWriteScope,
+  );
   const selectedModel = editor?.draft.modelSelection ?? null;
   const projectId = editor?.draft.projectId ?? null;
+  const project =
+    useProjects().find(
+      (entry) => entry.environmentId === editor?.environmentId && entry.id === projectId,
+    ) ?? null;
   const models = useMemo(
     () => buildModelOptions(config, selectedModel, undefined, projectId),
     [config, selectedModel, projectId],
@@ -82,7 +94,9 @@ export function ScheduledTaskModelPickerRouteScreen() {
             : current,
         )
       }
-      runtimeMode={editor.draft.runtimeMode}
+      // A new task runs the project's default until a mode is picked.
+      runtimeMode={editor.draft.runtimeMode ?? scheduledTaskProjectRuntimeMode(config, project)}
+      runtimeModeDisabledReason={(mode) => runtimeModeDisabledReason(mode, canWriteSettings)}
       onUpdateRuntimeMode={(runtimeMode) =>
         setEditor((current) =>
           current

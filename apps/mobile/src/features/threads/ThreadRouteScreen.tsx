@@ -1034,6 +1034,7 @@ function ThreadRouteContent(
           activePendingUserInputDrafts={requests.activePendingUserInputDrafts}
           activePendingUserInputAnswers={requests.activePendingUserInputAnswers}
           respondingUserInputId={requests.respondingUserInputId}
+          runtimeResponseAttempts={requests.runtimeResponseAttempts}
           draftMessage={composer.draftMessage}
           draftAttachments={composer.draftAttachments}
           connectionStateLabel={routeConnectionState}
@@ -1076,6 +1077,11 @@ function ThreadRouteContent(
           onChangeUserInputCustomAnswer={requests.onChangeUserInputCustomAnswer}
           onSubmitUserInput={requests.onSubmitUserInput}
           onDismissUserInput={requests.onDismissUserInput}
+          lostRequests={requests.lostRequests}
+          lostRequestsBusy={requests.lostRequestsBusy}
+          onAskAgainLostRequests={requests.onAskAgainLostRequests}
+          onDismissLostRequests={requests.onDismissLostRequests}
+          onRetryRuntimeResponse={requests.onRetryRuntimeResponse}
         />
       </ThreadPane>
     </>

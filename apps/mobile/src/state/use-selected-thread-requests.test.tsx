@@ -55,27 +55,32 @@ vi.mock("./use-thread-selection", () => ({
     selectedThread: { environmentId: "environment-1", id: "thread-1" },
   }),
 }));
-vi.mock("./use-thread-detail", () => ({
-  useSelectedThreadPendingRequests: () => ({
-    approvals: [],
-    userInputs: [
-      {
-        requestId: "request-1",
-        createdAt: "2026-09-08T00:00:00Z",
-        responseCapability: "live",
-        dismissible: false,
-        questions: ["first", "second"].map((id) => ({
-          id,
-          header: id,
-          question: `Attach ${id} file`,
-          options: [],
-          allowCustomAnswer: true,
-          multiSelect: false,
-        })),
-      },
-    ],
-  }),
-}));
+vi.mock("./use-thread-detail", async () => {
+  const Option = await import("effect/Option");
+  return {
+    useSelectedThreadDetailState: () => ({ status: "live", data: Option.none() }),
+    useSelectedThreadLostRequests: () => [],
+    useSelectedThreadPendingRequests: () => ({
+      approvals: [],
+      userInputs: [
+        {
+          requestId: "request-1",
+          createdAt: "2026-09-08T00:00:00Z",
+          responseCapability: "live",
+          dismissible: false,
+          questions: ["first", "second"].map((id) => ({
+            id,
+            header: id,
+            question: `Attach ${id} file`,
+            options: [],
+            allowCustomAnswer: true,
+            multiSelect: false,
+          })),
+        },
+      ],
+    }),
+  };
+});
 
 import { ApprovalRequestId, EnvironmentId, ThreadId } from "@starkfuture/contracts";
 import { questionAttachmentDraftKey } from "./question-attachments";

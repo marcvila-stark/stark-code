@@ -5,10 +5,32 @@ and publish repositories, create pull requests, and review changes.
 
 ## Review turn changes
 
-A turn's changed files and diff show only the turn's own work. When a turn pulls, merges, or
-rebases, the files Git brought in are left out. A file stays in the list when the turn edited it,
-committed it, or fixed a conflict in it. Use the branch comparison to review everything that changed
-against your base branch. Restore still returns the complete saved workspace.
+A turn's diff compares the folder before and after the turn, so it can include edits that you or
+another program made while the turn ran. A reply's changed files separate the agent's edits from
+the rest: files its edit tools did not report writing are marked "source unknown" when something
+the agent ran, such as a command or an edit that did not finish, could have changed them, and
+"other changes in the folder" when nothing it ran could have. A reply that changed nothing itself
+shows no changed files. When a turn pulls, merges, or rebases, the files Git brought in are left
+out. A file stays in the list when the turn edited it, committed it, or fixed a conflict in it.
+
+**Uncommitted**, **Changes**, and the **Folder changes** count cover the whole folder, including
+edits made outside the chat. Use them to review everything that changed against your base branch.
+Restore still returns the complete saved workspace.
+
+To ask for a correction, select lines in a turn's diff and comment, or use the comment button in
+a file's header to comment on the whole file. Files without changed lines, such as binary files and
+pure renames, cannot take a comment. Each comment is added to the composer and names the turn it
+reviews; nothing is sent until you send the message.
+
+In a Codex or Claude thread, the latest turn's diff also offers **Run** for each project action with
+the test or lint icon. It shows the exact command and the folder it runs in before you click. The
+command runs in the thread's live folder as your own shell command, like a [`!`
+command](composer.md#run-a-shell-command) sent with **Just run**: the same permissions and server
+setting apply, and no agent sandbox limits it. It waits for a running turn, and is skipped if other
+queued work runs first. The exit code, duration and output are recorded in the thread, shown next to
+the diff and in the turn's **Details** as "ran after Turn N in the live folder". That result describes the
+folder when the command ran, not the turn's changes alone. When a check fails, **Ask for a fix**
+adds a request with the end of its output to the composer for you to review and send.
 
 ## Connect an account
 

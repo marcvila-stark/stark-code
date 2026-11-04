@@ -4,6 +4,7 @@ import {
   AuthFilesystemReadScope,
   AuthProvidersManageScope,
   AuthSettingsWriteScope,
+  clientRpcRequiredScopes,
   DEFAULT_SERVER_SETTINGS,
   ProviderInstanceId,
   ProjectId,
@@ -13,6 +14,7 @@ import {
   RuntimeRequestId,
   RESPONSE_VISUALS_MODEL,
   RESPONSE_VISUALS_VERSION,
+  ScheduledTaskId,
   type AuthEnvironmentScope,
   AuthOrchestrationOperateScope,
   ORCHESTRATION_V2_WS_METHODS,
@@ -25,6 +27,7 @@ import {
   AuthTerminalOperateScope,
   WS_METHODS,
   WsRpcGroup,
+  RunId,
 } from "@starkfuture/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -73,7 +76,91 @@ it.effect("refuses persistent approval without settings permission before the ha
   }).pipe(Effect.scoped),
 );
 
+it.effect("refuses persistent answers and widening without settings permission", () =>
+  Effect.gen(function* () {
+    const method = ORCHESTRATION_V2_WS_METHODS.dispatchCommand;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+      ),
+    );
+    const handled: Array<string> = [];
+    const client = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          group.toLayerHandler(method, (command) =>
+            Effect.sync(() => {
+              handled.push(command.commandId);
+              return { sequence: 1 };
+            }),
+          ),
+          RpcAuthorization.layer([AuthOrchestrationOperateScope]),
+        ),
+      ),
+    );
+    const base = { threadId: ThreadId.make("thread") };
+    // A persisted network deny is still a saved rule.
+    expect(
+      yield* client[method]({
+        ...base,
+        type: "runtime-request.respond",
+        commandId: CommandId.make("persistent-option"),
+        requestId: RuntimeRequestId.make("request"),
+        optionId: "persistent:0",
+      }).pipe(Effect.flip),
+    ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
+    expect(
+      yield* client[method]({
+        ...base,
+        type: "thread.permission.set",
+        commandId: CommandId.make("inherit"),
+        permissionSource: "inherit",
+        runtimeMode: "approval-required",
+      }).pipe(Effect.flip),
+    ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
+    expect(
+      yield* client[method]({
+        ...base,
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("widen"),
+        runtimeMode: "auto",
+      }).pipe(Effect.flip),
+    ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
+    // Answering once and choosing the narrowest preset need only operate access.
+    yield* client[method]({
+      ...base,
+      type: "runtime-request.respond",
+      commandId: CommandId.make("session-option"),
+      requestId: RuntimeRequestId.make("request"),
+      optionId: "session:0",
+    });
+    yield* client[method]({
+      ...base,
+      type: "thread.permission.set",
+      commandId: CommandId.make("narrowest"),
+      permissionSource: "override",
+      runtimeMode: "approval-required",
+    });
+    expect(handled).toEqual(["session-option", "narrowest"]);
+  }).pipe(Effect.scoped),
+);
+
 describe("RPC authorization scopes", () => {
+  it("needs settings permission to save a scheduled task above the narrowest mode", () => {
+    expect(
+      clientRpcRequiredScopes(WS_METHODS.scheduledTasksUpsert, { runtimeMode: "auto" }),
+    ).toEqual([AuthOrchestrationOperateScope, AuthSettingsWriteScope]);
+    expect(
+      clientRpcRequiredScopes(WS_METHODS.scheduledTasksUpsert, {
+        runtimeMode: "approval-required",
+      }),
+    ).toEqual([AuthOrchestrationOperateScope]);
+    // Omitted, the server picks the project's default, which is never Bypass.
+    expect(clientRpcRequiredScopes(WS_METHODS.scheduledTasksUpsert, {})).toEqual([
+      AuthOrchestrationOperateScope,
+    ]);
+  });
+
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
   });
@@ -121,6 +208,12 @@ describe("RPC authorization scopes", () => {
       AuthOrchestrationOperateScope,
     );
   });
+  it("reads a chat's effective permissions with read access", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.providerReadEffectivePermissions)).toBe(
+      AuthOrchestrationReadScope,
+    );
+  });
+
   it("requires read scope for idle-neutral session catalog and context inspection", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.providerReadSessionCatalog)).toBe(
       AuthOrchestrationReadScope,
@@ -159,6 +252,19 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.agentSessionsImport)).toBe(
       AuthOrchestrationOperateScope,
     );
+    // The client refuses the import up front on a read-only connection.
+    expect(clientRpcRequiredScopes(WS_METHODS.agentSessionsImport, undefined)).toEqual([
+      AuthOrchestrationOperateScope,
+    ]);
+  });
+
+  it("lets a read-only connection search thread history", () => {
+    expect(requiredScopeForRpcMethod(ORCHESTRATION_V2_WS_METHODS.searchThreadHistory)).toBe(
+      AuthOrchestrationReadScope,
+    );
+    expect(
+      clientRpcRequiredScopes(ORCHESTRATION_V2_WS_METHODS.searchThreadHistory, undefined),
+    ).toEqual([AuthOrchestrationReadScope]);
   });
 
   it("separates ACP Registry discovery from provisioning", () => {
@@ -577,6 +683,36 @@ describe("human shell command authorization", () => {
       }
     }).pipe(Effect.scoped),
   );
+  it.effect.each([
+    { scopes: [AuthOrchestrationOperateScope], missing: AuthTerminalOperateScope },
+    { scopes: [AuthTerminalOperateScope], missing: AuthOrchestrationOperateScope },
+  ] satisfies ReadonlyArray<{
+    scopes: AuthEnvironmentScope[];
+    missing: AuthEnvironmentScope;
+  }>)("keeps a project check behind both scopes (missing=$missing)", ({ scopes, missing }) =>
+    Effect.gen(function* () {
+      const handled: string[] = [];
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayerHandler(method, (input) =>
+              Effect.sync(() => {
+                handled.push(input.type);
+                return { sequence: 1 };
+              }),
+            ),
+            RpcAuthorization.layer(scopes),
+          ),
+        ),
+      );
+      const check = { subjectRunId: RunId.make("run-5"), scriptId: "test", scriptName: "Test" };
+      expect(yield* client[method]({ ...command, check }).pipe(Effect.flip)).toMatchObject({
+        _tag: "EnvironmentAuthorizationError",
+        requiredPermission: missing,
+      });
+      expect(handled).toEqual([]);
+    }).pipe(Effect.scoped),
+  );
   it.effect("keeps normal text delivery under orchestration scope alone", () =>
     Effect.gen(function* () {
       const client = yield* RpcTest.makeClient(group).pipe(
@@ -686,6 +822,44 @@ it.effect.each([WS_METHODS.claudeAccountsSnapshot, WS_METHODS.claudeAccountsComm
       });
       expect(handled).toBe(false);
     }).pipe(Effect.scoped),
+);
+
+it.effect("lists scheduled task runs for read-only clients and refuses clients without read", () =>
+  Effect.gen(function* () {
+    const method = WS_METHODS.scheduledTasksListRuns;
+    const input = { id: ScheduledTaskId.make("scheduled-task:runs") };
+    expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    // Clients check the same scope before calling, so a session without it never asks.
+    expect(clientRpcRequiredScopes(method, input)).toEqual([AuthOrchestrationReadScope]);
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+      ),
+    );
+    let handled = 0;
+    const clientWith = (scopes: AuthEnvironmentScope[]) =>
+      RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayerHandler(method, () =>
+              Effect.sync(() => {
+                handled++;
+                return { runs: [] };
+              }),
+            ),
+            RpcAuthorization.layer(scopes),
+          ),
+        ),
+      );
+    const reader = yield* clientWith([AuthOrchestrationReadScope]);
+    expect(yield* reader[method](input)).toEqual({ runs: [] });
+    const terminalOnly = yield* clientWith([AuthTerminalReadScope]);
+    expect(yield* terminalOnly[method](input).pipe(Effect.flip)).toMatchObject({
+      _tag: "EnvironmentAuthorizationError",
+      requiredPermission: AuthOrchestrationReadScope,
+    });
+    expect(handled).toBe(1);
+  }).pipe(Effect.scoped),
 );
 
 describe("local history sync authorization", () => {

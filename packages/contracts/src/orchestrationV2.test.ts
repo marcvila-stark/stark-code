@@ -43,6 +43,9 @@ import {
   OrchestrationV2ThreadShell,
   OrchestrationV2TurnItem,
   OrchestrationV2TurnItemJson,
+  OrchestrationV2RuntimeRequestJson,
+  isKnownOrchestrationV2EventType,
+  LOST_RUNTIME_REQUEST_BATCH_LIMIT,
 } from "./orchestrationV2.ts";
 
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
@@ -137,6 +140,39 @@ const decodeOrchestrationV2SubscribeThreadInput = Schema.decodeUnknownSync(
 );
 
 describe("orchestration V2 contracts", () => {
+  it("preserves proposed approval changes in runtime and JSON schemas", () => {
+    const proposedChanges = [
+      { operation: "rename", path: "/new.ts", oldPath: "/old.ts", patch: "-old\n+new" },
+      { operation: "add", path: "/empty", patch: "", approximate: true },
+    ];
+    const base = {
+      id: "approval-item",
+      type: "approval_request",
+      threadId: "thread-1",
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "waiting",
+      title: null,
+      startedAt: null,
+      completedAt: null,
+      requestId: "request-1",
+      requestKind: "file-change",
+      proposedChanges,
+      proposedChangesOmitted: 2,
+    };
+    expect(decodeOrchestrationV2TurnItem({ ...base, updatedAt: now })).toMatchObject({
+      proposedChanges,
+      proposedChangesOmitted: 2,
+    });
+    const json = decodeOrchestrationV2TurnItemJson({ ...base, updatedAt: DateTime.formatIso(now) });
+    expect(encodeOrchestrationV2TurnItemJson(json)).toMatchObject({ proposedChanges });
+  });
+
   it("carries command failure metadata through runtime and JSON schemas without output text", () => {
     const base = {
       id: "command-item",
@@ -1606,5 +1642,152 @@ describe("human shell command dispatch", () => {
     });
     expect(decoded).not.toHaveProperty("userShell");
     expect(decoded).toMatchObject({ text: "!pwd" });
+  });
+  it("keeps an optional check naming the turn it runs after", () => {
+    const check = { subjectRunId: "run-5", scriptId: "test", scriptName: "Test" };
+    expect(decode({ ...input, check })).toMatchObject({ check });
+    expect(decode({ ...input, check: { subjectRunId: "run-5" } })).toMatchObject({
+      check: { subjectRunId: "run-5" },
+    });
+    expect(decode(input)).not.toHaveProperty("check");
+    expect(() => decode({ ...input, check: { scriptName: "Test" } })).toThrow();
+    expect(() =>
+      decode({ ...input, check: { subjectRunId: "run-5", scriptName: "x".repeat(201) } }),
+    ).toThrow();
+  });
+});
+
+describe("lost runtime requests", () => {
+  const storedRequest = {
+    id: "request-lost",
+    nodeId: "node-lost",
+    providerTurnId: null,
+    nativeRequestRef: null,
+    kind: "command",
+    status: "expired",
+    responseCapability: { type: "not_resumable", reason: "The server restarted." },
+    createdAt: "2026-04-20T00:00:00.000Z",
+    resolvedAt: "2026-04-20T00:01:00.000Z",
+  };
+  const decodeStored = Schema.decodeUnknownSync(OrchestrationV2RuntimeRequestJson);
+  const encodeStored = Schema.encodeSync(OrchestrationV2RuntimeRequestJson);
+
+  it("decodes requests stored before losses were recorded", () => {
+    expect(decodeStored(storedRequest)).not.toHaveProperty("lost");
+  });
+
+  it("round-trips a loss through the stored request", () => {
+    const stored = {
+      ...storedRequest,
+      lost: {
+        cause: "server_restart",
+        lostAt: "2026-04-20T00:01:00.000Z",
+        deliveryUncertain: true,
+        askedAgainAt: "2026-04-20T00:02:00.000Z",
+      },
+    };
+    expect(encodeStored(decodeStored(stored))).toEqual(stored);
+  });
+
+  it("decodes Ask again and Dismiss with one or more named requests", () => {
+    const decode = Schema.decodeUnknownSync(OrchestrationV2Command);
+    for (const type of ["runtime-request.ask-again", "runtime-request.lost.dismiss"]) {
+      expect(
+        decode({ type, commandId: "command", threadId: "thread", requestIds: ["a", "b"] }),
+      ).toMatchObject({ type, requestIds: ["a", "b"] });
+      expect(() =>
+        decode({ type, commandId: "command", threadId: "thread", requestIds: [] }),
+      ).toThrow();
+      expect(() =>
+        decode({
+          type,
+          commandId: "command",
+          threadId: "thread",
+          requestIds: Array.from(
+            { length: LOST_RUNTIME_REQUEST_BATCH_LIMIT + 1 },
+            (_, index) => `request-${index}`,
+          ),
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("streams asked-again and dismissed events to clients that know them", () => {
+    const decodeWireItems = Schema.decodeUnknownSync(
+      Schema.toCodecJson(Schema.Array(OrchestrationV2RpcSchemas.subscribeThread.output)),
+    );
+    const items = decodeWireItems(
+      ["runtime-request.asked-again", "runtime-request.lost-dismissed"].map((type, index) => ({
+        kind: "event",
+        sequence: index + 1,
+        event: {
+          id: `event-${index}`,
+          type,
+          threadId: "thread-1",
+          nodeId: "node-lost",
+          occurredAt: "2026-04-20T00:02:00.000Z",
+          payload: {
+            ...storedRequest,
+            lost: {
+              cause: "provider_exit",
+              lostAt: "2026-04-20T00:01:00.000Z",
+              dismissedAt: "2026-04-20T00:02:00.000Z",
+            },
+          },
+        },
+      })),
+    );
+    expect(items.map((item) => item.kind)).toEqual(["event", "event"]);
+    expect(isKnownOrchestrationV2EventType("runtime-request.asked-again")).toBe(true);
+    expect(isKnownOrchestrationV2EventType("runtime-request.lost-dismissed")).toBe(true);
+  });
+
+  it("decodes shells from servers that predate lost requests", () => {
+    const decodeWireShell = Schema.decodeUnknownSync(
+      Schema.toCodecJson(OrchestrationV2ThreadShell),
+    );
+    const shell = {
+      createdBy: "user",
+      creationSource: "web",
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Thread",
+      providerInstanceId: "codex",
+      modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "thread-1" },
+      forkedFrom: null,
+      activeProviderThreadId: null,
+      latestRunId: null,
+      activeRunId: null,
+      status: "cancelled",
+      pendingRuntimeRequest: null,
+      latestVisibleMessage: null,
+      latestUserMessageAt: null,
+      hasActionableProposedPlan: false,
+      itemCount: 0,
+      visibleItemCount: 0,
+      createdAt: "2026-04-20T00:00:00.000Z",
+      updatedAt: "2026-04-20T00:00:00.000Z",
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      deletedAt: null,
+    };
+    expect(decodeWireShell(shell)).not.toHaveProperty("lostRuntimeRequest");
+    expect(
+      decodeWireShell({
+        ...shell,
+        lostRuntimeRequest: {
+          id: "request-lost",
+          kind: "user_input",
+          cause: "server_shutdown",
+          lostAt: "2026-04-20T00:01:00.000Z",
+        },
+      }).lostRuntimeRequest?.cause,
+    ).toBe("server_shutdown");
   });
 });

@@ -1,6 +1,13 @@
 import { assert, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
-import { ContextHandoffId, OrchestrationV2Command, ThreadId } from "@starkfuture/contracts";
+import {
+  ContextHandoffId,
+  OrchestrationV2Command,
+  ProviderDriverKind,
+  ThreadId,
+} from "@starkfuture/contracts";
+
+import { continuesImportedAgentSession } from "./AgentSessionContinuation.ts";
 
 import {
   appendContextHandoffId,
@@ -35,6 +42,56 @@ it("reissues imported context until a V2 run completes", () => {
       historyOrigin: "v1_import",
       hasCompletedRun: false,
       legacyImportItemCount: 0,
+    }),
+  );
+});
+
+it("does not resend an imported CLI session's transcript to that session", () => {
+  assert.isFalse(
+    shouldPrepareLegacyImportHandoff({
+      historyOrigin: "v1_import",
+      hasCompletedRun: false,
+      legacyImportItemCount: 2,
+      continuesImportedAgentSession: true,
+    }),
+  );
+  assert.isTrue(
+    shouldPrepareLegacyImportHandoff({
+      historyOrigin: "v1_import",
+      hasCompletedRun: false,
+      legacyImportItemCount: 2,
+      continuesImportedAgentSession: false,
+    }),
+  );
+});
+
+it("recognizes the native session an imported thread came from", () => {
+  const threadId = ThreadId.make("import:claudeAgent:6f1c2f0e-3b7a-4c55-9d7e-1a2b3c4d5e6f");
+  const nativeThreadRef = (nativeId: string, strength: "strong" | "weak" = "strong") => ({
+    nativeThreadRef: { driver: ProviderDriverKind.make("claudeAgent"), nativeId, strength },
+  });
+
+  assert.isTrue(
+    continuesImportedAgentSession({
+      threadId,
+      providerThread: nativeThreadRef("6f1c2f0e-3b7a-4c55-9d7e-1a2b3c4d5e6f"),
+    }),
+  );
+  // A fresh session that replaced it after a failed resume holds none of it.
+  assert.isFalse(
+    continuesImportedAgentSession({ threadId, providerThread: nativeThreadRef("fresh-session") }),
+  );
+  assert.isFalse(
+    continuesImportedAgentSession({
+      threadId,
+      providerThread: nativeThreadRef("6f1c2f0e-3b7a-4c55-9d7e-1a2b3c4d5e6f", "weak"),
+    }),
+  );
+  assert.isFalse(continuesImportedAgentSession({ threadId, providerThread: undefined }));
+  assert.isFalse(
+    continuesImportedAgentSession({
+      threadId: ThreadId.make("thread-native"),
+      providerThread: nativeThreadRef("thread-native"),
     }),
   );
 });

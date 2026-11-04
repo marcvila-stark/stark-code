@@ -70,11 +70,15 @@ const grokInstanceId = ProviderInstanceId.make("grok");
 const supportedRuntimeModesByInstance = new Map<ProviderInstanceId, ReadonlyArray<RuntimeMode>>([
   [grokInstanceId, ["approval-required", "auto", "full-access"]],
 ]);
+// Only this instance leaves permissions to the provider's own settings.
+const inheritingInstanceId = ProviderInstanceId.make("claude_inherit");
 const providerInstanceFor = (instanceId: ProviderInstanceId) =>
   ({
+    driverKind: instanceId === inheritingInstanceId ? "claudeAgent" : instanceId,
     snapshot: {
       getSnapshot: Effect.succeed({
         supportedRuntimeModes: supportedRuntimeModesByInstance.get(instanceId),
+        ...(instanceId === inheritingInstanceId ? { nativePermissionInherit: true } : {}),
       } as ServerProvider),
     },
   }) as ProviderInstance;
@@ -214,6 +218,37 @@ it.layer(layerTest)("RuntimePolicyV2", (it) => {
       assert.equal(yield* modeFor(grokInstanceId, "full-access"), "full-access");
       // A provider that advertises no restriction runs every mode as stored.
       assert.equal(yield* modeFor(providerInstanceId, "auto-accept-edits"), "auto-accept-edits");
+    }),
+  );
+
+  it.effect("inherits the provider's settings only where the driver supports it", () =>
+    Effect.gen(function* () {
+      const policy = yield* RuntimePolicy.RuntimePolicyV2;
+      const now = yield* DateTime.now;
+      const inheritingThread = {
+        ...makeThread({ now, worktreePath: null, runtimeMode: "approval-required" }),
+        permissionSource: "inherit" as const,
+      };
+      const supported = yield* policy.resolve({
+        thread: inheritingThread,
+        modelSelection: { instanceId: inheritingInstanceId, model: "claude-sonnet-4-6" },
+      });
+      assert.equal(supported.permissionSource, "inherit");
+      // Elsewhere the chat runs its stored preset exactly as before.
+      const unsupported = yield* policy.resolve({ thread: inheritingThread, modelSelection });
+      assert.isUndefined(unsupported.permissionSource);
+      assert.equal(unsupported.runtimeMode, "approval-required");
+      // A legacy chat without a source never inherits.
+      const legacy = yield* policy.resolve({
+        thread: makeThread({ now, worktreePath: null, runtimeMode: "auto" }),
+        modelSelection: { instanceId: inheritingInstanceId, model: "claude-sonnet-4-6" },
+      });
+      assert.isUndefined(legacy.permissionSource);
+      assert.deepStrictEqual(yield* policy.permissionCapabilities(inheritingInstanceId), {
+        driver: "claudeAgent",
+        supportedRuntimeModes: undefined,
+        nativePermissionInherit: true,
+      });
     }),
   );
 });

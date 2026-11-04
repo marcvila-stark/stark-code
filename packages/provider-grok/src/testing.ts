@@ -16,6 +16,7 @@ export {
 export {
   GROK_ACP_CANCEL_META,
   GROK_ACP_INITIALIZE_META,
+  grokAcpSpawnArgs,
   makeGrokAcpRuntime,
 } from "./server/acpSupport.ts";
 export {

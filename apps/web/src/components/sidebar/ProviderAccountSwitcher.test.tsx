@@ -68,6 +68,7 @@ async function render(
     connected?: boolean;
     blocked?: string | null;
     claude?: boolean;
+    rail?: boolean;
   } = {},
 ) {
   const shownEntries = options.claude
@@ -118,6 +119,10 @@ async function render(
           environmentLabel="Remote Mac"
           connected={options.connected ?? true}
           onManage={manage}
+          trigger={
+            options.rail ? <button aria-label="Agents and accounts">Account</button> : undefined
+          }
+          popupSide={options.rail ? "right" : "top"}
         />
       </SidebarProvider>,
     ),
@@ -267,4 +272,13 @@ it("keeps same-login Claude organizations separate and blocks switching in an ac
   await render({ claude: true });
   await act(() => other.click());
   expect(select).toHaveBeenCalledExactlyOnceWith(ProviderInstanceId.make("claude-two"), "gpt-test");
+});
+
+it("opens the provider accounts directly from a rail trigger", async () => {
+  await render({ rail: true });
+  await click("Agents and accounts");
+  expect(document.body.textContent).toContain("Codex accounts");
+  expect(document.body.textContent).toContain("work@example.com");
+  expect(document.body.textContent).toContain("second@example.com");
+  expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
 });

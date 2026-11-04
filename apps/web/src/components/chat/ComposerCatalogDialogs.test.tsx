@@ -26,6 +26,7 @@ const skills: ServerProviderSkill[] = [
     path: "/plugins/release/SKILL.md",
     enabled: true,
     pluginName: "release-tools",
+    permissionWarning: PROVIDER_PERMISSION_WARNING,
     description: "Review the release before publishing.",
   },
   { name: "private", path: "/skills/private/SKILL.md", enabled: true, userInvocable: false },

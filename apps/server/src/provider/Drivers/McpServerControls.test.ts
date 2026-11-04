@@ -133,6 +133,26 @@ describe("provider MCP controls", () => {
     );
     assert.isTrue(codexMcpStatusEntry(base).tools[0]?.readOnly);
   });
+  it.each([
+    ["connected", "unsupported", "failed"],
+    ["disabled", "unsupported", "disabled"],
+    ["connected", "notLoggedIn", "needs-auth"],
+  ] as const)(
+    "does not hide a failed discovery behind transport %s/auth %s",
+    (runtimeStatus, authStatus, expected) => {
+      const result = codexMcpStatusEntry({
+        name: "docs",
+        runtimeStatus,
+        authStatus,
+        tools: {},
+        toolsError: "Transport closed while listing tools",
+        resources: [],
+        resourceTemplates: [],
+      });
+      assert.equal(result.status, expected);
+      assert.equal(result.error, "Transport closed while listing tools");
+    },
+  );
   it.effect("refuses direct attempts to control the app's server", () =>
     Effect.gen(function* () {
       assert.isTrue(

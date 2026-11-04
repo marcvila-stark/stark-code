@@ -377,7 +377,12 @@ export function StarkPagesSidebar(props: {
           ) : null}
         </div>
       ) : null}
-      {onOpenPage && !libraryEnabled && !initialSlug && selectedPage?.key === panelKey && origin ? (
+      {props.showHeader !== false &&
+      onOpenPage &&
+      !libraryEnabled &&
+      !initialSlug &&
+      selectedPage?.key === panelKey &&
+      origin ? (
         <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
           <span className="min-w-0 flex-1 truncate text-sm">{selectedPage.page.title}</span>
           <Button

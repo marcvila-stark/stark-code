@@ -118,6 +118,38 @@ describe("runMigrations", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
+  it.effect("reads threads projected before permission sources as override", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 63 });
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_threads (
+          thread_id, project_id, title, default_provider, provider_instance_id,
+          runtime_mode, interaction_mode, active_provider_thread_id,
+          created_at, updated_at, archived_at, deleted_at, payload_json
+        )
+        VALUES (
+          'thread:legacy', 'project:legacy', 'Legacy', 'claudeAgent', 'claudeAgent',
+          'full-access', 'default', NULL,
+          '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', NULL, NULL, '{}'
+        )
+      `;
+      assert.deepStrictEqual(yield* runMigrations(), [[64, "PermissionSource"]]);
+      const rows = yield* sql<{
+        readonly permission_source: string;
+        readonly runtime_mode: string;
+      }>`
+        SELECT permission_source, runtime_mode FROM orchestration_v2_projection_threads
+      `;
+      // The column only names the source; the freeze narrows modes through events.
+      assert.deepStrictEqual(rows, [
+        { permission_source: "override", runtime_mode: "full-access" },
+      ]);
+      const audit = yield* sql`SELECT * FROM permission_migration_audit`;
+      assert.deepStrictEqual(audit, []);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
   it.effect("still starts after a newer build recorded a later V2 migration", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

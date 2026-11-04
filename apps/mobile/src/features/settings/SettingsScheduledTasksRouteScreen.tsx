@@ -1,9 +1,13 @@
 import { useAtomValue } from "@effect/atom-react";
+import { commandFailureMessage } from "@starkfuture/client-runtime/errors";
 import {
   AuthOrchestrationOperateScope,
+  AuthSettingsWriteScope,
   resolveProjectProviderInstanceEnabled,
 } from "@starkfuture/contracts";
-import { readEnvironmentScope } from "../../state/session";
+import { runtimeModeDisabledReason } from "@starkfuture/client-runtime/approvals/permission-presentation";
+import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
+import { RUNTIME_MODE_CHOICES } from "../threads/thread-settings-options";
 import type {
   EnvironmentId,
   ProjectId,
@@ -25,6 +29,12 @@ import {
   DEFAULT_WEBHOOK_PROMPT,
   parseMaxDeliveryAge,
 } from "@starkfuture/client-runtime/scheduled-task-webhook";
+import {
+  createRunNowClickIds,
+  runScheduledTaskNowOnce,
+  scheduledTaskRunTone,
+  supportsScheduledTaskRuns,
+} from "@starkfuture/client-runtime/scheduled-task-runs";
 import {
   useCallback,
   useEffect,
@@ -80,10 +90,15 @@ import { settingsTargetsForProject } from "./settings-environment-filter.logic";
 import { useScheduledTaskEditor } from "./scheduled-task-editor";
 import { scheduledTaskEditorSessionAtom } from "./scheduled-task-editor-state";
 import { appAtomRegistry } from "../../state/atom-registry";
+import { uuidv4 } from "../../lib/uuid";
 import {
   formatNextScheduledTaskRun,
   formatScheduledTaskInterval,
+  formatScheduledTaskLastRun,
 } from "./scheduledTaskPresentation";
+
+/** Run now command ids: a repeated tap before the server answers asks for the same run. */
+const runNowClickIds = createRunNowClickIds(uuidv4);
 
 type ScheduledTaskRoutes = {
   SettingsScheduledTaskNew: undefined;
@@ -592,6 +607,11 @@ function TaskForm({
   const canOperate = useAtomValue(
     serverEnvironment.upsertScheduledTask.permissionAtom(environmentId),
   );
+  const canWriteSettings = useEnvironmentScope(environmentId, AuthSettingsWriteScope);
+  // A task saved above the narrowest mode can be saved again only with the settings grant.
+  const modeBlocksSave =
+    draft.runtimeMode !== null &&
+    runtimeModeDisabledReason(draft.runtimeMode, canWriteSettings) !== undefined;
   const upsert = useAtomCommand(serverEnvironment.upsertScheduledTask, {
     label: "scheduled task upsert",
     reportFailure: false,
@@ -608,7 +628,7 @@ function TaskForm({
 
   const failure = (title: string, result: AtomCommandResult<unknown, unknown>) => {
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-      Alert.alert(title, String(squashAtomCommandFailure(result)));
+      Alert.alert(title, commandFailureMessage(squashAtomCommandFailure(result)));
     }
   };
 
@@ -619,7 +639,8 @@ function TaskForm({
       saving ||
       dictationPending ||
       taskMissing ||
-      environmentUnavailable
+      environmentUnavailable ||
+      modeBlocksSave
     )
       return;
     // Signatures are edited on desktop and web; send the task's current one,
@@ -677,7 +698,7 @@ function TaskForm({
                 baseRef: draft.baseRef.trim() || "main",
                 startFromOrigin: draft.startFromOrigin,
               },
-      runtimeMode: draft.runtimeMode,
+      ...(draft.runtimeMode === null ? {} : { runtimeMode: draft.runtimeMode }),
       interactionMode: draft.task?.interactionMode ?? "default",
       creationSource: draft.task?.creationSource ?? "mobile",
     };
@@ -799,6 +820,14 @@ function TaskForm({
           disabled={saving || dictationPending || environmentUnavailable}
         />
       </SettingsSection>
+      {modeBlocksSave ? (
+        <Text className="px-2 text-sm text-danger-foreground">
+          Saving at{" "}
+          {RUNTIME_MODE_CHOICES.find((choice) => choice.mode === draft.runtimeMode)?.label ??
+            draft.runtimeMode}{" "}
+          needs settings permission. Choose Supervised in Model › Runtime.
+        </Text>
+      ) : null}
 
       <SettingsSection title="Workspace">
         <SelectRow
@@ -1015,10 +1044,16 @@ function TaskForm({
       <Pressable
         accessibilityRole="button"
         accessibilityState={{
-          disabled: saving || dictationPending || taskMissing || environmentUnavailable,
+          disabled:
+            saving || dictationPending || taskMissing || environmentUnavailable || modeBlocksSave,
         }}
         disabled={
-          !canOperate || saving || dictationPending || taskMissing || environmentUnavailable
+          !canOperate ||
+          saving ||
+          dictationPending ||
+          taskMissing ||
+          environmentUnavailable ||
+          modeBlocksSave
         }
         onPress={() => void save()}
         className="min-h-12 items-center justify-center rounded-[14px] bg-primary px-4 disabled:opacity-50"
@@ -1100,7 +1135,7 @@ function WebhookScheduleDetails({
                       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
                         Alert.alert(
                           "Could not rotate URL",
-                          String(squashAtomCommandFailure(result)),
+                          commandFailureMessage(squashAtomCommandFailure(result)),
                         );
                       }
                     });
@@ -1137,6 +1172,9 @@ function EnvironmentTasks({
   readonly onEdit: (task: ScheduledTask) => void;
 }) {
   const environmentId = environment.environmentId;
+  const keepsRunHistory = supportsScheduledTaskRuns(
+    environment.serverConfig.environment.capabilities,
+  );
   const tasks = useEnvironmentQuery(
     serverEnvironment.scheduledTasksLive({ environmentId, input: {} }),
   );
@@ -1160,7 +1198,7 @@ function EnvironmentTasks({
   });
   const failure = (title: string, result: AtomCommandResult<unknown, unknown>) => {
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-      Alert.alert(title, String(squashAtomCommandFailure(result)));
+      Alert.alert(title, commandFailureMessage(squashAtomCommandFailure(result)));
     }
   };
 
@@ -1168,7 +1206,13 @@ function EnvironmentTasks({
     if (!readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) return;
     const result =
       action === "run"
-        ? await runNow({ environmentId, input: { id: task.id } })
+        ? await runScheduledTaskNowOnce({
+            clickIds: runNowClickIds,
+            environmentId,
+            taskId: task.id,
+            keepsRunHistory,
+            run: runNow,
+          })
         : action === "toggle"
           ? await setEnabled({ environmentId, input: { id: task.id, enabled: !task.enabled } })
           : await remove({ environmentId, input: { id: task.id } });
@@ -1225,7 +1269,25 @@ function EnvironmentTasks({
                     ? ` · ${formatNextScheduledTaskRun(task.nextRunAt, now)}`
                     : ""}
               </Text>
-              {task.lastRunError ? (
+              {task.latestRun !== undefined ? (
+                <>
+                  <Text
+                    className={
+                      scheduledTaskRunTone(task.latestRun.state) === "error"
+                        ? "text-sm text-danger-foreground"
+                        : "text-sm text-foreground-muted"
+                    }
+                    numberOfLines={1}
+                  >
+                    {formatScheduledTaskLastRun(task.latestRun, now)}
+                  </Text>
+                  {task.latestRun.error !== null ? (
+                    <Text className="text-sm text-danger-foreground" numberOfLines={2}>
+                      {task.latestRun.error}
+                    </Text>
+                  ) : null}
+                </>
+              ) : task.lastRunError ? (
                 <Text className="text-sm text-danger-foreground" numberOfLines={2}>
                   Last run failed: {task.lastRunError}
                 </Text>

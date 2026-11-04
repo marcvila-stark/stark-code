@@ -293,6 +293,16 @@ describe("selectComposerUsage", () => {
     expect(signedOut?.window).toBeNull();
     expect(signedOut?.windows).toEqual([]);
     expect(signedOut?.message).toBe("Sign in to see subscription usage.");
+    const unchecked = selectComposerUsage(
+      { ...provider(), auth: { status: "unknown" } },
+      true,
+      now,
+    );
+    expect(unchecked?.windows).toEqual([]);
+    expect(unchecked?.message).toBe("Could not check your account. Refresh usage to try again.");
+    expect(composerUsageNeedsRefresh({ ...provider(), auth: { status: "unknown" } }, now)).toBe(
+      false,
+    );
     const missing = selectComposerUsage({ ...provider(), usageLimits: undefined }, true, now);
     expect(missing?.window).toBeNull();
     expect(missing?.windows).toEqual([]);

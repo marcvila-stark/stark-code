@@ -23,6 +23,7 @@ import {
   type ArchiveThreadInput,
   type CancelQueuedRunInput,
   type RetryWorkspacePreparationInput,
+  type RetryThreadWorkerInput,
   type CreateThreadInput,
   type DeleteThreadInput,
   type EditQueuedRunInput,
@@ -36,8 +37,10 @@ import {
   type RespondToThreadApprovalInput,
   type RespondToThreadUserInputInput,
   type DismissThreadUserInputInput,
+  type LostThreadRequestsInput,
   type RevertThreadCheckpointInput,
   type SetThreadInteractionModeInput,
+  type SetThreadPermissionInput,
   type SetThreadRuntimeModeInput,
   type PinThreadInput,
   type ReorderPinnedThreadInput,
@@ -68,12 +71,16 @@ import {
   reorderQueuedRun,
   resumeThreadQueue,
   retryWorkspacePreparation,
+  retryThreadWorker,
   linkThreadPullRequest,
   respondToThreadApproval,
   respondToThreadUserInput,
   dismissThreadUserInput,
+  askAgainThreadRequests,
+  dismissLostThreadRequests,
   revertThreadCheckpoint,
   setThreadInteractionMode,
+  setThreadPermission,
   setThreadRuntimeMode,
   pinThread,
   reorderPinnedThread,
@@ -95,6 +102,7 @@ import {
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as ThreadHistoryController from "./threadHistoryController.ts";
+import { trackRuntimeResponse } from "./runtimeRequestResponse.ts";
 
 export type LoadEarlierThreadHistoryInput = {
   readonly threadId: ThreadId;
@@ -113,12 +121,15 @@ export type {
   MergeThreadBackInput,
   PromoteQueuedRunInput,
   ReorderQueuedRunInput,
+  RetryThreadWorkerInput,
   LinkThreadPullRequestInput,
   RespondToThreadApprovalInput,
   RespondToThreadUserInputInput,
   DismissThreadUserInputInput,
+  LostThreadRequestsInput,
   RevertThreadCheckpointInput,
   SetThreadInteractionModeInput,
+  SetThreadPermissionInput,
   SetThreadRuntimeModeInput,
   PinThreadInput,
   ReorderPinnedThreadInput,
@@ -148,6 +159,17 @@ export function createThreadEnvironmentAtoms<R, E>(
     mode: "serial" as const,
     key: ({ environmentId, input }: { environmentId: string; input: { threadId: string } }) =>
       JSON.stringify([environmentId, input.threadId]),
+  };
+  // A reply can wait minutes for a reconnect; it must not hold the thread's other commands.
+  const runtimeResponseConcurrency = {
+    mode: "serial" as const,
+    key: ({
+      environmentId,
+      input,
+    }: {
+      environmentId: string;
+      input: { threadId: string; requestId: string };
+    }) => JSON.stringify([environmentId, input.threadId, input.requestId]),
   };
   const commands = {
     launch: createEnvironmentRpcCommand(runtime, {
@@ -280,6 +302,12 @@ export function createThreadEnvironmentAtoms<R, E>(
       scheduler,
       concurrency,
     }),
+    setPermission: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:set-permission",
+      execute: (input: SetThreadPermissionInput) => setThreadPermission(input),
+      scheduler,
+      concurrency,
+    }),
     setInteractionMode: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:set-interaction-mode",
       execute: (input: SetThreadInteractionModeInput) => setThreadInteractionMode(input),
@@ -300,19 +328,49 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     respondToApproval: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:respond-to-approval",
-      execute: (input: RespondToThreadApprovalInput) => respondToThreadApproval(input),
+      execute: (input: RespondToThreadApprovalInput, registry, environmentId) =>
+        trackRuntimeResponse(
+          registry,
+          environmentId,
+          { kind: "approval", input },
+          respondToThreadApproval,
+        ),
       scheduler,
-      concurrency,
+      concurrency: runtimeResponseConcurrency,
     }),
     respondToUserInput: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:respond-to-user-input",
-      execute: (input: RespondToThreadUserInputInput) => respondToThreadUserInput(input),
+      execute: (input: RespondToThreadUserInputInput, registry, environmentId) =>
+        trackRuntimeResponse(
+          registry,
+          environmentId,
+          { kind: "user-input", input },
+          respondToThreadUserInput,
+        ),
       scheduler,
-      concurrency,
+      concurrency: runtimeResponseConcurrency,
     }),
     dismissUserInput: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:dismiss-user-input",
-      execute: (input: DismissThreadUserInputInput) => dismissThreadUserInput(input),
+      execute: (input: DismissThreadUserInputInput, registry, environmentId) =>
+        trackRuntimeResponse(
+          registry,
+          environmentId,
+          { kind: "dismiss", input },
+          dismissThreadUserInput,
+        ),
+      scheduler,
+      concurrency: runtimeResponseConcurrency,
+    }),
+    askAgainLostRequests: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:ask-again-lost-requests",
+      execute: (input: LostThreadRequestsInput) => askAgainThreadRequests(input),
+      scheduler,
+      concurrency,
+    }),
+    dismissLostRequests: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:dismiss-lost-requests",
+      execute: (input: LostThreadRequestsInput) => dismissLostThreadRequests(input),
       scheduler,
       concurrency,
     }),
@@ -411,6 +469,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     uploadFeedback: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:commands:thread:upload-feedback",
       tag: WS_METHODS.providerUploadFeedback,
+      scheduler,
+      concurrency,
+    }),
+    retryWorker: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:retry-worker",
+      execute: (input: RetryThreadWorkerInput) => retryThreadWorker(input),
       scheduler,
       concurrency,
     }),

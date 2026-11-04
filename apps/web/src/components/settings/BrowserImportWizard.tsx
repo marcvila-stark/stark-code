@@ -1,13 +1,21 @@
 import { PermissionChecklist, PermissionContinueButton } from "../permissions/PermissionChecklist";
 import { usePermissionStatus } from "../permissions/usePermissionStatus";
-import type { BrowserImportSource, BrowserImportSourceProfile } from "@starkfuture/contracts";
+import type { BrowserImportSource } from "@starkfuture/contracts";
 import { BROWSER_IMPORT_FAILURE_COPY } from "@starkfuture/contracts";
-import { ArrowDownIcon, ArrowRightIcon, CheckIcon, HardDriveIcon } from "lucide-react";
-import { useRef, useState } from "react";
+import {
+  ArrowDownIcon,
+  ArrowRightIcon,
+  CheckIcon,
+  ChevronRightIcon,
+  HardDriveIcon,
+} from "lucide-react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 
 import { cn, randomUUID } from "~/lib/utils";
 
 import { Button } from "../ui/button";
+import { Checkbox } from "../ui/checkbox";
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import {
   Dialog,
   DialogClose,
@@ -18,20 +26,31 @@ import {
   DialogPopup,
   DialogTitle,
 } from "../ui/dialog";
+import { Input } from "../ui/input";
 import { Spinner } from "../ui/spinner";
-import { BrowserImportSitePicker } from "./BrowserImportSitePicker";
 import {
   initialWizardStep,
   initialTargetSelection,
   canCloseWizard,
+  copySignInsLabel,
+  deselectSites,
+  filterSites,
   isRetryableReason,
   formatSkippedDomains,
   fullDiskAccessRecheckStep,
+  MAX_IMPORT_SITES,
   outcomeToStep,
+  parseSiteInput,
+  recommendedSiteGroups,
   refreshedSourceProfileDirectory,
   refreshedSourceStep,
   resolveWizardTarget,
+  selectSites,
+  siteCountLabel,
+  siteGroupSelectionLabel,
+  siteGroupState,
   type ImportOutcome,
+  type RecommendedSiteGroup,
   type WizardTarget,
   type WizardTargetProfile,
   type WizardTargetSelection,
@@ -97,7 +116,9 @@ export function BrowserImportWizard({
   );
   const [targetError, setTargetError] = useState<string>();
   const [selectedDomains, setSelectedDomains] = useState<string[]>([]);
-  const [consent, setConsent] = useState(false);
+  const availableDomains = source.profiles.find(
+    (profile) => profile.directory === sourceProfileDirectory,
+  )?.domains;
   // Stable across retries so a keychain re-approval lands in one profile, not
   // a new one each time.
   const newProfileId = useRef(`profile-${randomUUID()}`);
@@ -108,7 +129,9 @@ export function BrowserImportWizard({
   const importInFlight = useRef(false);
 
   const runImport = () => {
-    if (importInFlight.current || !consent || selectedDomains.length === 0) return;
+    // Pressing the copy button is the acknowledgement; it is only enabled once
+    // the user has chosen at least one site.
+    if (importInFlight.current || selectedDomains.length === 0) return;
     const chosen = resolveWizardTarget(target, newProfileId.current, targetProfiles);
     if (chosen === undefined) {
       setTargetError("That profile is no longer available. Choose where to import these cookies.");
@@ -139,10 +162,9 @@ export function BrowserImportWizard({
           setSource(refreshed);
           const nextDirectory = refreshedSourceProfileDirectory(sourceProfileDirectory, refreshed);
           if (nextDirectory !== sourceProfileDirectory) {
-            // Consent belongs to the account profile the user chose. A
-            // post-quit refresh must not transfer it to a replacement profile.
+            // The chosen sites belong to the account profile the user chose. A
+            // post-quit refresh must not transfer them to a replacement profile.
             setSelectedDomains([]);
-            setConsent(false);
           }
           setSourceProfileDirectory(nextDirectory);
         }
@@ -158,7 +180,7 @@ export function BrowserImportWizard({
       <DialogPopup
         variant="brand"
         layer={layer}
-        className="max-w-xl"
+        className="max-w-lg"
         showCloseButton={canCloseWizard(step)}
       >
         {step.step === "quit" ? (
@@ -198,14 +220,12 @@ export function BrowserImportWizard({
         ) : (
           <ConfigureStep
             source={source}
-            destinationEnvironmentName={destinationEnvironmentName}
             targetProfiles={targetProfiles}
             canCreateProfile={canCreateProfile}
             sourceProfileDirectory={sourceProfileDirectory}
             onSourceProfileChange={(directory) => {
               setSourceProfileDirectory(directory);
               setSelectedDomains([]);
-              setConsent(false);
             }}
             target={target}
             onTargetChange={(selection) => {
@@ -213,18 +233,13 @@ export function BrowserImportWizard({
               setTargetError(undefined);
             }}
             targetError={targetError}
-            importReady={consent && selectedDomains.length > 0}
-            selectedSiteCount={selectedDomains.length}
+            selectedCount={selectedDomains.length}
             sitePicker={
-              <BrowserImportSitePicker
+              <SitePicker
                 key={sourceProfileDirectory}
-                profile={source.profiles.find(
-                  (profile) => profile.directory === sourceProfileDirectory,
-                )}
-                selectedDomains={selectedDomains}
-                onSelectionChange={setSelectedDomains}
-                consent={consent}
-                onConsentChange={setConsent}
+                domains={availableDomains}
+                selected={selectedDomains}
+                onChange={setSelectedDomains}
               />
             }
             onCancel={onClose}
@@ -263,28 +278,21 @@ function QuitStep({
   );
 }
 
-function sourceSiteCountLabel(profile: BrowserImportSourceProfile): string {
-  if (profile.domains === undefined) return "Choose sites by address";
-  const count = new Set(profile.domains).size;
-  return `${count.toLocaleString()}${profile.domainsTruncated ? "+" : ""} ${count === 1 ? "site" : "sites"} found`;
-}
-
 function cookieResultCount(count: number): string {
   return `${count.toLocaleString()} ${count === 1 ? "cookie" : "cookies"}`;
 }
 
 type ConfigureStepProps = {
   readonly source: BrowserImportSource;
-  readonly destinationEnvironmentName: string;
   readonly targetProfiles: ReadonlyArray<WizardTargetProfile>;
   readonly canCreateProfile: boolean;
   readonly sourceProfileDirectory: string;
   readonly onSourceProfileChange: (directory: string) => void;
   readonly target: WizardTargetSelection;
   readonly targetError: string | undefined;
-  readonly sitePicker: import("react").ReactNode;
-  readonly importReady: boolean;
-  readonly selectedSiteCount: number;
+  readonly sitePicker: ReactNode;
+  /** How many exact hosts are chosen; the copy button names it. */
+  readonly selectedCount: number;
   readonly onTargetChange: (target: WizardTargetSelection) => void;
   readonly onCancel: () => void;
   readonly onImport: () => void;
@@ -378,7 +386,6 @@ function FullDiskAccessStep({
 }
 function ConfigureStep({
   source,
-  destinationEnvironmentName,
   targetProfiles,
   canCreateProfile,
   sourceProfileDirectory,
@@ -386,8 +393,7 @@ function ConfigureStep({
   target,
   targetError,
   sitePicker,
-  importReady,
-  selectedSiteCount,
+  selectedCount,
   onTargetChange,
   onCancel,
   onImport,
@@ -406,46 +412,47 @@ function ConfigureStep({
       : targetUncreatable
         ? "You've reached the profile limit. Choose an existing profile to import into."
         : undefined);
+  // Settings and setup both import into the one personal profile; a picker
+  // with a single fixed choice reads better as a line.
+  const fixedTarget =
+    !canCreateProfile && targetProfiles.length === 1 ? targetProfiles[0] : undefined;
+  const sourceTiles = source.profiles.map((profile) => (
+    <SelectableTile
+      key={profile.directory}
+      selected={sourceProfileDirectory === profile.directory}
+      title={profile.name}
+      subtitle={siteCountLabel(profile.domains, profile.domainsTruncated)}
+      onSelect={() => onSourceProfileChange(profile.directory)}
+    />
+  ));
   return (
     <>
       <DialogHeader>
-        <DialogTitle>Import from {source.name}</DialogTitle>
+        <DialogTitle>Use your {source.name} sign-ins in Stark Code</DialogTitle>
         <DialogDescription>
-          Bring sign-ins for the sites you choose into {destinationEnvironmentName}.
+          Stark Code copies the sign-in cookies of the sites you pick into its own browser profile
+          on this computer, so sites like Stark Pages open already signed in.
         </DialogDescription>
       </DialogHeader>
       <DialogPanel>
-        {source.profiles.length === 1 &&
-        targetProfiles.length === 1 &&
-        !canCreateProfile &&
-        target.kind === "existing" &&
-        target.profileId === targetProfiles[0]!.id ? (
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 rounded-lg border border-border px-3 py-2">
-            <p className="min-w-0 wrap-anywhere text-sm">
-              {source.profiles[0]!.name}
-              <span className="text-xs text-muted-foreground">
-                {" · "}
-                {sourceSiteCountLabel(source.profiles[0]!)}
-              </span>
+        {fixedTarget ? (
+          <section className="min-w-0 space-y-2">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              From
             </p>
-            <p className="text-xs text-muted-foreground">Into {targetProfiles[0]!.name}</p>
-          </div>
+            {sourceTiles}
+            <p className="text-xs text-muted-foreground">
+              Into: <span className="font-medium text-foreground">{fixedTarget.name}</span>
+            </p>
+          </section>
         ) : (
-          /* Zero-minimum columns keep long account names inside the dialog. */
+          // Zero-minimum columns keep long account names inside the dialog.
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center sm:gap-4">
             <section className="min-w-0 space-y-2">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 From
               </p>
-              {source.profiles.map((profile) => (
-                <SelectableTile
-                  key={profile.directory}
-                  selected={sourceProfileDirectory === profile.directory}
-                  title={profile.name}
-                  subtitle={sourceSiteCountLabel(profile)}
-                  onSelect={() => onSourceProfileChange(profile.directory)}
-                />
-              ))}
+              {sourceTiles}
             </section>
             <div className="flex shrink-0 items-center justify-center text-muted-foreground">
               <ArrowDownIcon className="size-4 sm:hidden" />
@@ -477,10 +484,11 @@ function ConfigureStep({
         )}
         {sitePicker}
         {targetFeedback ? (
-          <p role="alert" className="mt-3 text-sm text-destructive">
+          <p role="alert" className="text-sm text-destructive">
             {targetFeedback}
           </p>
         ) : null}
+        <SignInSafetyNotes />
       </DialogPanel>
       <DialogFooter>
         <Button variant="outline" onClick={onCancel}>
@@ -488,18 +496,309 @@ function ConfigureStep({
         </Button>
         <Button
           disabled={
-            !importReady || sourceProfileDirectory === "" || targetMissing || targetUncreatable
+            selectedCount === 0 ||
+            sourceProfileDirectory === "" ||
+            targetMissing ||
+            targetUncreatable
           }
           onClick={onImport}
         >
-          {selectedSiteCount > 0
-            ? `Import ${selectedSiteCount.toLocaleString()} ${selectedSiteCount === 1 ? "site" : "sites"}`
-            : "Select sites to import"}
+          {copySignInsLabel(selectedCount)}
         </Button>
       </DialogFooter>
     </>
   );
 }
+
+const SITE_LIMIT_NOTICE = `One import can copy up to ${MAX_IMPORT_SITES} sites. Clear some to add more.`;
+
+/**
+ * Chooses the exact hosts to copy. Stark sites and sign-in providers are one
+ * click each and open to single hosts; everything else sits behind "Other
+ * sites". Nothing starts selected.
+ */
+function SitePicker({
+  domains,
+  selected,
+  onChange,
+}: {
+  /** The source profile's cookie hosts; absent when they could not be listed. */
+  readonly domains: ReadonlyArray<string> | undefined;
+  readonly selected: ReadonlyArray<string>;
+  readonly onChange: (selected: string[]) => void;
+}) {
+  const groups = useMemo(() => recommendedSiteGroups(domains ?? []), [domains]);
+  const [othersOpen, setOthersOpen] = useState(groups.recommended.length === 0);
+  const [filter, setFilter] = useState("");
+  const [siteDraft, setSiteDraft] = useState("");
+  const [notice, setNotice] = useState<string>();
+  const selectedSet = new Set(selected);
+  const listed = new Set(groups.recommended.flatMap((group) => group.hosts));
+  for (const host of groups.other) listed.add(host);
+  // Sites typed in by hand join the other sites so they can be unticked too.
+  const otherHosts = [...selected.filter((host) => !listed.has(host)), ...groups.other];
+  const otherSelected = otherHosts.filter((host) => selectedSet.has(host)).length;
+  const { visible, hiddenCount } = filterSites(otherHosts, filter);
+
+  const select = (hosts: ReadonlyArray<string>) => {
+    const result = selectSites(selected, hosts);
+    setNotice(result.limitReached ? SITE_LIMIT_NOTICE : undefined);
+    if (!result.limitReached) onChange(result.selected);
+  };
+  const deselect = (hosts: ReadonlyArray<string>) => {
+    setNotice(undefined);
+    onChange(deselectSites(selected, hosts));
+  };
+  const toggle = (host: string, checked: boolean) => (checked ? select([host]) : deselect([host]));
+  const addSite = () => {
+    const host = parseSiteInput(siteDraft);
+    if (host === undefined) {
+      setNotice("Enter one exact site, like pages.starkfuture.com.");
+      return;
+    }
+    const result = selectSites(selected, [host]);
+    setNotice(result.limitReached ? SITE_LIMIT_NOTICE : undefined);
+    if (result.limitReached) return;
+    onChange(result.selected);
+    setSiteDraft("");
+  };
+
+  return (
+    <section className="space-y-2">
+      <p className="text-sm font-medium text-foreground">Choose sites</p>
+      <div className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60">
+        {groups.recommended.map((group) => (
+          <SiteGroupRow
+            key={group.id}
+            group={group}
+            selected={selected}
+            onSelectAll={(checked) => (checked ? select(group.hosts) : deselect(group.hosts))}
+            onToggleSite={toggle}
+          />
+        ))}
+        <Collapsible open={othersOpen} onOpenChange={setOthersOpen}>
+          <CollapsibleTrigger className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm font-medium text-foreground outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+            <ChevronRightIcon
+              aria-hidden
+              className={cn(
+                "size-4 shrink-0 text-muted-foreground transition-transform duration-150 motion-reduce:transition-none",
+                othersOpen && "rotate-90",
+              )}
+            />
+            <span className="min-w-0 flex-1">Other sites</span>
+            {otherHosts.length > 0 ? (
+              <span className="shrink-0 text-xs font-normal tabular-nums text-muted-foreground">
+                {otherSelected > 0
+                  ? `${otherSelected} of ${otherHosts.length.toLocaleString()} selected`
+                  : otherHosts.length.toLocaleString()}
+              </span>
+            ) : null}
+          </CollapsibleTrigger>
+          <CollapsiblePanel>
+            <div className="space-y-3 px-3 pt-1 pb-3">
+              {otherHosts.length > 0 ? (
+                <>
+                  <Input
+                    type="search"
+                    size="sm"
+                    placeholder="Filter sites"
+                    aria-label="Filter other sites"
+                    value={filter}
+                    onChange={(event) => setFilter(event.target.value)}
+                  />
+                  <div className="max-h-48 space-y-2 overflow-auto">
+                    {visible.map((host) => (
+                      <SiteCheckbox
+                        key={host}
+                        host={host}
+                        checked={selectedSet.has(host)}
+                        onCheckedChange={(checked) => toggle(host, checked)}
+                      />
+                    ))}
+                    {visible.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">No sites match.</p>
+                    ) : null}
+                  </div>
+                  {hiddenCount > 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      {hiddenCount.toLocaleString()} more. Filter to find them.
+                    </p>
+                  ) : null}
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {domains === undefined
+                    ? "This browser can't list its sites. Add the ones you want below."
+                    : "No other sites were found in this profile."}
+                </p>
+              )}
+              <form
+                className="flex items-end gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  addSite();
+                }}
+              >
+                <label className="min-w-0 flex-1 text-xs text-muted-foreground">
+                  Add a site that isn&rsquo;t listed
+                  <Input
+                    className="mt-1"
+                    size="sm"
+                    placeholder="pages.starkfuture.com"
+                    value={siteDraft}
+                    onChange={(event) => setSiteDraft(event.target.value)}
+                  />
+                </label>
+                <Button type="submit" variant="outline" size="sm">
+                  Add
+                </Button>
+              </form>
+            </div>
+          </CollapsiblePanel>
+        </Collapsible>
+      </div>
+      {notice ? (
+        <p role="status" className="text-xs text-destructive">
+          {notice}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * A recommended set. Its checkbox copies every host in the set; the host
+ * summary under the title opens the list so single hosts can be unticked.
+ */
+function SiteGroupRow({
+  group,
+  selected,
+  onSelectAll,
+  onToggleSite,
+}: {
+  readonly group: RecommendedSiteGroup;
+  readonly selected: ReadonlyArray<string>;
+  readonly onSelectAll: (checked: boolean) => void;
+  readonly onToggleSite: (host: string, checked: boolean) => void;
+}) {
+  const state = siteGroupState(selected, group.hosts);
+  const selectionLabel = siteGroupSelectionLabel(selected, group.hosts);
+  return (
+    <Collapsible>
+      <div className="px-3 py-2.5">
+        <label className="flex cursor-pointer items-start gap-3">
+          <Checkbox
+            className="mt-0.5"
+            checked={state === "all"}
+            indeterminate={state === "some"}
+            onCheckedChange={onSelectAll}
+          />
+          <span className="min-w-0 flex-1">
+            <span className="flex items-baseline justify-between gap-3">
+              <span className="min-w-0 text-sm font-medium text-foreground">{group.title}</span>
+              {selectionLabel ? (
+                <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                  {selectionLabel}
+                </span>
+              ) : null}
+            </span>
+            {group.description ? (
+              <span className="block text-xs text-muted-foreground">{group.description}</span>
+            ) : null}
+          </span>
+        </label>
+        <CollapsibleTrigger className="group ml-6 flex items-center gap-1 rounded-sm px-1 text-left text-xs text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+          <span className="min-w-0 wrap-anywhere">{group.hostsLabel}</span>
+          <ChevronRightIcon
+            aria-hidden
+            className="size-3.5 shrink-0 transition-transform duration-150 group-data-panel-open:rotate-90 motion-reduce:transition-none"
+          />
+        </CollapsibleTrigger>
+        <CollapsiblePanel>
+          <div className="ml-7 max-h-48 space-y-2 overflow-auto pt-2">
+            {group.hosts.map((host) => (
+              <SiteCheckbox
+                key={host}
+                host={host}
+                checked={selected.includes(host)}
+                onCheckedChange={(checked) => onToggleSite(host, checked)}
+              />
+            ))}
+          </div>
+        </CollapsiblePanel>
+      </div>
+    </Collapsible>
+  );
+}
+
+/** One exact host and its own checkbox. */
+function SiteCheckbox({
+  host,
+  checked,
+  onCheckedChange,
+}: {
+  readonly host: string;
+  readonly checked: boolean;
+  readonly onCheckedChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="flex min-w-0 cursor-pointer items-center gap-2 text-sm">
+      <Checkbox checked={checked} onCheckedChange={onCheckedChange} />
+      <span className="min-w-0 wrap-anywhere">{host}</span>
+    </label>
+  );
+}
+
+/**
+ * What happens to copied sign-ins, next to the button that copies them: the two
+ * lines that matter stay visible and the rest waits behind "More details". Each
+ * line has to stay true to the import path: cookies are written into the
+ * personal profile's partition on this machine (imports refuse to run without
+ * OS-backed cookie encryption) and are never sent to the Stark server.
+ */
+function SignInSafetyNotes() {
+  return (
+    <section className="rounded-lg border border-border/60 bg-muted/30 px-3.5 py-3">
+      <p className="text-xs font-medium text-foreground">What happens to these sign-ins</p>
+      <ul className="mt-2 space-y-1.5">
+        {SIGN_IN_SAFETY_POINTS.map((point) => (
+          <li key={point} className="flex items-start gap-2 text-xs text-foreground">
+            <CheckIcon className="mt-px size-3.5 shrink-0 text-success" aria-hidden />
+            <span className="min-w-0">{point}</span>
+          </li>
+        ))}
+      </ul>
+      <Collapsible className="mt-2">
+        <CollapsibleTrigger className="group -mx-1 flex items-center gap-1 rounded-sm px-1 text-xs text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+          More details
+          <ChevronRightIcon
+            aria-hidden
+            className="size-3.5 shrink-0 transition-transform duration-150 group-data-panel-open:rotate-90 motion-reduce:transition-none"
+          />
+        </CollapsibleTrigger>
+        <CollapsiblePanel>
+          <div className="space-y-1 pt-1.5 text-xs text-muted-foreground">
+            {SIGN_IN_SAFETY_DETAILS.map((detail) => (
+              <p key={detail}>{detail}</p>
+            ))}
+          </div>
+        </CollapsiblePanel>
+      </Collapsible>
+    </section>
+  );
+}
+
+const SIGN_IN_SAFETY_POINTS = [
+  "Kept on this computer, in Stark Code's own profile.",
+  "Not uploaded to Stark servers; used when you visit the selected websites.",
+] as const;
+
+const SIGN_IN_SAFETY_DETAILS = [
+  "Encrypted with your system keychain. Agents can't open this profile.",
+  "Clear it any time in Settings → Connected tools → Browser & privacy.",
+  "A copied sign-in works like the original, so anyone using this computer account could use it inside Stark Code.",
+  "Not passwords, history or bookmarks. One-time copy.",
+] as const;
 
 /** One selectable option: a name, an optional detail line, and a check. */
 function SelectableTile({
@@ -549,13 +848,13 @@ function ImportingStep() {
   return (
     <>
       <DialogHeader>
-        <DialogTitle>Importing cookies</DialogTitle>
+        <DialogTitle>Copying sign-ins</DialogTitle>
         <DialogDescription>This may take a moment.</DialogDescription>
       </DialogHeader>
       <DialogPanel>
         <div className="flex items-center gap-3 py-2">
           <Spinner size="md" tone="muted" />
-          <span className="text-sm text-muted-foreground">Importing…</span>
+          <span className="text-sm text-muted-foreground">Copying…</span>
         </div>
       </DialogPanel>
     </>

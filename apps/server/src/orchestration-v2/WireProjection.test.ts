@@ -7,6 +7,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2ThreadProjection,
@@ -50,6 +51,27 @@ const base = {
 };
 
 describe("orchestration V2 wire projection", () => {
+  it("keeps a waiting approval's proposed patch rather than stripping it like a completed file diff", () => {
+    const diff = "@@\n-previous\n+" + "line\n".repeat(30_000) + "+last";
+    const item = {
+      ...base,
+      type: "approval_request" as const,
+      requestId: RuntimeRequestId.make("approval"),
+      requestKind: "file-change" as const,
+      status: "waiting" as const,
+      proposedChanges: [{ operation: "update", path: "/large.ts", patch: diff }],
+    };
+    const projected = projectTurnItemForWire(item);
+    expect(projected).toMatchObject({ proposedChanges: [{ patch: diff }] });
+    expect(decodeTurnItemJson(encodeTurnItemJson(projected))).toMatchObject({
+      proposedChanges: [{ patch: diff }],
+    });
+    expect(projectTurnItemForDetail(item)).toMatchObject({ proposedChanges: [{ patch: diff }] });
+    expect(projectTurnItemForWire({ ...item, proposedChanges: undefined })).not.toHaveProperty(
+      "proposedChanges.0",
+    );
+  });
+
   it("keeps copied handoff transcripts out of activity items and live events", () => {
     const item = {
       ...base,
@@ -399,6 +421,45 @@ describe("orchestration V2 wire projection", () => {
       },
     };
     expect(projectTurnItemForWire({ ...base, output })).not.toHaveProperty("output");
+  });
+
+  it("sends a pending approval's proposed diff and keeps only the file list once resolved", () => {
+    const { toolName: _toolName, input: _input, ...itemBase } = base;
+    const waiting = {
+      ...itemBase,
+      type: "approval_request" as const,
+      status: "waiting" as const,
+      requestId: RuntimeRequestId.make("request-1"),
+      requestKind: "file-change" as const,
+      proposedChanges: [
+        {
+          path: "/work/a.ts",
+          operation: "update",
+          patch: "--- /work/a.ts\n+++ /work/a.ts\n@@ -1 +1 @@\n-a\n+b\n",
+          approximate: true as const,
+        },
+        { path: "/work/c.ts", operation: "rename", oldPath: "/work/b.ts" },
+      ],
+      proposedChangesOmitted: 2,
+    };
+    expect(projectTurnItemForWire(waiting)).toBe(waiting);
+    expect(projectTurnItemForDetail(waiting)).toBe(waiting);
+    for (const status of ["completed", "cancelled", "failed"] as const) {
+      const resolved = { ...waiting, status };
+      const expected = {
+        ...resolved,
+        proposedChanges: [
+          { path: "/work/a.ts", operation: "update" },
+          { path: "/work/c.ts", operation: "rename", oldPath: "/work/b.ts" },
+        ],
+      };
+      expect(projectTurnItemForWire(resolved)).toEqual(expected);
+      expect(projectTurnItemForDetail(resolved)).toEqual(expected);
+      expect(decodeTurnItemJson(encodeTurnItemJson(projectTurnItemForWire(resolved)))).toEqual(
+        expected,
+      );
+    }
+    expect(waiting.proposedChanges[0]?.patch).toContain("+b");
   });
 });
 

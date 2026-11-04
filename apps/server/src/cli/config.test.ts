@@ -955,7 +955,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
             ConfigProvider.layer(
               ConfigProvider.fromEnv({
                 env: {
-                  STARK_CODE_OTLP_HEADERS: "authorization=Basic%20abc%3D%3D,x-tenant=stark",
+                  STARK_CODE_OTLP_HEADERS: "authorization=Basic%20abc%3D%3D,x-tenant=stark-code",
                 },
               }),
             ),
@@ -998,7 +998,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
             ConfigProvider.layer(
               ConfigProvider.fromEnv({
                 env: {
-                  STARK_CODE_OTLP_HEADERS: "authorization=Bearer abc==, x-tenant=stark",
+                  STARK_CODE_OTLP_HEADERS: "authorization=Bearer abc==, x-tenant=stark-code",
                   STARK_CODE_OTLP_TRACES_URL: "http://collector.internal:4318",
                 },
               }),

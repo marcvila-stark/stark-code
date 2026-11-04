@@ -14,11 +14,19 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { useEnvironmentScope } from "../../state/session";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { isElectron } from "../../env";
+import { useNowMinute } from "../../hooks/useNowMinute";
 import { ensureLocalApi } from "../../localApi";
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { useMcpServersQuery } from "./useMcpServersQuery";
 import { mcpRecoveryMessage } from "./mcpRecoveryPresentation";
+import {
+  describeMcpStatusFreshness,
+  MCP_STATUS_FRESH_ON_OPEN_MS,
+  mcpStatusMemory,
+  mcpStatusTargetKey,
+  resolveMcpStatusView,
+} from "./mcpStatusMemory";
 import {
   isLocalMcpDesktopTarget,
   mcpConnectionSummary,
@@ -200,14 +208,12 @@ type McpServersPanelProps = {
 export function McpServersPanel(props: McpServersPanelProps) {
   // A held confirmation and OAuth callback belong to exactly one target. A late
   // action from the previous target must never populate the newly selected panel.
-  const targetKey = JSON.stringify([
-    props.environmentId,
-    props.target.threadId,
-    props.target.providerInstanceId,
-    props.target.projectId,
-    props.providerKind,
-  ]);
-  return <McpServersPanelTarget key={targetKey} {...props} />;
+  return (
+    <McpServersPanelTarget
+      key={`${mcpStatusTargetKey(props.environmentId, props.target)}:${props.providerKind ?? ""}`}
+      {...props}
+    />
+  );
 }
 
 function McpServersPanelTarget({
@@ -226,16 +232,37 @@ function McpServersPanelTarget({
       ? "Could not reload Claude plugins. Refresh status and try again."
       : "Could not reload MCP servers. Refresh status and try again.";
   const query = useMcpServersQuery(environmentId, target, 2_000);
+  // Read once: the panel remounts whenever its target changes. Shown only
+  // until this panel's own inspection answers.
+  const [remembered] = useState(() =>
+    mcpStatusMemory.recall(mcpStatusTargetKey(environmentId, target)),
+  );
+  const [freshSince, setFreshSince] = useState(() => Date.now() - MCP_STATUS_FRESH_ON_OPEN_MS);
+  const nowMinute = useNowMinute();
+  const status = resolveMcpStatusView({
+    current: query.data,
+    currentReceivedAt: query.dataUpdatedAt,
+    pending: query.isPending,
+    failed: query.error !== null,
+    remembered,
+    freshSince,
+    now: Date.parse(`${nowMinute}Z`),
+  });
+  const shown = status.kind === "known" ? status.result : null;
   const [inspectionAttempt, setInspectionAttempt] = useState(0);
   const [inspectionSlow, setInspectionSlow] = useState(false);
-  const waitingForStatus = !query.data && !query.error;
+  const waitingForStatus = status.kind === "checking";
+  const refreshingShown = status.kind === "known" && status.refreshing;
+  const inspecting = waitingForStatus || refreshingShown;
   useEffect(() => {
     setInspectionSlow(false);
-    if (!waitingForStatus) return;
+    if (!inspecting) return;
     const timer = window.setTimeout(() => setInspectionSlow(true), 10_000);
     return () => window.clearTimeout(timer);
-  }, [waitingForStatus, inspectionAttempt]);
+  }, [inspecting, inspectionAttempt]);
+  const freshness = describeMcpStatusFreshness(status, inspectionSlow);
   const retryStatus = () => {
+    setFreshSince(Date.now());
     setInspectionAttempt((attempt) => attempt + 1);
     query.refresh();
   };
@@ -488,7 +515,7 @@ function McpServersPanelTarget({
           Connection changes are available after this turn finishes.
         </p>
       ) : null}
-      {query.data?.live && query.data.reconnectScope === "all" ? (
+      {shown?.live && shown.reconnectScope === "all" ? (
         <p className="text-xs text-muted-foreground">
           This provider cannot reconnect one server without reloading healthy connections.
           Individual retries are unavailable here.
@@ -630,6 +657,19 @@ function McpServersPanelTarget({
           </Button>
         </div>
       ) : null}
+      {freshness ? (
+        <div
+          className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground"
+          role="status"
+        >
+          <p>{freshness}</p>
+          {refreshingShown && inspectionSlow ? (
+            <Button size="xs" variant="outline" disabled={busy} onClick={retryStatus}>
+              Retry status check
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       {waitingForStatus ? (
         <div
           className={
@@ -665,12 +705,12 @@ function McpServersPanelTarget({
           ) : null}
         </div>
       ) : null}
-      {target.threadId !== undefined && query.data && !query.data.live ? (
+      {target.threadId !== undefined && shown && !shown.live ? (
         <p className="text-xs text-muted-foreground">
           Send a message to start this thread's MCP session.
         </p>
       ) : null}
-      {query.data && !unavailable && query.data.servers.length === 0 ? (
+      {shown && !(target.threadId !== undefined && !shown.live) && shown.servers.length === 0 ? (
         <p className="text-xs text-muted-foreground">No MCP servers reported.</p>
       ) : null}
       {canReconnect &&
@@ -698,7 +738,7 @@ function McpServersPanelTarget({
       ) : null}
       <McpServerRows
         spacious={presentation === "settings"}
-        servers={query.data?.servers ?? []}
+        servers={shown?.servers ?? []}
         canReconnect={canReconnect}
         canManage={canManage}
         busy={mutationBlocked}
@@ -715,7 +755,7 @@ function McpServersPanelTarget({
   );
 }
 
-export function McpServersChip({
+function McpServersChip({
   threadRef,
   providerKind,
   sessionBusy,

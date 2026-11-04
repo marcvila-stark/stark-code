@@ -157,6 +157,31 @@ describe("resolveThreadListV2Status", () => {
     expect(resolveThreadListV2Status(thread)).toBe("approval");
   });
 
+  it("labels a decision lost to a restart until the user asks again or dismisses it", () => {
+    const stopped = makeThread({
+      id: ThreadId.make("lost"),
+      title: "lost",
+      hasLostRuntimeRequest: true,
+      runtime: {
+        status: "failed",
+        activeRunId: null,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        providerName: "Codex",
+        lastError: "Provider exited",
+        updatedAt: NOW,
+      },
+    });
+    expect(resolveThreadListV2Status(stopped)).toBe("lost");
+    expect(resolveThreadListV2Status({ ...stopped, hasPendingApprovals: true })).toBe("approval");
+    expect(
+      resolveThreadListV2Status({
+        ...stopped,
+        runtime: { ...stopped.runtime!, status: "running" },
+      }),
+    ).toBe("working");
+    expect(resolveThreadListV2Status({ ...stopped, hasLostRuntimeRequest: false })).toBe("failed");
+  });
+
   it("reports waiting when presentation parks runtime idle for background tasks", () => {
     expect(
       resolveThreadListV2Status(

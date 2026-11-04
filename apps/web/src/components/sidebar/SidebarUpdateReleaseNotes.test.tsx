@@ -74,79 +74,23 @@ describe("SidebarUpdateReleaseNotes", () => {
     testState.addToast.mockReset();
   });
 
-  it("links each preview to its exact release and labels hidden changes", () => {
-    const anchors = collectAnchors(
-      renderNotes({
+  it("shows release notes as plain text and links to no release page", () => {
+    const openExternal = vi.fn().mockResolvedValue(true);
+    const notes = renderNotes(
+      {
         ...baseState,
         releaseNotes: [
           { version: "0.0.36-nightly.3", items: ["Change 3"], totalItems: 1 },
           { version: "0.0.36-nightly.2", items: ["Change 2"], totalItems: 2 },
-          { version: "0.0.36-nightly.1", items: ["Change 1", "Earlier"], totalItems: 4 },
         ],
-      }),
-    );
-
-    expect(anchors.map(({ props }) => props.href)).toEqual([
-      "https://github.com/example/stark-code/releases/tag/v0.0.36-nightly.3",
-      "https://github.com/example/stark-code/releases/tag/v0.0.36-nightly.2",
-      "https://github.com/example/stark-code/releases/tag/v0.0.36-nightly.1",
-    ]);
-    expect(anchors.map(({ props }) => textContent(props.children))).toEqual([
-      "View release on GitHub",
-      "1 more change on GitHub",
-      "2 more changes on GitHub",
-    ]);
-  });
-
-  it("links omitted releases to release history", () => {
-    const anchors = collectAnchors(
-      renderNotes({
-        ...baseState,
-        releaseNotes: [{ version: "0.0.36-nightly.3", items: ["Change 3"], totalItems: 1 }],
-        omittedReleaseCount: 1,
-      }),
-    );
-
-    expect(anchors.at(-1)?.props.href).toBe("https://github.com/example/stark-code/releases");
-    expect(textContent(anchors.at(-1)?.props.children)).toBe("1 older release on GitHub");
-  });
-
-  it("shows plural history text for multiple omitted releases", () => {
-    const anchors = collectAnchors(
-      renderNotes({
-        ...baseState,
-        releaseNotes: [{ version: "0.0.36-nightly.3", items: ["Change 3"], totalItems: 1 }],
         omittedReleaseCount: 3,
-      }),
+      },
+      openExternal,
     );
 
-    expect(textContent(anchors.at(-1)?.props.children)).toBe("3 older releases on GitHub");
-  });
-
-  it("reports a release link that fails to open", async () => {
-    const openExternal = vi.fn().mockResolvedValue(false);
-    const [anchor] = collectAnchors(
-      renderNotes(
-        {
-          ...baseState,
-          releaseNotes: [{ version: "0.0.36-nightly.3", items: ["Change 3"], totalItems: 1 }],
-        },
-        openExternal,
-      ),
-    );
-    const preventDefault = vi.fn();
-
-    anchor?.props.onClick?.({ preventDefault } as unknown as MouseEvent<HTMLAnchorElement>);
-
-    expect(preventDefault).toHaveBeenCalledOnce();
-    await vi.waitFor(() => {
-      expect(openExternal).toHaveBeenCalledWith(
-        "https://github.com/example/stark-code/releases/tag/v0.0.36-nightly.3",
-      );
-      expect(testState.addToast).toHaveBeenCalledWith({
-        type: "error",
-        title: "Unable to open release notes",
-      });
-    });
+    expect(collectAnchors(notes)).toEqual([]);
+    expect(textContent(notes)).toContain("Change 3");
+    expect(textContent(notes)).toContain("Change 2");
+    expect(openExternal).not.toHaveBeenCalled();
   });
 });

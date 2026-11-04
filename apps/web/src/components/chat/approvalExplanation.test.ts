@@ -2,6 +2,27 @@ import { describe, expect, it } from "vite-plus/test";
 import { explainApprovalCommand } from "./approvalExplanation";
 
 describe("plain-language command explanations", () => {
+  it("explains literal inspection commands without treating arbitrary scripts as read-only", () => {
+    for (const command of ["pwd", "/bin/pwd -P", "node --version", "sed -n '1,120p' source.ts"]) {
+      expect(explainApprovalCommand(command).steps[0]?.unknown, command).toBe(false);
+    }
+    for (const command of [
+      "node --version --require ./hook.js",
+      "node -e 'doSomething()'",
+      "sed -n '1e rm file' source.ts",
+    ]) {
+      expect(explainApprovalCommand(command).steps[0]?.unknown, command).toBe(true);
+    }
+    // An in-place flag turns the line printer into an edit, which the card names with caution.
+    expect(explainApprovalCommand("sed -n '1p' -i source.ts").steps[0]).toMatchObject({
+      caution: true,
+      unknown: false,
+    });
+    expect(explainApprovalCommand("pwd > result.txt").notes).toContain(
+      "Output redirection can create or overwrite a file.",
+    );
+  });
+
   it("distinguishes discarding work from retaining it, without inventing affected files", () => {
     const hard = explainApprovalCommand("git -C '/work/project' reset --hard HEAD");
     expect(hard.steps[0]).toMatchObject({ caution: true, unknown: false });
@@ -48,7 +69,8 @@ describe("plain-language command explanations", () => {
     const result = explainApprovalCommand("git status && rm -rf build");
     expect(result.steps.map((step) => step.caution)).toEqual([false, true]);
     expect(result.steps[1]?.command).toBe("rm -rf build");
-    expect(result.notes.join(" ")).toContain("conditionally");
+    expect(result.context.join(" ")).toContain("conditionally");
+    expect(result.readOnly).toBeUndefined();
   });
 
   it("explains literal shell wrappers but never evaluates expansions or interpreted scripts", () => {
@@ -111,5 +133,51 @@ describe("plain-language command explanations", () => {
     const many = explainApprovalCommand(Array.from({ length: 20 }, () => "git status").join(";"));
     expect(many.steps).toHaveLength(6);
     expect(many.notes.join(" ")).toContain("More command parts");
+  });
+
+  it("leads with a read-only summary and keeps the shell wrapper out of the warnings", () => {
+    const result = explainApprovalCommand("/bin/zsh -lc 'cat brief.md'");
+    expect(result.readOnly?.summary).toBe("Expected to read only — shows brief.md.");
+    expect(result.wrapper).toEqual({ wrapper: "/bin/zsh -lc", script: "cat brief.md" });
+    expect(result.notes).toEqual([]);
+    expect(result.context).toContain("The shell's startup settings may also run commands.");
+    expect(result.steps[0]).toMatchObject({ explanation: "Shows brief.md.", unknown: false });
+  });
+
+  it("explains common read-only programs instead of calling them unknown", () => {
+    for (const command of [
+      "find src docs -type f | wc -l",
+      "grep -rn TODO src",
+      "ls -la",
+      "sed -n '1,20p' a.ts",
+      "git blame a.ts",
+      "git ls-files",
+      "node --version",
+    ]) {
+      const result = explainApprovalCommand(command);
+      expect(
+        result.steps.every((step) => !step.unknown && !step.caution),
+        command,
+      ).toBe(true);
+      expect(result.readOnly, command).toBeDefined();
+    }
+  });
+
+  it("explains search commands that run or delete without calling them read-only", () => {
+    const exec = explainApprovalCommand(
+      "find src docs -type f -not -path '*/node_modules/*' -exec wc -c {} +",
+    );
+    expect(exec.steps[0]).toMatchObject({ unknown: false, caution: false });
+    expect(exec.steps[0]?.explanation).toContain('runs "wc" on each match');
+    expect(exec.readOnly).toBeUndefined();
+    expect(explainApprovalCommand("find . -name '*.tmp' -delete").steps[0]?.caution).toBe(true);
+    expect(explainApprovalCommand("sed -i 's/a/b/' x.ts").steps[0]?.caution).toBe(true);
+    expect(explainApprovalCommand("cat a > b").readOnly).toBeUndefined();
+  });
+
+  it("does not trust zsh-only syntax that looks like plain text to a bash parser", () => {
+    const result = explainApprovalCommand("git diff =(rm -rf x)");
+    expect(result.steps[0]?.unknown).toBe(true);
+    expect(result.readOnly).toBeUndefined();
   });
 });

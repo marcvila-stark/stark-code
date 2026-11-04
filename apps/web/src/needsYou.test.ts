@@ -2,6 +2,7 @@ import { expect, it } from "vite-plus/test";
 import * as DateTime from "effect/DateTime";
 import {
   EnvironmentId,
+  ProviderInstanceId,
   RuntimeRequestId,
   ThreadId,
   type OrchestrationV2PendingRuntimeRequestSummary,
@@ -140,4 +141,65 @@ it("keeps native Codex input generic, labels explicit kinds, and removes resolve
     ]);
   }
   expect(collectNeedsYou([thread], [], [])).toEqual([]);
+});
+
+it("lists a lost decision beside a pending one until it is asked again or dismissed", () => {
+  const blocked = pending("lost-and-pending", "local", "command");
+  const thread = {
+    ...blocked,
+    source: {
+      ...blocked.source,
+      lostRuntimeRequest: {
+        id: RuntimeRequestId.make("request-lost"),
+        kind: "command" as const,
+        cause: "server_restart" as const,
+        lostAt: DateTime.makeUnsafe("2026-10-20T11:00:00Z"),
+      },
+    },
+  };
+  expect(collectNeedsYou([thread], [])).toMatchObject([
+    { requestId: "request-lost", kind: "lost" },
+    { requestId: "request-lost-and-pending", kind: "approval" },
+  ]);
+  // The shell drops the summary once the user asks again or dismisses it.
+  expect(
+    collectNeedsYou([{ ...thread, source: { ...thread.source, lostRuntimeRequest: null } }], []),
+  ).toMatchObject([{ kind: "approval" }]);
+  expect(collectNeedsYou([{ ...thread, deletedAt: "2026-10-20T12:00:00Z" }], [])).toEqual([]);
+});
+
+it("names a chat's provider by brand instead of its driver or instance id", () => {
+  const blocked = pending("claude-approval", "local", "command");
+  const runtime = (providerName: string | null) => ({
+    status: "running" as const,
+    activeRunId: null,
+    providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+    providerName,
+    lastError: null,
+    updatedAt: "2026-10-20T12:00:00Z",
+  });
+  const claude = { ...blocked, runtime: runtime("claudeAgent") };
+  const lost = {
+    ...claude,
+    source: {
+      ...claude.source,
+      pendingRuntimeRequest: null,
+      lostRuntimeRequest: {
+        id: RuntimeRequestId.make("request-lost"),
+        kind: "command" as const,
+        cause: "server_restart" as const,
+        lostAt: DateTime.makeUnsafe("2026-10-20T11:00:00Z"),
+      },
+    },
+  };
+  expect(collectNeedsYou([claude], []).map((entry) => entry.provider)).toEqual(["Claude"]);
+  expect(collectNeedsYou([lost], []).map((entry) => entry.provider)).toEqual(["Claude"]);
+  // Without a runtime, a default instance id still names its brand.
+  expect(collectNeedsYou([{ ...blocked, runtime: null }], [])[0]?.provider).toBe("Codex");
+  const custom = {
+    ...blocked,
+    runtime: null,
+    providerInstanceId: ProviderInstanceId.make("codex_work"),
+  };
+  expect(collectNeedsYou([custom], [])[0]?.provider).toBe("codex_work");
 });

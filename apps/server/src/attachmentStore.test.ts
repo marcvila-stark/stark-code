@@ -3,6 +3,8 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
+import * as DateTime from "effect/DateTime";
+
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -239,6 +241,41 @@ describe("attachmentStore", () => {
       expect(NodeFS.existsSync(threadPath)).toBe(true);
     } finally {
       NodeFS.rmSync(attachmentsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps aged uploads that drafts still reference across an update or restore", () => {
+    const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "starkcode-holds-"));
+    const attachmentsDir = NodePath.join(stateDir, "attachments");
+    NodeFS.mkdirSync(attachmentsDir);
+    try {
+      const now = 1_800_000_000_000;
+      const oldTimeSeconds = (now - 3 * 24 * 60 * 60 * 1000) / 1000;
+      const heldId = "pending-00000000-0000-4000-8000-000000000010";
+      const looseId = "pending-00000000-0000-4000-8000-000000000011";
+      const heldPath = NodePath.join(attachmentsDir, `${heldId}.png`);
+      const loosePath = NodePath.join(attachmentsDir, `${looseId}.png`);
+      for (const filePath of [heldPath, loosePath]) {
+        NodeFS.writeFileSync(filePath, Buffer.from("pixels"));
+        NodeFS.utimesSync(filePath, oldTimeSeconds, oldTimeSeconds);
+      }
+      const writeHold = (heldAt: string) =>
+        NodeFS.writeFileSync(
+          NodePath.join(stateDir, "attachment-holds.json"),
+          JSON.stringify({ version: 1, heldAt, attachmentIds: [heldId] }),
+        );
+
+      writeHold(DateTime.formatIso(DateTime.makeUnsafe(now - 2 * 24 * 60 * 60 * 1000)));
+      expect(sweepStalePendingAttachments({ attachmentsDir, nowMs: now })).toEqual({ deleted: 1 });
+      expect(NodeFS.existsSync(heldPath)).toBe(true);
+      expect(NodeFS.existsSync(loosePath)).toBe(false);
+
+      // A hold older than 30 days protects nothing.
+      writeHold(DateTime.formatIso(DateTime.makeUnsafe(now - 31 * 24 * 60 * 60 * 1000)));
+      expect(sweepStalePendingAttachments({ attachmentsDir, nowMs: now })).toEqual({ deleted: 1 });
+      expect(NodeFS.existsSync(heldPath)).toBe(false);
+    } finally {
+      NodeFS.rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });

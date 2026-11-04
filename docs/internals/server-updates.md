@@ -56,6 +56,45 @@ could lose the only successful RPC result. The client must then observe the
 prepared version after reconnecting. If installation fails, desktop restarts the
 stopped backends and replays the failure for the same token.
 
+## Desktop data protection
+
+Every process that opens the state database (the server and CLI `auth`, `pair`,
+`project` and `backup`) goes through
+[`StateAccess`](../../apps/server/src/persistence/StateAccess.ts), which holds
+`maintenance-owner.sqlite` shared for as long as the database is open. The
+desktop install handoff, a pre-migration backup and a restore take it
+exclusively, so every other opener is refused rather than writing behind them.
+The server ownership lock alone is not enough: CLI processes open the database
+without it. `maintenance.json` records what the exclusive holder was doing; the
+next opener settles a dead holder's intent (restore journal, unpublished backup
+staging) before it opens anything.
+
+[`StateCompatibility`](../../apps/server/src/persistence/StateCompatibility.ts)
+compares the recorded migration history with the build's by name on a read-only
+handle before the writable open, because the migrator skips every id up to the
+highest recorded one whatever its name. Packaged builds refuse a newer or
+divergent history with a terminal exit code; development builds keep starting.
+A pending migration always takes a fresh backup first: settings, sessions and
+schedules change without orchestration events, so no earlier snapshot can stand
+in for one.
+
+Before a desktop backend stops for an install, its
+[maintenance gate](../../apps/server/src/maintenance/MaintenanceGate.ts) refuses
+new root work at every source (dispatch, scheduler, Run now, webhooks, cleanup)
+while admitted work drains, then pauses effect claims. The pause sits before
+`claimNext` because the claim is what counts a retry attempt. A restore leaves
+`recovery-hold.json`, which holds scheduling, restart continuations, webhooks and
+cleanup on every boot until the user resumes, so a rolled-back `next_run_at` or
+continuation cannot replay external work.
+
+The desktop app that comes back after a failed update is older than the feed's
+latest version, so its updater would download and offer the failing version
+again. A failed migration, and a restore that rolls back a `pre-install`
+backup's target version, leave `failed-update.json` in the state directory,
+which a restore does not replace. The updater passes over exactly that version
+on background checks until a newer one appears; a check the user starts offers
+it.
+
 ## Recovering interrupted threads
 
 Restart continuation is an environment-owned preference, on by default. A

@@ -7,6 +7,7 @@ import {
   EventId,
   ProviderInstanceId,
   ProviderSessionId,
+  RuntimeRequestId,
   ThreadId,
   type OrchestrationProjectShell,
   type OrchestrationV2AppThread,
@@ -102,6 +103,13 @@ function shell(overrides: Partial<SettlementShell> = {}): SettlementShell {
     ...overrides,
   };
 }
+
+const lostDecision = {
+  id: RuntimeRequestId.make("request:lost"),
+  kind: "command" as const,
+  cause: "server_restart" as const,
+  lostAt: at(-DAY_MS),
+};
 
 describe("isAutoSettlementCandidate", () => {
   it("excludes overridden, pinned, blocked, and working threads", () => {
@@ -524,7 +532,14 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
   const snapshotReadCount = yield* Ref.make(0);
   const snapshotReads = yield* Queue.unbounded<number>();
   const candidateReads = yield* Ref.make<ReadonlyArray<string | undefined>>([]);
-  const settings = yield* Ref.make(options.settings ?? DEFAULT_SERVER_SETTINGS);
+  // Auto-settlement is off by default; the harness turns it on unless a test sets its own.
+  const settings = yield* Ref.make(
+    options.settings ?? {
+      ...DEFAULT_SERVER_SETTINGS,
+      sidebarAutoSettleOnMerge: true,
+      sidebarAutoSettleAfterDays: 3,
+    },
+  );
   const settingsChanges = yield* PubSub.unbounded<ContractServerSettings>();
   const mergedPullRequests = yield* PubSub.unbounded<PullRequestService.PullRequestMergeEvent>();
   const commands = yield* Ref.make<ReadonlyArray<AutoSettleCommand>>([]);
@@ -723,7 +738,11 @@ describe("ThreadSettlementServiceV2 worker", () => {
         });
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([thread]),
-          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: null },
+          settings: {
+            ...DEFAULT_SERVER_SETTINGS,
+            sidebarAutoSettleAfterDays: null,
+            sidebarAutoSettleOnMerge: true,
+          },
         });
 
         yield* Effect.gen(function* () {
@@ -1293,5 +1312,31 @@ describe("isSnoozed", () => {
     expect(
       ThreadSettlementService.isSnoozed(shell({ ...snoozed, snoozedUntil: at(-1) }), NOW_MS),
     ).toBe(false);
+  });
+
+  it("wakes for a decision lost to a restart", () => {
+    expect(
+      ThreadSettlementService.isSnoozed(
+        shell({ ...snoozed, status: "cancelled", lostRuntimeRequest: lostDecision }),
+        NOW_MS,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("lost decisions", () => {
+  it("keep a thread out of automatic settlement until asked again or dismissed", () => {
+    expect(
+      ThreadSettlementService.isAutoSettlementCandidate(
+        shell({ status: "cancelled", lostRuntimeRequest: lostDecision }),
+        NOW_MS,
+      ),
+    ).toBe(false);
+    expect(
+      ThreadSettlementService.isAutoSettlementCandidate(
+        shell({ status: "cancelled", lostRuntimeRequest: null }),
+        NOW_MS,
+      ),
+    ).toBe(true);
   });
 });

@@ -9,6 +9,12 @@ import {
   supportsEnvironmentUpdate,
 } from "./environment-maintenance";
 
+// Check channel selection against a fake index; the real local build has no release index.
+vi.mock("@starkfuture/shared/cliRelease", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@starkfuture/shared/cliRelease")>()),
+  cliReleaseIndexPageUrl: (page: number) => `https://releases.example.test/index?page=${page}`,
+}));
+
 const provider = Schema.decodeUnknownSync(ServerProvider)({
   instanceId: "codex-personal",
   driver: "codex",

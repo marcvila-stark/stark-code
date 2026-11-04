@@ -110,7 +110,9 @@ const seed = Effect.gen(function* () {
       projectId: ProjectId.make("project:permission-tests"),
       title: "Permissions",
       modelSelection: { instanceId, model: "gpt-5" },
-      runtimeMode: "full-access",
+      // Codex runs Supervised under the brand, so that is all either thread
+      // holds; a stored Bypass would refuse the caller before the boundary here.
+      runtimeMode: "approval-required",
       interactionMode: "default",
       branch: null,
       worktreePath: null,
@@ -167,6 +169,38 @@ const seed = Effect.gen(function* () {
           resolvedAt: null,
         },
       });
+      if (kind === "permission") {
+        // The approval card carries the choices an answer is checked against.
+        yield* projections.apply({
+          id: EventId.make(`item:${requestId}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`item:${requestId}`),
+            threadId,
+            runId: null,
+            nodeId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "waiting",
+            title: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+            type: "approval_request",
+            requestId,
+            requestKind: "permission",
+            options: [
+              { decision: "accept", label: "Allow once" },
+              { decision: "decline", label: "Deny" },
+            ],
+          },
+        });
+      }
       if (kind === "user_input") {
         yield* projections.apply({
           id: EventId.make(`item:${requestId}`),
@@ -198,13 +232,20 @@ const seed = Effect.gen(function* () {
   }
 });
 
+// The tables orchestration V2 writes: its events and receipts share the
+// application event log; only the effect outbox keeps a V2 table.
 const durableCounts = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  return yield* sql`
-    SELECT (SELECT COUNT(*) FROM orchestration_v2_events) AS events,
-      (SELECT COUNT(*) FROM orchestration_v2_command_receipts) AS receipts,
+  const [counts] = yield* sql<{
+    readonly events: number;
+    readonly receipts: number;
+    readonly effects: number;
+  }>`
+    SELECT (SELECT COUNT(*) FROM orchestration_events) AS events,
+      (SELECT COUNT(*) FROM orchestration_command_receipts) AS receipts,
       (SELECT COUNT(*) FROM orchestration_v2_effect_outbox) AS effects
   `;
+  return counts!;
 });
 
 it.layer(orchestration)("MCP pending request permission boundary", (it) => {
@@ -215,6 +256,9 @@ it.layer(orchestration)("MCP pending request permission boundary", (it) => {
         yield* seed;
         const projections = yield* ProjectionStore.ProjectionStoreV2;
         const before = yield* durableCounts;
+        // The seed's own commands are counted, so a write below would show.
+        assert.isAbove(before.events, 0);
+        assert.isAbove(before.receipts, 0);
         const outsideAgent = {
           ...scope,
           thread: undefined,

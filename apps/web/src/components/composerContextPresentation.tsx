@@ -292,7 +292,15 @@ function ComposerReviewCommentDetails({ comment }: { comment: ReviewCommentConte
       </div>
       {comment.text.trim() ? <ChatMarkdown text={comment.text.trim()} cwd={undefined} /> : null}
       {comment.diff.trim() ? (
-        <div className="flex h-64 min-h-0 flex-col overflow-hidden rounded-md border border-border">
+        <div
+          className="flex min-h-0 flex-col overflow-hidden rounded-md border border-border"
+          style={{
+            height: Math.min(
+              256,
+              Math.max(80, comment.diff.trimEnd().split("\n").length * 20 + 24),
+            ),
+          }}
+        >
           <ReadOnlySourcePreview name="review.diff" text={comment.diff} />
         </div>
       ) : null}

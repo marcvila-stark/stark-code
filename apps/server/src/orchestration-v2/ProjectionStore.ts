@@ -1,6 +1,6 @@
 import { selectThreadTurnIndexPage } from "./threadTurnIndex.ts";
 import { applyThreadPullRequestLinkUpdate } from "@starkfuture/shared/threadPullRequests";
-import { projectTurnItemForWire } from "./WireProjection.ts";
+import { dropResolvedApprovalPreview, projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import { makeThreadFind, findProjectedThreadItems } from "./ThreadFind.ts";
 import type {
@@ -60,6 +60,7 @@ import {
   OrchestrationV2SubagentJson as OrchestrationV2SubagentJsonSchema,
   OrchestrationV2TurnItemJson as OrchestrationV2TurnItemJsonSchema,
   orchestrationV2RunWorkStartedAt,
+  permissionSourceOf,
   RunId,
   MessageId,
   RuntimeRequestId,
@@ -73,6 +74,7 @@ import {
   isOrchestrationV2SupersededInterrupt,
 } from "@starkfuture/shared/orchestrationV2Timeline";
 import { derivePendingBackgroundWork } from "@starkfuture/shared/orchestrationV2PendingBackgroundWork";
+import { openLostRuntimeRequests } from "@starkfuture/shared/orchestrationV2LostRequests";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -209,6 +211,7 @@ export type ProjectionSettlementCandidate = Pick<
   | "activityRunStatus"
   | "pendingRuntimeRequest"
   | "pendingBackgroundTasks"
+  | "lostRuntimeRequest"
 > &
   Pick<OrchestrationV2AppThread, "lastSnoozeWakeAt"> & {
     readonly latestUserAuthoredMessageAt: DateTime.Utc | null;
@@ -228,9 +231,10 @@ const ProjectionCheckpointContext = Schema.Struct({
   ),
   checkpoints: Schema.Array(
     OrchestrationV2CheckpointJsonSchema.mapFields(
-      ({ scopeId, runId, appRunOrdinal, status, ref }) => ({
+      ({ scopeId, runId, ordinalWithinScope, appRunOrdinal, status, ref }) => ({
         scopeId,
         runId,
+        ordinalWithinScope,
         appRunOrdinal,
         status,
         ref,
@@ -491,9 +495,15 @@ export interface ProjectionStoreV2Shape {
     threadId: ThreadId,
     targetInstanceId?: ProviderInstanceId,
   ) => Effect.Effect<ProjectionThreadProviderContext, ProjectionStoreV2Error>;
+  /**
+   * A request with its node, card and live session. `unstoredNodeId` finds the
+   * node and card of a request that is not stored yet (its provider closed it
+   * while it was being published).
+   */
   readonly getRuntimeResponseContext: (
     threadId: ThreadId,
     requestId: RuntimeRequestId,
+    unstoredNodeId?: NodeId,
   ) => Effect.Effect<ProjectionRuntimeResponseContext, ProjectionStoreV2Error>;
   readonly getCheckpointContext: (
     threadId: ThreadId,
@@ -753,6 +763,8 @@ export function applyToProjection(
     case "thread.interaction-mode-updated":
     case "thread.model-selection-updated":
     case "thread.provider-switched":
+    case "thread.permission-updated":
+    case "thread.permission-migrated":
       return {
         ...base,
         thread: event.payload,
@@ -855,7 +867,7 @@ export function applyToProjection(
     case "turn-item.updated":
       return withLocalVisibleTurnItems({
         ...base,
-        turnItems: upsertById(base.turnItems, event.payload),
+        turnItems: upsertById(base.turnItems, dropResolvedApprovalPreview(event.payload)),
       });
     case "plan.updated":
       return {
@@ -884,6 +896,12 @@ export function applyToProjection(
       return {
         ...base,
         contextTransfers: upsertById(base.contextTransfers, event.payload),
+      };
+    case "runtime-request.asked-again":
+    case "runtime-request.lost-dismissed":
+      return {
+        ...base,
+        runtimeRequests: upsertById(base.runtimeRequests, event.payload),
       };
   }
 }
@@ -1010,6 +1028,7 @@ type ShellThreadRow = {
   readonly has_actionable_proposed_plan: number;
   readonly item_count: number;
   readonly runless_item_count: number;
+  readonly lost_request_payload_json: string | null;
 };
 
 type ShellRunRow = {
@@ -1487,6 +1506,9 @@ export function threadShellFromProjection(
     modelSelection: projection.thread.modelSelection,
     runtimeMode: projection.thread.runtimeMode,
     interactionMode: projection.thread.interactionMode,
+    ...(projection.thread.permissionSource === undefined
+      ? {}
+      : { permissionSource: projection.thread.permissionSource }),
     branch: projection.thread.branch,
     worktreePath: projection.thread.worktreePath,
     ...(projection.thread.localSession === undefined
@@ -1565,6 +1587,63 @@ export function threadShellFromProjection(
     titleRegeneration: projection.thread.titleRegeneration ?? null,
     limitRecovery: projection.thread.limitRecovery ?? null,
     deletedAt: projection.thread.deletedAt,
+    lostRuntimeRequest: lostRuntimeRequestForShell(
+      openLostRuntimeRequests(projection.runtimeRequests).at(-1) ?? null,
+    ),
+  };
+}
+
+/** The shell summary of a thread's newest open lost request. */
+function lostRuntimeRequestForShell(
+  request: OrchestrationV2ThreadProjection["runtimeRequests"][number] | null,
+): OrchestrationV2ThreadShell["lostRuntimeRequest"] {
+  if (request?.lost === undefined) return null;
+  return {
+    id: request.id,
+    kind: request.kind,
+    cause: request.lost.cause,
+    lostAt: request.lost.lostAt,
+    ...(request.lost.deliveryUncertain === true ? { deliveryUncertain: true } : {}),
+  };
+}
+
+/** Records that explain a thread's open lost requests, whatever their age. */
+type OpenLostRuntimeRequestRecords = Pick<
+  OrchestrationV2ThreadProjection,
+  "runtimeRequests" | "nodes" | "turnItems"
+>;
+
+/**
+ * Adds open lost requests and their records to a history window. The timeline
+ * is left alone: the window's visible rows and cursor do not change.
+ */
+function withOpenLostRuntimeRequestRecords(
+  projection: OrchestrationV2ThreadProjection,
+  records: OpenLostRuntimeRequestRecords,
+): OrchestrationV2ThreadProjection {
+  const missing = <Row extends { readonly id: string }>(
+    loaded: ReadonlyArray<Row>,
+    extra: ReadonlyArray<Row>,
+  ) => {
+    const ids = new Set(loaded.map((row) => row.id));
+    return extra.filter((row) => !ids.has(row.id));
+  };
+  const runtimeRequests = missing(projection.runtimeRequests, records.runtimeRequests);
+  const nodes = missing(projection.nodes, records.nodes);
+  const turnItems = missing(projection.turnItems, records.turnItems);
+  if (runtimeRequests.length + nodes.length + turnItems.length === 0) return projection;
+  return {
+    ...projection,
+    runtimeRequests: [...projection.runtimeRequests, ...runtimeRequests].toSorted(
+      (left, right) =>
+        DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
+        (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    ),
+    nodes: [...projection.nodes, ...nodes],
+    turnItems: [...projection.turnItems, ...turnItems].toSorted(
+      (left, right) =>
+        left.ordinal - right.ordinal || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    ),
   };
 }
 
@@ -1641,6 +1720,7 @@ type ShellThreadState = {
   readonly updatedAt: OrchestrationV2ThreadProjection["updatedAt"];
   readonly runOrdinalById: ReadonlyMap<RunId, number>;
   readonly itemCountByRunId: ReadonlyMap<RunId, number>;
+  readonly lostRuntimeRequest: OrchestrationV2ThreadProjection["runtimeRequests"][number] | null;
 };
 
 function shellStatusFromStoredRunStatus(status: string | null): OrchestrationV2ShellThreadStatus {
@@ -1758,6 +1838,9 @@ function shellFromState(input: {
     modelSelection: input.state.thread.modelSelection,
     runtimeMode: input.state.thread.runtimeMode,
     interactionMode: input.state.thread.interactionMode,
+    ...(input.state.thread.permissionSource === undefined
+      ? {}
+      : { permissionSource: input.state.thread.permissionSource }),
     branch: input.state.thread.branch,
     worktreePath: input.state.thread.worktreePath,
     ...(input.state.thread.localSession === undefined
@@ -1823,6 +1906,7 @@ function shellFromState(input: {
     titleRegeneration: input.state.thread.titleRegeneration ?? null,
     limitRecovery: input.state.thread.limitRecovery ?? null,
     deletedAt: input.state.thread.deletedAt,
+    lostRuntimeRequest: lostRuntimeRequestForShell(input.state.lostRuntimeRequest),
   };
 }
 
@@ -1877,7 +1961,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           case "thread.runtime-mode-updated":
           case "thread.interaction-mode-updated":
           case "thread.model-selection-updated":
-          case "thread.provider-switched": {
+          case "thread.provider-switched":
+          case "thread.permission-updated":
+          case "thread.permission-migrated": {
             const payloadJson = yield* encodeThreadPayload(event.payload);
             const payload = parseEncodedPayload(payloadJson);
             yield* sql`
@@ -1894,7 +1980,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 updated_at,
                 archived_at,
                 deleted_at,
-                payload_json
+                payload_json,
+                permission_source
               )
               VALUES (
                 ${event.payload.id},
@@ -1909,7 +1996,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ${stringField(payload, "updatedAt")},
                 ${nullableStringField(payload, "archivedAt")},
                 ${nullableStringField(payload, "deletedAt")},
-                ${payloadJson}
+                ${payloadJson},
+                ${permissionSourceOf(event.payload)}
               )
               ON CONFLICT(thread_id)
               DO UPDATE SET
@@ -1924,7 +2012,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 updated_at = excluded.updated_at,
                 archived_at = excluded.archived_at,
                 deleted_at = excluded.deleted_at,
-                payload_json = excluded.payload_json
+                payload_json = excluded.payload_json,
+                permission_source = excluded.permission_source
             `;
             break;
           }
@@ -2462,7 +2551,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             break;
           }
           case "turn-item.updated": {
-            const payloadJson = yield* encodeTurnItemPayload(event.payload);
+            const payloadJson = yield* encodeTurnItemPayload(
+              dropResolvedApprovalPreview(event.payload),
+            );
             const payload = parseEncodedPayload(payloadJson);
             yield* sql`
               INSERT INTO orchestration_v2_projection_turn_items (
@@ -2686,6 +2777,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             `;
             break;
           }
+          // The payload is the whole request; the upsert also touches the thread.
+          case "runtime-request.asked-again":
+          case "runtime-request.lost-dismissed":
+            return yield* apply({ ...event, type: "runtime-request.updated" });
         }
 
         if (
@@ -2707,7 +2802,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           event.type !== "thread.runtime-mode-updated" &&
           event.type !== "thread.interaction-mode-updated" &&
           event.type !== "thread.model-selection-updated" &&
-          event.type !== "thread.provider-switched"
+          event.type !== "thread.provider-switched" &&
+          event.type !== "thread.permission-updated" &&
+          event.type !== "thread.permission-migrated"
         ) {
           // Only the activity timestamp changes. This runs for every streamed
           // run, node and turn-item event, so the thread row is patched in place
@@ -3675,6 +3772,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 UNION
                 SELECT thread_id FROM orchestration_v2_projection_runtime_requests
                 WHERE status = 'pending'
+                  -- An answer whose delivery was never reported.
+                  OR (status = 'resolved' AND CASE WHEN json_valid(payload_json)
+                    THEN json_extract(payload_json, '$.delivery.state') = 'pending'
+                    ELSE 0 END)
                 UNION
                 SELECT bindings.thread_id
                 FROM orchestration_v2_projection_provider_sessions AS sessions
@@ -4237,7 +4338,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             `,
           sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_runtime_requests
-              WHERE thread_id = ${threadId} AND status = 'pending'
+              WHERE thread_id = ${threadId}
+                AND (status = 'pending'
+                  -- An answer whose delivery was never reported.
+                  OR (status = 'resolved' AND CASE WHEN json_valid(payload_json)
+                    THEN json_extract(payload_json, '$.delivery.state') = 'pending'
+                    ELSE 0 END))
               ORDER BY created_at ASC, runtime_request_id ASC
             `,
           sql<PayloadRow>`
@@ -4271,6 +4377,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                         AND status IN ('pending', 'running', 'waiting')
                     )
                   )
+                  -- A request recovery marks lost is retitled even when no cut run owns it.
+                  OR item.type IN ('approval_request', 'user_input_request')
                 )
               ORDER BY item.ordinal ASC, item.turn_item_id ASC
             `,
@@ -4586,24 +4694,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const getRuntimeResponseContext: ProjectionStoreV2Shape["getRuntimeResponseContext"] = (
       threadId,
       requestId,
+      unstoredNodeId,
     ) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
             yield* requireThread(threadId);
             const request = yield* getRuntimeRequest(threadId, requestId);
-            if (request === undefined)
+            const nodeId = request?.nodeId ?? unstoredNodeId;
+            if (nodeId === undefined)
               return { request, node: undefined, item: undefined, session: undefined };
             const nodeRows =
               yield* sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_nodes
-          WHERE thread_id = ${threadId} AND node_id = ${request.nodeId}`;
+          WHERE thread_id = ${threadId} AND node_id = ${nodeId}`;
             const itemRows =
               yield* sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_turn_items
-          WHERE thread_id = ${threadId} AND node_id = ${request.nodeId} AND type IN ('approval_request', 'user_input_request')
+          WHERE thread_id = ${threadId} AND node_id = ${nodeId} AND type IN ('approval_request', 'user_input_request')
             AND json_extract(payload_json, '$.requestId') = ${requestId}
           ORDER BY ordinal ASC LIMIT 1`;
             const sessionRows =
-              request.responseCapability.type !== "live"
+              request === undefined || request.responseCapability.type !== "live"
                 ? []
                 : yield* sql<PayloadRow>`
           SELECT session.payload_json FROM orchestration_v2_projection_provider_sessions AS session
@@ -4658,6 +4768,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             `,
               sql`
               SELECT scope_id AS "scopeId", run_id AS "runId",
+                ordinal_within_scope AS "ordinalWithinScope",
                 app_run_ordinal AS "appRunOrdinal", status,
                 json_extract(payload_json, '$.ref') AS ref
               FROM orchestration_v2_projection_checkpoints
@@ -5219,6 +5330,47 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
         );
 
+    // An open lost request is shown until the user acts on it, so a history
+    // window carries it with its node, its own item and the command item its
+    // node hangs off (what lostRuntimeRequestDetail reads), however old.
+    // Mirrors isOpenLostRuntimeRequest; lost requests are expired or cancelled.
+    const readOpenLostRuntimeRequestRecords = (threadId: ThreadId) =>
+      Effect.gen(function* () {
+        const runtimeRequests = yield* sql<PayloadRow>`
+          SELECT payload_json FROM orchestration_v2_projection_runtime_requests
+          WHERE thread_id = ${threadId}
+            AND status IN ('expired', 'cancelled')
+            AND json_type(payload_json, '$.lost') IS NOT NULL
+            AND json_type(payload_json, '$.lost.askedAgainAt') IS NULL
+            AND json_type(payload_json, '$.lost.dismissedAt') IS NULL
+          ORDER BY created_at ASC, runtime_request_id ASC
+        `.pipe(Effect.flatMap(decodeRows(decodeRuntimeRequestPayload, threadId)));
+        if (runtimeRequests.length === 0) {
+          return { runtimeRequests, nodes: [], turnItems: [] };
+        }
+        const nodes = yield* sql<PayloadRow>`
+          SELECT payload_json FROM orchestration_v2_projection_nodes
+          WHERE thread_id = ${threadId}
+            AND node_id IN (SELECT value FROM json_each(${encodeIdList(runtimeRequests.map((request) => request.nodeId))}))
+          ORDER BY COALESCE(started_at, ''), node_id ASC
+        `.pipe(Effect.flatMap(decodeRows(decodeNodePayload, threadId)));
+        const commandNodeIds = nodes.flatMap((node) =>
+          node.parentNodeId === null ? [] : [node.parentNodeId],
+        );
+        const turnItems = yield* sql<PayloadRow>`
+          SELECT payload_json FROM orchestration_v2_projection_turn_items
+          WHERE thread_id = ${threadId}
+            AND (
+              (node_id IN (SELECT value FROM json_each(${encodeIdList(nodes.map((node) => node.id))}))
+                AND type IN ('approval_request', 'user_input_request'))
+              OR (node_id IN (SELECT value FROM json_each(${encodeIdList(commandNodeIds)}))
+                AND type = 'command_execution')
+            )
+          ORDER BY ordinal ASC, turn_item_id ASC
+        `.pipe(Effect.flatMap(decodeRows(decodeTurnItemPayload, threadId)));
+        return { runtimeRequests, nodes, turnItems } satisfies OpenLostRuntimeRequestRecords;
+      });
+
     const getThreadSnapshotWindow: ProjectionStoreV2Shape["getThreadSnapshotWindow"] = (
       threadId,
       options,
@@ -5249,6 +5401,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 : {}),
               ...(historyAnchor === undefined ? {} : { historyAnchor }),
             });
+            const lostRecords = yield* readOpenLostRuntimeRequestRecords(threadId);
             const rows = yield* sql<{ readonly snapshot_sequence: number | null }>`
               SELECT MAX(sequence) AS snapshot_sequence
               FROM orchestration_events
@@ -5259,7 +5412,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             return {
               schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
               snapshotSequence: rows[0]?.snapshot_sequence ?? 0,
-              projection,
+              projection: withOpenLostRuntimeRequestRecords(projection, lostRecords),
             };
           }),
         )
@@ -5419,7 +5572,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 FROM orchestration_v2_projection_turn_items i
                 WHERE i.thread_id = t.thread_id
                   AND i.run_id IS NULL
-              ) AS runless_item_count
+              ) AS runless_item_count,
+              (
+                -- Mirrors openLostRuntimeRequests(...).at(-1). Lost requests are
+                -- closed (expired or cancelled), so the status index skips the
+                -- resolved and pending rows.
+                SELECT request.payload_json
+                FROM orchestration_v2_projection_runtime_requests request
+                WHERE request.thread_id = t.thread_id
+                  AND request.status IN ('expired', 'cancelled')
+                  AND json_type(request.payload_json, '$.lost') IS NOT NULL
+                  AND json_type(request.payload_json, '$.lost.askedAgainAt') IS NULL
+                  AND json_type(request.payload_json, '$.lost.dismissedAt') IS NULL
+                ORDER BY json_extract(request.payload_json, '$.lost.lostAt') DESC,
+                  request.created_at DESC, request.runtime_request_id DESC
+                LIMIT 1
+              ) AS lost_request_payload_json
             FROM orchestration_v2_projection_threads t
             -- The newest run not waiting in a held queue, matching latestUnheldRun.
             LEFT JOIN orchestration_v2_projection_runs presented ON presented.run_id = (
@@ -5635,6 +5803,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 SELECT 1 FROM orchestration_v2_projection_runtime_requests request
                 WHERE request.thread_id = t.thread_id AND request.status = 'pending'
               )
+              -- An open lost decision blocks like a pending one (isOpenLostRuntimeRequest).
+              AND NOT EXISTS (
+                SELECT 1 FROM orchestration_v2_projection_runtime_requests request
+                WHERE request.thread_id = t.thread_id
+                  AND request.status IN ('expired', 'cancelled')
+                  AND json_type(request.payload_json, '$.lost') IS NOT NULL
+                  AND json_type(request.payload_json, '$.lost.askedAgainAt') IS NULL
+                  AND json_type(request.payload_json, '$.lost.dismissedAt') IS NULL
+              )
             ORDER BY t.updated_at ASC, t.thread_id ASC
           `;
             if (rows.length === 0) return [];
@@ -5682,6 +5859,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   activityRunStatus: null,
                   activityRunStartedAt: null,
                   pendingRuntimeRequest: null,
+                  lostRuntimeRequest: null,
                   pendingBackgroundTasks: derivePendingBackgroundWork({
                     latestRun:
                       latestRunId === null || status === "idle"
@@ -5865,6 +6043,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           updatedAt: thread.updatedAt,
           runOrdinalById: runOrdinalsByThreadId.get(ThreadId.make(row.thread_id)) ?? new Map(),
           itemCountByRunId: itemCountsByThreadId.get(ThreadId.make(row.thread_id)) ?? new Map(),
+          lostRuntimeRequest:
+            row.lost_request_payload_json === null
+              ? null
+              : yield* decodeRuntimeRequestPayload(row.lost_request_payload_json),
         } satisfies ShellThreadState;
       });
 
@@ -6502,18 +6684,19 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                   ),
           };
         }),
-      getRuntimeResponseContext: (threadId, requestId) =>
+      getRuntimeResponseContext: (threadId, requestId, unstoredNodeId) =>
         Effect.gen(function* () {
           const projection = (yield* Ref.get(replayState)).projections.get(threadId);
           if (projection === undefined)
             return yield* new ProjectionStoreThreadNotFoundError({ threadId });
           const request = projection.runtimeRequests.find((request) => request.id === requestId);
+          const nodeId = request?.nodeId ?? unstoredNodeId;
           return {
             request,
-            node: projection.nodes.find((node) => node.id === request?.nodeId),
+            node: projection.nodes.find((node) => node.id === nodeId),
             item: projection.turnItems.find(
               (item) =>
-                item.nodeId === request?.nodeId &&
+                item.nodeId === nodeId &&
                 (item.type === "approval_request" || item.type === "user_input_request") &&
                 item.requestId === requestId,
             ),
@@ -6539,9 +6722,10 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               cwd,
             })),
             checkpoints: projection.checkpoints.map(
-              ({ scopeId, runId, appRunOrdinal, status, ref }) => ({
+              ({ scopeId, runId, ordinalWithinScope, appRunOrdinal, status, ref }) => ({
                 scopeId,
                 runId,
+                ordinalWithinScope,
                 appRunOrdinal,
                 status,
                 ref,
@@ -6813,4 +6997,45 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
 
     return service;
   }),
+);
+
+/**
+ * Admitted work that keeps a backend from being stopped for an update: runs
+ * that have not ended, requests a person owes an answer, provider threads that
+ * are active or still report background tasks, and executing effects. Idle
+ * provider sessions do not count. Mirrors the "runtime" recovery query; see
+ * `maintenance/MaintenanceGate.ts`.
+ */
+export const readMaintenanceBlockers = Effect.fn("ProjectionStore.readMaintenanceBlockers")(
+  function* () {
+    const sql = yield* SqlClient.SqlClient;
+    return yield* sql<{
+      readonly kind: "run" | "pending-request" | "provider-work" | "effect";
+      readonly id: string;
+      readonly thread_id: string | null;
+    }>`
+      SELECT 'run' AS kind, run_id AS id, thread_id
+      FROM orchestration_v2_projection_runs
+      WHERE status IN ('preparing', 'starting', 'running', 'waiting')
+      UNION ALL
+      SELECT 'pending-request' AS kind, runtime_request_id AS id, thread_id
+      FROM orchestration_v2_projection_runtime_requests
+      WHERE status = 'pending'
+        AND kind NOT IN ('dynamic_tool_call', 'auth_refresh')
+        AND CASE WHEN json_valid(payload_json)
+          THEN coalesce(json_extract(payload_json, '$.responseCapability.type'), '') != 'message'
+          ELSE 1 END
+      UNION ALL
+      SELECT 'provider-work' AS kind, provider_thread_id AS id, thread_id
+      FROM orchestration_v2_projection_provider_threads
+      WHERE status = 'active'
+        OR CASE WHEN json_valid(payload_json)
+          THEN coalesce(json_array_length(payload_json, '$.pendingBackgroundTasks'), 0) > 0
+          ELSE 0 END
+      UNION ALL
+      SELECT 'effect' AS kind, effect_id AS id, thread_id
+      FROM orchestration_v2_effect_outbox
+      WHERE status = 'running'
+    `;
+  },
 );

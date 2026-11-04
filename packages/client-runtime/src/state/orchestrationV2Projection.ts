@@ -226,6 +226,8 @@ export function applyOrchestrationV2ProjectionEvent(
     case "thread.interaction-mode-updated":
     case "thread.model-selection-updated":
     case "thread.provider-switched":
+    case "thread.permission-updated":
+    case "thread.permission-migrated":
       return { ...base, thread: event.payload };
     // Visited tracking is read state, not activity: skip the updatedAt bump.
     case "thread.visited":
@@ -328,5 +330,9 @@ export function applyOrchestrationV2ProjectionEvent(
     case "context-transfer.created":
     case "context-transfer.updated":
       return { ...base, contextTransfers: upsertEntity(base.contextTransfers, event.payload) };
+    // The payload is the whole lost request with its Ask again or Dismiss time.
+    case "runtime-request.asked-again":
+    case "runtime-request.lost-dismissed":
+      return { ...base, runtimeRequests: upsertEntity(base.runtimeRequests, event.payload) };
   }
 }

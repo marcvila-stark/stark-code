@@ -234,3 +234,39 @@ describe("nextRemoteDesktopUpdateStep", () => {
     assert.equal(normalizeRemoteUpdateReason("  feed unreachable  "), "feed unreachable");
   });
 });
+
+describe("nextRemoteDesktopUpdateStep with restart preconditions", () => {
+  it("waits while a download is checked or a restart is being prepared", () => {
+    for (const status of ["verifying", "preparing", "restarting"] as const) {
+      assert.deepEqual(
+        nextRemoteDesktopUpdateStep(
+          makeState({ status, availableVersion: "1.2.4" }),
+          NO_ATTEMPTS,
+          null,
+        ),
+        { action: "wait" },
+      );
+    }
+  });
+
+  it("reports a blocked restart instead of asking again", () => {
+    const blocked = makeState({
+      status: "downloaded",
+      downloadedVersion: "1.2.4",
+      message: "Stark Code can't restart yet: 1 task is running.",
+      installBlockers: [{ kind: "active-task", message: "A task is running.", count: 1 }],
+    });
+    // A block left by an earlier local attempt does not stop this run's first try.
+    assert.deepEqual(nextRemoteDesktopUpdateStep(blocked, NO_ATTEMPTS, null), {
+      action: "install",
+    });
+    assert.deepEqual(
+      nextRemoteDesktopUpdateStep(blocked, { checks: 0, downloads: 0, installs: 1 }, null),
+      {
+        action: "done",
+        outcome: "failed",
+        reason: "Stark Code can't restart yet: 1 task is running.",
+      },
+    );
+  });
+});

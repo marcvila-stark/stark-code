@@ -171,6 +171,8 @@ import {
   OrchestrationSearchThreadsError,
   OrchestrationSearchThreadsInput,
   OrchestrationSearchThreadsResult,
+  OrchestrationSearchThreadHistoryInput,
+  OrchestrationSearchThreadHistoryResult,
 } from "./threadSearch.ts";
 import {
   ProviderUploadFeedbackError,
@@ -194,6 +196,8 @@ import {
 } from "./mcpServers.ts";
 import {
   ReadPermissionRulesInput,
+  ReadEffectivePermissionsInput,
+  EffectivePermissions,
   ForgetPermissionRuleInput,
   ReadPermissionRulesResult,
   PermissionRulesError,
@@ -336,6 +340,7 @@ import {
   DeviceShutdownInput,
 } from "./device.ts";
 import {} from "./previewAutomation.ts";
+import { PreviewBrowserStatus } from "./previewBrowser.ts";
 import {
   ServerConfigStreamEvent,
   DesktopUpdateCommitInput,
@@ -394,6 +399,8 @@ import {
   ScheduledTaskListWebhookDeliveriesResult,
   ScheduledTaskGetWebhookDeliveryInput,
   ScheduledTaskGetWebhookDeliveryResult,
+  ScheduledTaskListRunsInput,
+  ScheduledTaskListRunsResult,
   ScheduledTaskRunNowResult,
   ScheduledTaskSetEnabledInput,
   ScheduledTaskUpsertInput,
@@ -468,6 +475,7 @@ export const WS_METHODS = {
   providerReadSessionCatalog: "provider.readSessionCatalog",
   providerReadPermissionRules: "provider.readPermissionRules",
   providerForgetPermissionRule: "provider.forgetPermissionRule",
+  providerReadEffectivePermissions: "provider.readEffectivePermissions",
   checkpointRollbackPreview: "checkpoint.rollback.preview",
   checkpointRestoreFiles: "checkpoint.restoreFiles",
   checkpointUndoRestore: "checkpoint.undoRestore",
@@ -557,6 +565,8 @@ export const WS_METHODS = {
   serverRemoveKeybinding: "server.removeKeybinding",
   serverRunStorageCleanup: "server.runStorageCleanup",
   serverGetStorageCleanupReport: "server.getStorageCleanupReport",
+  serverInstallPreviewBrowser: "server.installPreviewBrowser",
+  serverGetPreviewBrowserStatus: "server.getPreviewBrowserStatus",
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
   serverDiscoverSourceControl: "server.discoverSourceControl",
@@ -596,6 +606,7 @@ export const WS_METHODS = {
   secretsAnswerRequest: "secrets.answerRequest",
   scheduledTasksListWebhookDeliveries: "scheduledTasks.listWebhookDeliveries",
   scheduledTasksGetWebhookDelivery: "scheduledTasks.getWebhookDelivery",
+  scheduledTasksListRuns: "scheduledTasks.listRuns",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -694,8 +705,9 @@ const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, 
      */
     instanceId: Schema.optional(ProviderInstanceId),
     cwd: Schema.optional(TrimmedNonEmptyString),
-    /** With `instanceId` and `cwd`: rescan the workspace's skills and slash
-     * commands even when a snapshot for that cwd already exists. */
+    /** With `instanceId`: bypass that instance's probe cache for an explicit
+     * refresh. With `cwd` too: also rescan its workspace skills and slash commands
+     * even when a snapshot for that cwd already exists. */
     fresh: Schema.optional(Schema.Boolean),
     /** Explicit user request: bypass Stark-owned caches and rediscover models.
      * Background status refreshes must not open agent sessions. */
@@ -831,6 +843,20 @@ const WsServerRunStorageCleanupRpc = Rpc.make(WS_METHODS.serverRunStorageCleanup
 const WsServerGetStorageCleanupReportRpc = Rpc.make(WS_METHODS.serverGetStorageCleanupReport, {
   payload: Schema.Struct({}),
   success: Schema.NullOr(StorageCleanupReport),
+  stream: true,
+  error: EnvironmentAuthorizationError,
+});
+
+/** Starts the preview browser install, or joins one in progress, and returns at once. */
+const WsServerInstallPreviewBrowserRpc = Rpc.make(WS_METHODS.serverInstallPreviewBrowser, {
+  payload: Schema.Struct({}),
+  success: PreviewBrowserStatus,
+  error: EnvironmentAuthorizationError,
+});
+/** The current status, then each change, including install progress. */
+const WsServerGetPreviewBrowserStatusRpc = Rpc.make(WS_METHODS.serverGetPreviewBrowserStatus, {
+  payload: Schema.Struct({}),
+  success: PreviewBrowserStatus,
   stream: true,
   error: EnvironmentAuthorizationError,
 });
@@ -1477,6 +1503,14 @@ const WsProviderReadPermissionRulesRpc = Rpc.make(WS_METHODS.providerReadPermiss
   success: ReadPermissionRulesResult,
   error: Schema.Union([PermissionRulesError, EnvironmentAuthorizationError]),
 });
+const WsProviderReadEffectivePermissionsRpc = Rpc.make(
+  WS_METHODS.providerReadEffectivePermissions,
+  {
+    payload: ReadEffectivePermissionsInput,
+    success: EffectivePermissions,
+    error: Schema.Union([PermissionRulesError, EnvironmentAuthorizationError]),
+  },
+);
 const WsProviderForgetPermissionRuleRpc = Rpc.make(WS_METHODS.providerForgetPermissionRule, {
   payload: ForgetPermissionRuleInput,
   success: ReadPermissionRulesResult,
@@ -1933,6 +1967,16 @@ const WsOrchestrationV2SubscribeThreadRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS
   stream: true,
 });
 
+/** Servers that answer it advertise `threadHistorySearch` in their config. */
+const WsOrchestrationV2SearchThreadHistoryRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.searchThreadHistory,
+  {
+    payload: OrchestrationSearchThreadHistoryInput,
+    success: OrchestrationSearchThreadHistoryResult,
+    error: Schema.Union([OrchestrationSearchThreadsError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsSubscribeTerminalEventsRpc = Rpc.make(WS_METHODS.subscribeTerminalEvents, {
   payload: Schema.Struct({}),
   success: TerminalEvent,
@@ -2048,6 +2092,13 @@ const WsScheduledTasksGetWebhookDeliveryRpc = Rpc.make(
   },
 );
 
+/** Newest runs of one task. Servers advertise it with the `scheduledTaskRuns` capability. */
+const WsScheduledTasksListRunsRpc = Rpc.make(WS_METHODS.scheduledTasksListRuns, {
+  payload: ScheduledTaskListRunsInput,
+  success: ScheduledTaskListRunsResult,
+  error: Schema.Union([ScheduledTaskError, EnvironmentAuthorizationError]),
+});
+
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -2106,6 +2157,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRemoveKeybindingRpc,
   WsServerRunStorageCleanupRpc,
   WsServerGetStorageCleanupReportRpc,
+  WsServerInstallPreviewBrowserRpc,
+  WsServerGetPreviewBrowserStatusRpc,
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,
   WsServerDiscoverSourceControlRpc,
@@ -2140,6 +2193,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSecretsAnswerRequestRpc,
   WsScheduledTasksListWebhookDeliveriesRpc,
   WsScheduledTasksGetWebhookDeliveryRpc,
+  WsScheduledTasksListRunsRpc,
   WsServerReportClientActivityRpc,
   WsServerReportHostPowerStateRpc,
   WsServerGetBackgroundPolicyRpc,
@@ -2218,6 +2272,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProviderReadSessionCatalogRpc,
   WsProviderReadPermissionRulesRpc,
   WsProviderForgetPermissionRuleRpc,
+  WsProviderReadEffectivePermissionsRpc,
   WsCheckpointRollbackPreviewRpc,
   WsCheckpointRestoreFilesRpc,
   WsCheckpointUndoRestoreRpc,
@@ -2296,4 +2351,5 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeArchivedShellRpc,
   WsOrchestrationV2SubscribeShellRpc,
   WsOrchestrationV2SubscribeThreadRpc,
+  WsOrchestrationV2SearchThreadHistoryRpc,
 ).middleware(RpcScopeAuthorization);

@@ -79,6 +79,7 @@ export function resolveThreadListV2ProviderDrivers(
 export type ThreadListV2Status =
   | "approval"
   | "input"
+  | "lost"
   | "working"
   | "waiting"
   | "failed"
@@ -183,7 +184,10 @@ export function threadHasUnseenCompletion(
 }
 
 export function resolveThreadListV2Status(
-  thread: Pick<EnvironmentThreadShell, "hasPendingApprovals" | "hasPendingUserInput" | "runtime">,
+  thread: Pick<
+    EnvironmentThreadShell,
+    "hasPendingApprovals" | "hasPendingUserInput" | "hasLostRuntimeRequest" | "runtime"
+  >,
 ): ThreadListV2Status {
   if (thread.hasPendingApprovals) {
     return "approval";
@@ -196,6 +200,11 @@ export function resolveThreadListV2Status(
     ["preparing", "queued", "starting", "running", "waiting"].includes(thread.runtime.status)
   ) {
     return "working";
+  }
+  // A decision lost to a restart outranks the failure or stop that caused it:
+  // the user still owes it, through Ask again or Dismiss.
+  if (thread.hasLostRuntimeRequest === true) {
+    return "lost";
   }
   if (thread.runtime?.status === "idle") {
     return "waiting";

@@ -134,7 +134,7 @@ const ManifestCacheFile = Schema.Struct({
   manifest: ModelManifestSchema,
 });
 /** Exported for tests that seed the disk cache. */
-export const encodeManifestCache = Schema.encodeEffect(
+const encodeManifestCache = Schema.encodeEffect(
   Schema.fromJsonString(
     ManifestCacheFile as unknown as Schema.Codec<typeof ManifestCacheFile.Type>,
   ),

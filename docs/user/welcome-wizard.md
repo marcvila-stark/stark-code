@@ -55,6 +55,8 @@ folder's full path on that computer.
 Setup opens only the folder you chose. It does not create separate projects from
 old conversation folders or import their history. Existing projects and
 conversations remain available. Opening a folder already in Stark Code reuses it.
+To bring in Claude Code or Codex sessions later, see
+[Import Claude Code and Codex sessions](./thread-sidebar.md#import-claude-code-and-codex-sessions).
 
 For the integrated Git worktree controls, open the repository's main checkout.
 Choose **Choose later** to finish setup without opening a folder. You can return

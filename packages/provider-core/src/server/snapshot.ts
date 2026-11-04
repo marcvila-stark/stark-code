@@ -15,6 +15,8 @@ export interface ManagedServerProvider {
   readonly getSnapshot: Effect.Effect<ServerProvider>;
   readonly refresh: Effect.Effect<ServerProvider>;
   readonly streamChanges: Stream.Stream<ServerProvider>;
+  /** Forget an account that has just changed, including probes still in flight. */
+  readonly invalidateAccount?: Effect.Effect<void>;
   /**
    * Fold a runtime rate-limit update into the published snapshot without
    * waiting for the next status probe. Sparse: windows merge by id and an

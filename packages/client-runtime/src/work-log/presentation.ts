@@ -523,11 +523,17 @@ export function resolveViewedImageAsset(
   return { resource: media.resource, alt: media.name, srcFragment: media.srcFragment };
 }
 
-function toolGroupActionCount(
-  action: ToolGroupAction,
-  entries: ReadonlyArray<WorkLogPresentationEntry>,
-): number {
-  if (action !== "edit") return entries.length;
+/**
+ * Only a completed edit changed a file. Providers that report no status keep
+ * counting as changed; idle edits have not run yet, so they count as waiting.
+ */
+function editOutcome(entry: WorkLogPresentationEntry): "applied" | "notApplied" | "waiting" {
+  const status = entry.toolLifecycleStatus;
+  if (status === undefined || status === "completed") return "applied";
+  return status === "inProgress" || status === "idle" ? "waiting" : "notApplied";
+}
+
+function changedFileCount(entries: ReadonlyArray<WorkLogPresentationEntry>): number {
   const changedFiles = new Set<string>();
   let editsWithoutFileDetails = 0;
   for (const entry of entries) {
@@ -538,6 +544,42 @@ function toolGroupActionCount(
     }
   }
   return changedFiles.size + editsWithoutFileDetails;
+}
+
+/**
+ * A command its approval never allowed (declined, expired or lost unanswered). The client marks
+ * it `declined` from the approval; the item's own status can still read failed or cancelled.
+ */
+function commandWasDeclined(entry: WorkLogPresentationEntry): boolean {
+  return entry.toolLifecycleStatus === "declined";
+}
+
+/**
+ * Edits and commands split by outcome, so the fold line never claims a change that did not land
+ * or a command that never ran.
+ */
+function toolGroupActionLabels(
+  action: ToolGroupAction,
+  entries: ReadonlyArray<WorkLogPresentationEntry>,
+): string[] {
+  if (action === "command") {
+    const declined = entries.filter(commandWasDeclined).length;
+    const ran = entries.length - declined;
+    return [
+      ...(ran > 0 ? [toolGroupActionLabel("command", ran)] : []),
+      ...(declined > 0 ? [`Declined ${declined} ${declined === 1 ? "command" : "commands"}`] : []),
+    ];
+  }
+  if (action !== "edit") return [toolGroupActionLabel(action, entries.length)];
+  const applied = entries.filter((entry) => editOutcome(entry) === "applied");
+  const notApplied = entries.filter((entry) => editOutcome(entry) === "notApplied").length;
+  const waiting = entries.length - applied.length - notApplied;
+  const edits = (count: number) => `${count} ${count === 1 ? "edit" : "edits"}`;
+  return [
+    ...(applied.length > 0 ? [toolGroupActionLabel("edit", changedFileCount(applied))] : []),
+    ...(notApplied > 0 ? [`Didn't apply ${edits(notApplied)}`] : []),
+    ...(waiting > 0 ? [`Waiting on ${edits(waiting)}`] : []),
+  ];
 }
 
 function toolGroupActionLabel(action: ToolGroupAction, count: number): string {
@@ -642,7 +684,10 @@ function summaryActionPriority(action: ToolGroupAction | StarkMcpToolSummaryActi
   }
 }
 
-/** Summarizes at most two action categories; every omitted call still counts in the remainder. */
+/**
+ * Summarizes at most two action categories; every omitted call still counts in
+ * the remainder. An edit category can contribute several parts, one per outcome.
+ */
 export function summarizeToolGroup(entries: ReadonlyArray<WorkLogPresentationEntry>): {
   summary: string;
   hasFailure: boolean;
@@ -654,7 +699,14 @@ export function summarizeToolGroup(entries: ReadonlyArray<WorkLogPresentationEnt
       hasFailure: false,
     };
   }
-  entries = toolEntries;
+  // An approval asks for work that another row records (the command it gates), so it counts as
+  // work of its own only in a group where nothing else is tool work.
+  const hasOtherToolWork = toolEntries.some(
+    (entry) => entry.itemType !== "approval_request" && workLogEntryIsToolLike(entry),
+  );
+  entries = hasOtherToolWork
+    ? toolEntries.filter((entry) => entry.itemType !== "approval_request")
+    : toolEntries;
   const groups = new Map<
     ToolGroupAction | StarkMcpToolSummaryAction,
     {
@@ -677,25 +729,31 @@ export function summarizeToolGroup(entries: ReadonlyArray<WorkLogPresentationEnt
     if (group) group.entries.push(entry);
     else groups.set(key, { action, starkAction, entries: [entry] });
   }
-  const summaries = [...groups].map(([action, group], index) => ({
-    index,
-    count: group.entries.length,
-    priority: summaryActionPriority(action),
-    ...(group.starkAction
+  const summaries = [...groups].map(([action, group], index) => {
+    const starkSummary = group.starkAction
       ? summarizeStarkToolCalls(group.starkAction, group.entries.map(starkToolSummaryCall))
-      : {
-          label: toolGroupActionLabel(
-            group.action,
-            toolGroupActionCount(group.action, group.entries),
-          ),
-          failedCount: group.entries.filter(workEntryDisplayIndicatesToolFailure).length,
-        }),
-  }));
+      : null;
+    return {
+      index,
+      count: group.entries.length,
+      priority: summaryActionPriority(action),
+      labels: starkSummary
+        ? [starkSummary.label]
+        : toolGroupActionLabels(group.action, group.entries),
+      failedCount:
+        starkSummary?.failedCount ??
+        group.entries.filter(
+          (entry) =>
+            !(group.action === "command" && commandWasDeclined(entry)) &&
+            workEntryDisplayIndicatesToolFailure(entry),
+        ).length,
+    };
+  });
   const selected = [...summaries]
     .sort((a, b) => a.priority - b.priority || a.index - b.index)
     .slice(0, 2)
     .sort((a, b) => a.index - b.index);
-  const labels = selected.map(({ label }) => label);
+  const labels = selected.flatMap((group) => group.labels);
   if (sources.size > 0) {
     const sourceValues = [...sources.values()];
     const sourceNames = [...new Set(sourceValues.map((source) => source.name))];

@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   MessageId,
   OrchestrationMessageContext,
+  RunId,
   ThreadId,
   type PreviewAnnotationPayload,
 } from "@starkfuture/contracts";
@@ -176,6 +177,27 @@ describe("composerContextRecords", () => {
       diff: "",
     });
     expect(reviewCommentContextRecord(reviewCommentFromRecord(record))).toEqual(record);
+  });
+
+  it("keeps the reviewed turn through paste and stash round trips", () => {
+    const comment = {
+      id: "turn-comment",
+      sectionId: "turn:run-5",
+      sectionTitle: "Turn 5",
+      filePath: "a.ts",
+      startIndex: 0,
+      endIndex: 0,
+      rangeLabel: "+1",
+      text: "Rename this",
+      diff: "+const a = 1;",
+      runId: RunId.make("run-5"),
+    };
+    const record = reviewCommentContextRecord(comment);
+    expect(record.runId).toBe("run-5");
+    expect(reviewCommentFromRecord(record).runId).toBe("run-5");
+    expect(reviewCommentContextRecord({ ...comment, runId: undefined })).not.toHaveProperty(
+      "runId",
+    );
   });
 
   it.each(["x", "preview-annotation_x"])(

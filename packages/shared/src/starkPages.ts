@@ -8,7 +8,7 @@ export const STARK_PAGES_ENV = {
   SPAGE_EMBED_ORIGINS: "starkcode://app starkcode-dev://app",
 } as const;
 
-export function isStarkPagesPort(port: unknown): port is number {
+function isStarkPagesPort(port: unknown): port is number {
   return typeof port === "number" && Number.isInteger(port) && port >= 4317 && port <= 4337;
 }
 

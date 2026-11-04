@@ -115,6 +115,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
+import * as ParentWatch from "./process/parentWatch.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
@@ -171,8 +172,11 @@ import * as RuntimeLayer from "./orchestration-v2/runtimeLayer.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as ResourceCleanupService from "./orchestration-v2/ResourceCleanupService.ts";
+import * as BypassOptOut from "./orchestration-v2/BypassOptOut.ts";
 import * as ThreadSettlementService from "./orchestration-v2/ThreadSettlementService.ts";
 import * as ThreadPullRequestService from "./orchestration-v2/ThreadPullRequestService.ts";
+import * as CommandReceiptStore from "./orchestration-v2/CommandReceiptStore.ts";
+import * as ScheduledTaskRunTracker from "./scheduledTasks/ScheduledTaskRunTracker.ts";
 import * as RunFinalizationService from "./orchestration-v2/RunFinalizationService.ts";
 import * as ProjectionStoreV2 from "./orchestration-v2/ProjectionStore.ts";
 import { makePersistedServerRuntimeState } from "./serverRuntimeState.ts";
@@ -182,6 +186,8 @@ import * as NetService from "@starkfuture/shared/Net";
 import * as RelayClient from "@starkfuture/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@starkfuture/tailscale";
 import * as ServerActivation from "./serverActivation.ts";
+import * as MaintenanceGate from "./maintenance/MaintenanceGate.ts";
+import * as MaintenanceDesktopBridge from "./maintenance/MaintenanceDesktopBridge.ts";
 
 // MCP handoff thread IDs include escaped provenance and can exceed find-my-way's
 // 100-character default for one path segment.
@@ -194,6 +200,28 @@ const HTTP_ROUTER_CONFIG = {
 // already closes the websocket gracefully. Do not add an artificial drain before
 // those finalizers get a chance to run.
 const HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS = 0;
+// Only the desktop app hands a backend its bootstrap token, so a token means
+// a desktop parent. Such a backend stops when that app is gone, even when it
+// was killed without stopping it, so it never keeps holding the data.
+const layerDesktopParentWatch = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    if (config.mode !== "desktop" || config.desktopBootstrapToken === undefined) return;
+    yield* ParentWatch.awaitParentExit({
+      startedUnder: ParentWatch.parentPidAtStart,
+      interval: ParentWatch.DESKTOP_PARENT_CHECK_INTERVAL,
+    }).pipe(
+      Effect.andThen(
+        Effect.logWarning("The desktop app that started this server is gone; stopping.", {
+          parentPid: ParentWatch.parentPidAtStart,
+        }),
+      ),
+      Effect.andThen(ParentWatch.stopThisProcess(ParentWatch.DESKTOP_PARENT_GONE_STOP_GRACE_MS)),
+      Effect.forkScoped,
+    );
+  }),
+);
+
 const layerResourceAttribution = ResourceAttribution.layer;
 const layerApplicationObservability = EventLoopMonitor.layer.pipe(
   Layer.provideMerge(Observability.layer),
@@ -493,6 +521,10 @@ const layerThreadSettlementWorker = Layer.effectDiscard(
   ThreadSettlementService.make.pipe(Effect.flatMap((service) => service.start())),
 ).pipe(Layer.provide(layerPullRequestService), Layer.provide(ProjectionStoreV2.layer));
 
+// Turning off an account's Bypass opt-in narrows its Bypass chats at once,
+// live sessions included (BypassOptOut).
+const layerBypassOptOutWorker = Layer.effectDiscard(BypassOptOut.start);
+
 const layerThreadPullRequestWorker = Layer.effectDiscard(
   ThreadPullRequestService.make.pipe(Effect.flatMap((service) => service.start())),
 ).pipe(Layer.provide(layerPullRequestService));
@@ -534,6 +566,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   // Asks Stark Connect to deliver webhooks it held while this environment was offline.
   HeldHooksWaker.layer,
   layerThreadSettlementWorker,
+  layerBypassOptOutWorker,
   StorageCleanup.layer.pipe(Layer.provide(ProjectionStoreV2.layer)),
   layerThreadPullRequestWorker,
   Layer.effectDiscard(
@@ -565,9 +598,19 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   // existed, or by a cleanup write that failed. See ProjectService.delete
   // for the normal (on-delete) path.
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
+  // Follows the agent runs scheduled tasks start, so run history shows how
+  // each turn went rather than only whether its prompt was sent.
+  ScheduledTaskRunTracker.layer.pipe(
+    Layer.provide(CommandReceiptStore.layerFromApplicationReceipts),
+  ),
+  // The desktop app closes this backend's maintenance gate before an update.
+  MaintenanceDesktopBridge.layer,
 ).pipe(
   // Core Services
   Layer.provideMerge(layerOrchestrationApplication),
+  // Below the runtime, so every source of new work (dispatch, scheduler,
+  // effect claims, scheduled runs, webhooks, cleanup) reads the same gate.
+  Layer.provideMerge(MaintenanceGate.layer),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
   Layer.provideMerge(Layer.merge(ProjectStore.layer, ThreadSearch.layer)),
   Layer.provideMerge(layerServerSettings),
@@ -577,6 +620,9 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.provideMerge(layerGit),
   Layer.provideMerge(layerVcs),
   Layer.provideMerge(Layer.mergeAll(layerTerminal, layerPreview, layerDevice)),
+  // One install of the headless browser for server browser tabs, HTML previews,
+  // the settings that install it, and the turn context that reports it.
+  Layer.provideMerge(PreviewBrowser.layer),
   Layer.provideMerge(layerPersistence),
   // Both read a user-owned file out of the state directory and stream changes
   // to clients; neither depends on the other.
@@ -726,8 +772,6 @@ const layerMakeRoutes = Layer.mergeAll(
   Layer.provide(layerPullRequestService),
   // The stream route and the WebSocket RPCs share one browser.
   Layer.provide(ServerBrowser.layer.pipe(Layer.provide(DesktopBrowserChannel.layer))),
-  // Server browser tabs and HTML render previews install and run the same headless browser.
-  Layer.provide(PreviewBrowser.layer),
   Layer.provide(PreviewAutomationBroker.layer),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(layerDesktopAppUpdate))),
   Layer.provide(layerCommandReadiness),
@@ -1088,6 +1132,7 @@ const layerMakeServer = Layer.unwrap(
       layerTailscaleServe,
       layerCloudDesiredLinkReconcile,
       HeapSnapshot.layer,
+      layerDesktopParentWatch,
     );
 
     return layerServerApplication.pipe(

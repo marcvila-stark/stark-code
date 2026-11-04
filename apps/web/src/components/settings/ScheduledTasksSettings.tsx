@@ -1,7 +1,9 @@
 import { useAtomValue } from "@effect/atom-react";
+import { commandFailureMessage } from "@starkfuture/client-runtime/errors";
 import {
   Clock3Icon,
   CopyIcon,
+  HistoryIcon,
   InboxIcon,
   MoreHorizontalIcon,
   PencilIcon,
@@ -33,6 +35,10 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@starkfuture/client-runtime/state/runtime";
+import {
+  runScheduledTaskNowOnce,
+  scheduledTaskRunStateLabel,
+} from "@starkfuture/client-runtime/scheduled-task-runs";
 
 import { formatRelativeTime } from "../../timestampFormat";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
@@ -58,14 +64,23 @@ import { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { WorktreeBaseBranchPicker } from "../WorktreeBaseBranchPicker";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
-import { AuthOrchestrationOperateScope } from "@starkfuture/contracts";
-import { readEnvironmentScope } from "~/state/session";
+import { AuthOrchestrationOperateScope, AuthSettingsWriteScope } from "@starkfuture/contracts";
+import { readEnvironmentScope, useEnvironmentScope } from "~/state/session";
+import { runtimeModeOptionsForProvider } from "../chat/runtimeModeConfig";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { ScheduledTaskRunsDialog, scheduledTaskRunBadgeVariant } from "./ScheduledTaskRunsDialog";
 import {
+  scheduledTaskRunNowClickIds,
+  useEnvironmentKeepsRunHistory,
+} from "../../state/scheduledTaskRuns";
+import {
+  PROJECT_DEFAULT_MODE,
   WEBHOOK_SIGNATURE_DEFAULTS,
   matchesScheduledTaskScope,
   scheduleFromDraft,
   scheduledTaskDefaultModel,
+  scheduledTaskModeChoices,
+  scheduledTaskProjectRuntimeMode,
   taskToDraft,
   type DraftState,
   type ScheduleMode,
@@ -128,7 +143,7 @@ const EMPTY_DRAFT: DraftState = {
   startFromOrigin: true,
   existingWorktreePath: "",
   modelKey: "",
-  runtimeMode: "full-access",
+  runtimeMode: null,
   interactionMode: "default",
   baseModelSelection: null,
   signatureEnabled: false,
@@ -393,7 +408,10 @@ function ScheduledTaskRow({
   );
   const [busy, setBusy] = useState(false);
   const [deliveriesOpen, setDeliveriesOpen] = useState(false);
+  const [runsOpen, setRunsOpen] = useState(false);
+  const keepsRunHistory = useEnvironmentKeepsRunHistory(environmentId);
   const isWebhook = task.schedule.type === "webhook";
+  const latestRun = task.latestRun;
   const toggle = useAtomCommand(serverEnvironment.setScheduledTaskEnabled, {
     label: "scheduled task enabled",
   });
@@ -410,7 +428,13 @@ function ScheduledTaskRow({
       action === "toggle"
         ? await toggle({ environmentId, input: { id: task.id, enabled: !task.enabled } })
         : action === "run"
-          ? await run({ environmentId, input: { id: task.id } })
+          ? await runScheduledTaskNowOnce({
+              clickIds: scheduledTaskRunNowClickIds,
+              environmentId,
+              taskId: task.id,
+              keepsRunHistory,
+              run,
+            })
           : await remove({ environmentId, input: { id: task.id } });
     setBusy(false);
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -418,7 +442,7 @@ function ScheduledTaskRow({
         stackedThreadToast({
           type: "error",
           title: "Could not update scheduled task",
-          description: String(squashAtomCommandFailure(result)),
+          description: commandFailureMessage(squashAtomCommandFailure(result)),
         }),
       );
     }
@@ -439,10 +463,20 @@ function ScheduledTaskRow({
                   ? `Next run ${relativeLabel(task.nextRunAt)}`
                   : "Not scheduled"}
           </span>
-          {task.lastRunStatus !== "never" ? (
+          {latestRun !== undefined ? (
+            <Badge variant={scheduledTaskRunBadgeVariant(latestRun)}>
+              {scheduledTaskRunStateLabel(latestRun.state)}
+            </Badge>
+          ) : task.lastRunStatus !== "never" ? (
             <Badge variant={statusVariant(task.lastRunStatus)}>{task.lastRunStatus}</Badge>
           ) : null}
-          {task.lastRunError ? <span className="text-destructive">{task.lastRunError}</span> : null}
+          {latestRun !== undefined ? (
+            latestRun.error !== null ? (
+              <span className="text-destructive">{latestRun.error}</span>
+            ) : null
+          ) : task.lastRunError ? (
+            <span className="text-destructive">{task.lastRunError}</span>
+          ) : null}
         </div>
       }
       control={
@@ -459,7 +493,8 @@ function ScheduledTaskRow({
                 <Button
                   size="icon-sm"
                   variant="ghost"
-                  disabled={busy || !canOperate}
+                  // Runs need only read access, so the menu stays open to read-only sessions.
+                  disabled={busy || (!canOperate && !keepsRunHistory)}
                   aria-label={`Actions for ${task.title}`}
                 />
               }
@@ -467,23 +502,29 @@ function ScheduledTaskRow({
               <MoreHorizontalIcon className="size-4" />
             </MenuTrigger>
             <MenuPopup align="end">
-              <MenuItem onClick={onEdit}>
+              <MenuItem disabled={!canOperate} onClick={onEdit}>
                 <PencilIcon />
                 Edit
               </MenuItem>
+              {keepsRunHistory ? (
+                <MenuItem onClick={() => setRunsOpen(true)}>
+                  <HistoryIcon />
+                  Runs
+                </MenuItem>
+              ) : null}
               {isWebhook ? (
-                <MenuItem onClick={() => setDeliveriesOpen(true)}>
+                <MenuItem disabled={!canOperate} onClick={() => setDeliveriesOpen(true)}>
                   <InboxIcon />
                   Deliveries
                 </MenuItem>
               ) : (
-                <MenuItem onClick={() => void act("run")}>
+                <MenuItem disabled={!canOperate} onClick={() => void act("run")}>
                   <PlayIcon />
                   Run now
                 </MenuItem>
               )}
               <MenuSeparator />
-              <MenuItem onClick={() => void act("delete")}>
+              <MenuItem disabled={!canOperate} onClick={() => void act("delete")}>
                 <Trash2Icon />
                 Delete
               </MenuItem>
@@ -494,6 +535,13 @@ function ScheduledTaskRow({
               environmentId={environmentId}
               task={task}
               onClose={() => setDeliveriesOpen(false)}
+            />
+          ) : null}
+          {runsOpen ? (
+            <ScheduledTaskRunsDialog
+              environmentId={environmentId}
+              task={task}
+              onClose={() => setRunsOpen(false)}
             />
           ) : null}
         </div>
@@ -686,7 +734,7 @@ function WebhookEndpointField({
         stackedThreadToast({
           type: "error",
           title: "Could not rotate webhook URL",
-          description: String(squashAtomCommandFailure(result)),
+          description: commandFailureMessage(squashAtomCommandFailure(result)),
         }),
       );
     }
@@ -829,6 +877,29 @@ function ScheduledTaskEditorDialog({
     () => getCustomModelOptionsByInstance(settings, providers, activeInstanceId, activeModel),
     [settings, providers, activeInstanceId, activeModel],
   );
+  const canWriteSettings = useEnvironmentScope(environmentId, AuthSettingsWriteScope);
+  const activeEntry = instanceEntries.find((entry) => entry.instanceId === activeInstanceId);
+  // Only the modes this instance runs, as the composer offers them (Bypass needs its opt-in).
+  const supportedRuntimeModes = activeEntry?.snapshot.supportedRuntimeModes;
+  const modeOptions = runtimeModeOptionsForProvider(activeEntry?.driverKind ?? "").filter(
+    (option) =>
+      !supportedRuntimeModes ||
+      supportedRuntimeModes.length === 0 ||
+      supportedRuntimeModes.includes(option.mode),
+  );
+  const modeChoices = scheduledTaskModeChoices({
+    options: modeOptions,
+    projectDefault: scheduledTaskProjectRuntimeMode(settings, selectedProject ?? null),
+    selected: draft.runtimeMode,
+    canWriteSettings,
+  });
+  const selectedModeChoice =
+    modeChoices.find((choice) => choice.value === (draft.runtimeMode ?? PROJECT_DEFAULT_MODE)) ??
+    modeChoices[0];
+  // A task saved above the narrowest mode can be saved again only with the settings grant.
+  const modeBlocksSave = selectedModeChoice?.disabledReason !== undefined;
+  const narrowestModeLabel =
+    modeOptions.find((option) => option.mode === "approval-required")?.label ?? "Supervised";
 
   const reportFailure = (title: string, error: unknown) => {
     toastManager.add(
@@ -847,7 +918,8 @@ function ScheduledTaskEditorDialog({
       saving ||
       editingTaskMissing ||
       !connected ||
-      tasksQuery.data === null
+      tasksQuery.data === null ||
+      modeBlocksSave
     )
       return;
     const selection = activeSelection;
@@ -917,7 +989,7 @@ function ScheduledTaskEditorDialog({
       threadId: draft.threadId ? (draft.threadId as ThreadId) : null,
       workspaceStrategy,
       modelSelection,
-      runtimeMode: draft.runtimeMode,
+      ...(draft.runtimeMode === null ? {} : { runtimeMode: draft.runtimeMode }),
       interactionMode: draft.interactionMode,
       creationSource: "web",
     };
@@ -1125,6 +1197,52 @@ function ScheduledTaskEditorDialog({
                   }
                 />
               </div>
+            </Field>
+
+            <Field label="Permissions" htmlFor="scheduled-task-permissions">
+              <Select
+                value={selectedModeChoice?.value ?? PROJECT_DEFAULT_MODE}
+                onValueChange={(value) => {
+                  const choice = modeChoices.find((entry) => entry.value === value);
+                  if (!choice || choice.disabledReason !== undefined) return;
+                  setDraft((current) => ({
+                    ...current,
+                    runtimeMode: choice.value === PROJECT_DEFAULT_MODE ? null : choice.value,
+                  }));
+                }}
+              >
+                <SelectTrigger size="sm" id="scheduled-task-permissions">
+                  <SelectValue>{selectedModeChoice?.label}</SelectValue>
+                </SelectTrigger>
+                <SelectPopup>
+                  {modeChoices.map((choice) => (
+                    <SelectItem
+                      key={choice.value}
+                      value={choice.value}
+                      disabled={choice.disabledReason !== undefined}
+                    >
+                      <span className="flex items-baseline justify-between gap-3">
+                        <span>{choice.label}</span>
+                        {choice.disabledReason ? (
+                          <span className="text-xs text-muted-foreground">
+                            {choice.disabledReason}
+                          </span>
+                        ) : null}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+              {modeBlocksSave ? (
+                <p className="text-xs text-destructive" role="status">
+                  Saving at {selectedModeChoice?.label} needs settings permission. Choose{" "}
+                  {narrowestModeLabel} or the project default.
+                </p>
+              ) : modeChoices.some((choice) => choice.disabledReason !== undefined) ? (
+                <p className="text-xs text-muted-foreground">
+                  Modes above {narrowestModeLabel} need settings permission.
+                </p>
+              ) : null}
             </Field>
 
             <div className="space-y-3">
@@ -1354,7 +1472,14 @@ function ScheduledTaskEditorDialog({
           </DialogClose>
           <Button
             size="sm"
-            disabled={!canOperate || saving || editingTaskMissing || !connected || !tasksQuery.data}
+            disabled={
+              !canOperate ||
+              saving ||
+              editingTaskMissing ||
+              !connected ||
+              !tasksQuery.data ||
+              modeBlocksSave
+            }
             onClick={() => void submit()}
           >
             {draft.editingId ? "Save task" : "Create task"}

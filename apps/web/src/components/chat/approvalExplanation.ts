@@ -1,4 +1,13 @@
-import { parse, type Command, type PipelineNode, type Word, type WordPart } from "unbash";
+import {
+  classifyReadOnlyShellCommand,
+  describeReadOnlyCommand,
+  literalShellWord,
+  shellProgramName as programName,
+  unwrapShellCommand,
+  type ReadOnlyShellCommand,
+  type UnwrappedShellCommand,
+} from "@starkfuture/shared/readOnlyShellCommand";
+import { parse, type Command, type PipelineNode } from "unbash";
 
 export interface ApprovalExplanationStep {
   readonly command: string;
@@ -9,7 +18,14 @@ export interface ApprovalExplanationStep {
 
 export interface ApprovalExplanation {
   readonly steps: readonly ApprovalExplanationStep[];
+  /** Warnings that bear on the decision, most important first. */
   readonly notes: readonly string[];
+  /** How the parts connect; shown with the details, never as a warning. */
+  readonly context: readonly string[];
+  /** Set when every part is expected to only read; its summary leads the approval card. */
+  readonly readOnly: Extract<ReadOnlyShellCommand, { readOnly: true }> | undefined;
+  /** The outer `zsh -lc '…'` style wrapper, when the command has one. */
+  readonly wrapper: UnwrappedShellCommand | undefined;
 }
 
 const MAX_LENGTH = 8_192;
@@ -17,27 +33,13 @@ const MAX_STEPS = 6;
 const UNKNOWN = "This app cannot reliably explain this command. Review the original command.";
 export const APPROVAL_EXPLANATION_LIMIT =
   "Based on command text only. Aliases, configuration, hooks and scripts may do more. Affected files have not been checked.";
+/** Replaces the general limit when the card carries the "Read-only command" badge. */
+export const READ_ONLY_APPROVAL_LIMIT =
+  "The read-only label is based on the command text only. Aliases, shell startup files, environment variables and repository settings such as Git helpers can still run other programs.";
 
-function isLiteralPart(part: WordPart): boolean {
-  if (part.type === "SingleQuoted" || part.type === "AnsiCQuoted") return true;
-  if (part.type === "DoubleQuoted") return part.parts.every((child) => child.type === "Literal");
-  // Globs/tilde are shell expansions even though the parser represents them as literals.
-  return part.type === "Literal" && !/[*?[\]]|^~/u.test(part.text);
-}
+const literal = literalShellWord;
 
-function literal(word: Word): string | undefined {
-  return word.parts
-    ? word.parts.every(isLiteralPart)
-      ? word.value
-      : undefined
-    : /[*?[\]]|^~/u.test(word.text)
-      ? undefined
-      : word.value;
-}
-
-function programName(value: string): string {
-  return value.replace(/^\/(?:usr\/)?bin\//u, "");
-}
+const sentence = (phrase: string) => `${phrase[0]!.toUpperCase()}${phrase.slice(1)}.`;
 
 function cleanRequestsPreview(args: readonly string[]): boolean {
   let preview = false;
@@ -69,6 +71,18 @@ function explainKnown(words: readonly string[]): Omit<ApprovalExplanationStep, "
     unknown: false,
   });
   const unknown = () => ({ explanation: UNKNOWN, caution: false, unknown: true });
+  if (name === "pwd" && args.every((arg) => ["-L", "-P"].includes(arg)))
+    return known("Prints the current working directory.");
+  if (name === "node" && args.length === 1 && ["--version", "-v"].includes(args[0]!))
+    return known("Asks Node.js to print its version.");
+  if (
+    name === "sed" &&
+    args.length >= 2 &&
+    args[0] === "-n" &&
+    /^\d+(?:,\d+)?p$/u.test(args[1]!) &&
+    args.slice(2).every((arg) => !arg.startsWith("-"))
+  )
+    return known("Prints the requested line range from the input files.");
   if (name === "rm") {
     return known(
       "Deletes the selected files or folders without moving them to the Trash. Recursive flags also delete their contents.",
@@ -82,7 +96,21 @@ function explainKnown(words: readonly string[]): Omit<ApprovalExplanationStep, "
       true,
     );
   }
-  if (name !== "git") return unknown();
+  if (name === "find" && args.includes("-delete")) {
+    return known("Deletes every file and folder this search matches.", true);
+  }
+  if (name === "find" && args.some((arg) => /^-(?:exec|execdir|ok|okdir)$/u.test(arg))) {
+    const index = args.findIndex((arg) => /^-(?:exec|execdir|ok|okdir)$/u.test(arg));
+    const program = args[index + 1];
+    return known(
+      `Searches for files and runs ${program ? `"${program}"` : "another program"} on each match. That program decides what happens to them.`,
+    );
+  }
+  if (name === "sed" && args.some((arg) => /^-[^-]*i|^--in-place/u.test(arg))) {
+    return known("Edits the selected files in place.", true);
+  }
+  const readOnly = describeReadOnlyCommand([name, ...args]);
+  if (name !== "git") return readOnly ? known(sentence(readOnly)) : unknown();
   // Only consume unambiguous location options. -c, --exec-path and other overrides
   // can change what runs; guessing which word is the subcommand would be misleading.
   while (args[0] === "-C") {
@@ -187,7 +215,7 @@ function explainKnown(words: readonly string[]): Omit<ApprovalExplanationStep, "
       true,
     );
   }
-  return unknown();
+  return readOnly ? known(sentence(readOnly)) : unknown();
 }
 
 /**
@@ -198,6 +226,14 @@ export function explainApprovalCommand(source: string | undefined): ApprovalExpl
   const steps: ApprovalExplanationStep[] = [];
   const notes = new Set<string>();
   const writeNotes = new Set<string>();
+  const context = new Set<string>();
+  const done = () => ({
+    steps,
+    notes: [...writeNotes, ...notes],
+    context: [...context],
+    readOnly: undefined,
+    wrapper: undefined,
+  });
   const unknown = (command: string, explanation = UNKNOWN) => {
     if (steps.length < MAX_STEPS)
       steps.push({ command, explanation, caution: false, unknown: true });
@@ -205,14 +241,14 @@ export function explainApprovalCommand(source: string | undefined): ApprovalExpl
   };
   if (!source?.trim()) {
     unknown("", "Command details are unavailable. Review the request before deciding.");
-    return { steps, notes: [] };
+    return done();
   }
   if (source.length > MAX_LENGTH) {
     unknown(
       "",
       "This command is too long to explain reliably. Review the complete original command.",
     );
-    return { steps, notes: [] };
+    return done();
   }
   const command = (node: Command, text: string, depth: number) => {
     const raw = text.slice(node.pos, node.end);
@@ -260,7 +296,7 @@ export function explainApprovalCommand(source: string | undefined): ApprovalExpl
       /^-(?:[il]*c|c[il]*)$/u.test(values[0]!) &&
       depth < 2
     ) {
-      notes.add("The shell's startup settings may also run commands.");
+      context.add("The shell's startup settings may also run commands.");
       visitScript(values[1]!, depth + 1);
       return;
     }
@@ -269,7 +305,7 @@ export function explainApprovalCommand(source: string | undefined): ApprovalExpl
   const visit = (node: PipelineNode, text: string, depth: number) => {
     if (node.type === "Command") command(node, text, depth);
     else if (node.type === "Pipeline") {
-      notes.add("These commands form a pipeline; output from one becomes input to another.");
+      context.add("These commands form a pipeline; output from one becomes input to another.");
       for (const child of node.commands) visit(child, text, depth);
     } else
       unknown(
@@ -286,7 +322,7 @@ export function explainApprovalCommand(source: string | undefined): ApprovalExpl
     for (const statement of parsed.commands) {
       if (statement.background) notes.add("A command is launched in the background.");
       if (statement.command.type === "AndOr") {
-        notes.add("Later commands run conditionally, depending on earlier exit codes.");
+        context.add("Later commands run conditionally, depending on earlier exit codes.");
         for (const child of statement.command.commands) visit(child, text, depth);
       } else visit(statement.command, text, depth);
     }
@@ -294,18 +330,18 @@ export function explainApprovalCommand(source: string | undefined): ApprovalExpl
   try {
     visitScript(source, 0);
   } catch {
-    return {
-      steps: [
-        {
-          command: "",
-          explanation: "This command could not be parsed reliably. Review the original command.",
-          caution: false,
-          unknown: true,
-        },
-      ],
-      notes: [],
-    };
+    steps.length = 0;
+    notes.clear();
+    writeNotes.clear();
+    context.clear();
+    unknown("", "This command could not be parsed reliably. Review the original command.");
+    return done();
   }
   if (steps.length === 0) unknown(source);
-  return { steps, notes: [...writeNotes, ...notes] };
+  const readOnly = classifyReadOnlyShellCommand(source);
+  return {
+    ...done(),
+    readOnly: readOnly.readOnly ? readOnly : undefined,
+    wrapper: unwrapShellCommand(source),
+  };
 }

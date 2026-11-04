@@ -610,6 +610,12 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
         ...workbenchEnvironment,
         // The server names this launcher in commands it asks a person to run.
         STARK_CODE_CLI_PATH: Option.getOrUndefined(input.cliPath),
+        // The app's version, not the server package's: the server records it
+        // as the last running version and as the writer of pre-migrate backups.
+        STARK_CODE_APP_VERSION: environment.appVersion,
+        // Only a mock rehearsal build bakes a fault; every other build clears
+        // an inherited one.
+        STARK_CODE_REHEARSAL_FAULT: environment.rehearsal?.fault ?? "",
       },
       // Primary wants process.env (PATH, dev-runner's STARK_CODE_HOME, etc.).
       extendEnv: true,

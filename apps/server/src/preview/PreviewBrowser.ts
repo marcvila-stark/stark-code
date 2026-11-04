@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Effect has no incremental digest.
 import * as EffectNodeStream from "@effect/platform-node/NodeStream";
+import { PreviewBrowserStatus } from "@starkfuture/contracts";
+import { starkPreviewBrowserNote } from "@starkfuture/provider-core/server/orchestrationInstructions";
 import * as HostProcess from "@starkfuture/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -15,6 +17,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import * as NodeCrypto from "node:crypto";
 
@@ -127,13 +130,27 @@ export class PreviewBrowserUnsupportedError extends Schema.TaggedError<PreviewBr
   }
 }
 
+/**
+ * An HTML preview found the browser missing, installing, or unusable. Agents get
+ * the status and what to do instead; nothing was downloaded on their behalf.
+ */
+export class PreviewBrowserNotReadyError extends Schema.TaggedError<PreviewBrowserNotReadyError>()(
+  "PreviewBrowserNotReadyError",
+  { status: PreviewBrowserStatus },
+) {
+  override get message(): string {
+    return starkPreviewBrowserNote(this.status);
+  }
+}
+
 export class PreviewBrowser extends Context.Service<
   PreviewBrowser,
   {
     /**
-     * Path to the installed headless shell. The first call starts the
-     * install; callers wait for it up to a bound and then get its progress
-     * instead, while the install keeps running.
+     * Path to the installed headless shell, for server browser tabs. The first
+     * call starts the install; callers wait for it up to a bound and then get
+     * its progress instead, while the install keeps running. HTML previews must
+     * not use it: they read `status` and never install.
      */
     readonly executable: Effect.Effect<
       string,
@@ -141,6 +158,15 @@ export class PreviewBrowser extends Context.Service<
     >;
     /** The installed headless shell, if any. Never starts or waits on an install. */
     readonly installed: Effect.Effect<Option.Option<string>>;
+    /** Whether the browser is ready, missing, installing, or failed. Never starts an install. */
+    readonly status: Effect.Effect<PreviewBrowserStatus>;
+    /** The current status, then each change, including download progress per megabyte. */
+    readonly changes: Stream.Stream<PreviewBrowserStatus>;
+    /**
+     * Starts the install the user asked for, or joins one in progress, and
+     * returns at once with the status. A failed install is retried.
+     */
+    readonly install: Effect.Effect<PreviewBrowserStatus>;
   }
 >()("stark-code/preview/PreviewBrowser") {}
 
@@ -191,6 +217,9 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
   const gate = yield* Semaphore.make(1);
   let state: InstallState = { _tag: "idle" };
   const progress = { downloadedBytes: 0, unpacking: false };
+  // The last install's failure, shown until the next install starts. `state`
+  // forgets it once an `executable` caller has reported it.
+  let lastFailure: PreviewBrowserInstallError | undefined;
 
   // The version directory appears by one rename of a fully unpacked tree, so a
   // runnable binary there is the complete-install marker.
@@ -205,6 +234,28 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
       Effect.orElseSucceed(() => Option.none<string>()),
     );
   };
+
+  const status = Effect.gen(function* () {
+    if (release === null) return { state: "unsupported", totalBytes: null } as const;
+    const totalBytes = release.bytes;
+    if (state._tag === "installing") {
+      return {
+        state: "installing",
+        totalBytes,
+        downloadedBytes: progress.downloadedBytes,
+        unpacking: progress.unpacking,
+      } as const;
+    }
+    // Another server sharing this home can install it too, so the disk decides.
+    if (state._tag === "installed" || Option.isSome(yield* installedExecutable(release))) {
+      return { state: "ready", totalBytes } as const;
+    }
+    return lastFailure === undefined
+      ? ({ state: "not-installed", totalBytes } as const)
+      : ({ state: "failed", totalBytes, failure: lastFailure.detail } as const);
+  }).pipe(Effect.map((value): PreviewBrowserStatus => value));
+  const statusRef = yield* SubscriptionRef.make(yield* status);
+  const publishStatus = status.pipe(Effect.flatMap((next) => SubscriptionRef.set(statusRef, next)));
 
   const download = Effect.fn("PreviewBrowser.download")(
     function* (release: PreviewBrowserRelease, archivePath: string) {
@@ -226,6 +277,7 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
       yield* response.stream.pipe(
         Stream.tap((chunk) =>
           Effect.suspend(() => {
+            const before = megabytes(progress.downloadedBytes);
             progress.downloadedBytes += chunk.byteLength;
             if (progress.downloadedBytes > release.bytes) {
               return Effect.fail(
@@ -235,7 +287,8 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
               );
             }
             hash.update(chunk);
-            return Effect.void;
+            // Watchers see whole megabytes, not every chunk.
+            return megabytes(progress.downloadedBytes) === before ? Effect.void : publishStatus;
           }),
         ),
         Stream.run(fs.sink(archivePath, { flag: "wx", mode: 0o600 })),
@@ -329,6 +382,7 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
         const unpacked = path.join(staging, "browser");
         yield* download(release, archivePath);
         progress.unpacking = true;
+        yield* publishStatus;
         yield* extract(release, archivePath, unpacked);
         const destination = path.join(installRoot, release.version);
         // A directory left without a runnable binary would block the rename.
@@ -384,25 +438,28 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
         const done = yield* Deferred.make<string, PreviewBrowserInstallError>();
         progress.downloadedBytes = 0;
         progress.unpacking = false;
+        lastFailure = undefined;
         const installing: InstallState = { _tag: "installing", done };
         state = installing;
+        yield* publishStatus;
         yield* install(release).pipe(
           Effect.onExit((exit) =>
             gate
               .withPermit(
                 Effect.sync(() => {
-                  state = Exit.isSuccess(exit)
-                    ? { _tag: "installed", executable: exit.value }
-                    : {
-                        _tag: "failed",
-                        error: Option.getOrElse(
-                          Cause.findErrorOption(exit.cause),
-                          () => new PreviewBrowserInstallError({ detail: "The install stopped." }),
-                        ),
-                      };
+                  if (Exit.isSuccess(exit)) {
+                    state = { _tag: "installed", executable: exit.value };
+                    return;
+                  }
+                  const error = Option.getOrElse(
+                    Cause.findErrorOption(exit.cause),
+                    () => new PreviewBrowserInstallError({ detail: "The install stopped." }),
+                  );
+                  lastFailure = error;
+                  state = { _tag: "failed", error };
                 }),
               )
-              .pipe(Effect.andThen(Deferred.done(done, exit))),
+              .pipe(Effect.andThen(publishStatus), Effect.andThen(Deferred.done(done, exit))),
           ),
           Effect.ignoreCause,
           // Server shutdown closes the service scope and stops an install in progress.
@@ -451,7 +508,19 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
 
   const installed = release === null ? Effect.succeedNone : installedExecutable(release);
 
-  return PreviewBrowser.of({ executable, installed });
+  const requestInstall = Effect.gen(function* () {
+    if (release === null) return yield* status;
+    // A failure is handed back once and cleared, so joining again retries it.
+    if ((yield* join(release))._tag === "failed") yield* join(release);
+    return yield* status;
+  }).pipe(Effect.withSpan("PreviewBrowser.install"));
+
+  // A new watcher reads the disk first, in case another server installed it.
+  const changes = Stream.unwrap(
+    publishStatus.pipe(Effect.as(SubscriptionRef.changes(statusRef))),
+  ).pipe(Stream.changesWith((left, right) => JSON.stringify(left) === JSON.stringify(right)));
+
+  return PreviewBrowser.of({ executable, installed, status, changes, install: requestInstall });
 });
 
 export const layer = Layer.effect(

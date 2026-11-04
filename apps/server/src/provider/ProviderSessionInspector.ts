@@ -12,7 +12,7 @@ import * as Option from "effect/Option";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 
-export class ProviderSessionInspector extends Context.Service<
+class ProviderSessionInspector extends Context.Service<
   ProviderSessionInspector,
   {
     readonly readCatalog: (
@@ -116,4 +116,4 @@ export const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(ProviderSessionInspector, make);
+const layer = Layer.effect(ProviderSessionInspector, make);

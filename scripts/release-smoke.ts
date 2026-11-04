@@ -20,7 +20,6 @@ const workspaceFiles = [
   "apps/mobile/modules/stark-source-text/package.json",
   "apps/mobile/modules/stark-review-diff/package.json",
   "apps/mobile/modules/stark-terminal/package.json",
-  "apps/marketing/package.json",
   "infra/relay/package.json",
   "oxlint-plugin-starkcode/package.json",
   "packages/client-runtime/package.json",
@@ -211,12 +210,6 @@ function assertMissing(path: string, message: string): void {
 const tempRoot = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "stark-release-smoke-"));
 
 try {
-  NodeChildProcess.execFileSync(
-    process.execPath,
-    ["--test", NodePath.resolve(repoRoot, ".github/scripts/relay-state-output.test.cjs")],
-    { stdio: "inherit" },
-  );
-
   copyWorkspaceManifestFixture(tempRoot);
 
   NodeChildProcess.execFileSync(

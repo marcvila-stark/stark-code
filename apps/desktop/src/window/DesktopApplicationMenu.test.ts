@@ -14,6 +14,7 @@ import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
 import * as DesktopWindow from "./DesktopWindow.ts";
+import { createInitialDesktopUpdateState } from "../updates/updateMachine.ts";
 
 const environmentInput = {
   dirname: "/repo/apps/desktop/dist-electron",
@@ -70,6 +71,10 @@ const layerDesktopUpdates = Layer.succeed(DesktopUpdates.DesktopUpdates, {
   download: Effect.die("unexpected download"),
   install: Effect.die("unexpected install"),
   installPrepared: () => Effect.die("unexpected installPrepared"),
+  cancelDownload: Effect.die("unexpected cancelDownload"),
+  setPostponed: () => Effect.die("unexpected setPostponed"),
+  setRestartParticipant: () => Effect.void,
+  acknowledgeRestart: () => Effect.void,
 } satisfies DesktopUpdates.DesktopUpdates["Service"]);
 
 const layerDesktopWindow = (selectedAction: Deferred.Deferred<string>) =>
@@ -147,6 +152,9 @@ describe("DesktopApplicationMenu", () => {
       if (!Array.isArray(applicationMenu.submenu)) {
         throw new Error("Expected application menu submenu to be an array.");
       }
+      assert.isFunction(
+        applicationMenu.submenu.find((item) => item.label === "Check for Updates…")?.click,
+      );
       assert.equal(
         applicationMenu.submenu.find((item) => item.role === "about")?.label,
         "About Stark Code (Nightly)",
@@ -308,4 +316,54 @@ describe("DesktopApplicationMenu", () => {
       assert.equal(yield* Deferred.await(selectedAction), "main-reload");
     }),
   );
+});
+
+describe("describeMenuUpdateCheck", () => {
+  const base = {
+    ...createInitialDesktopUpdateState(
+      "1.2.3",
+      { hostArch: "arm64", appArch: "arm64", runningUnderArm64Translation: false },
+      "latest",
+    ),
+    enabled: true,
+  };
+
+  it("says why updates are off instead of claiming to be up to date", () => {
+    const dialog = DesktopApplicationMenu.describeMenuUpdateCheck({
+      ...base,
+      enabled: false,
+      status: "disabled",
+      disabledReason: {
+        code: "feed-not-configured",
+        message: "Automatic updates are off: no Stark update feed is configured for this build.",
+      },
+    });
+    assert.equal(dialog?.title, "Automatic updates are off");
+    assert.equal(
+      dialog?.detail,
+      "Automatic updates are off: no Stark update feed is configured for this build.",
+    );
+  });
+
+  it("reports up to date only after a check said so, and shows a failed check", () => {
+    assert.equal(
+      DesktopApplicationMenu.describeMenuUpdateCheck({ ...base, status: "up-to-date" })?.message,
+      "Stark Code 1.2.3 is the newest version.",
+    );
+    const failed = DesktopApplicationMenu.describeMenuUpdateCheck({
+      ...base,
+      status: "error",
+      errorContext: "check",
+      errorKind: "unreachable",
+      message: "Couldn't reach the update server.",
+    });
+    assert.equal(failed?.type, "warning");
+    assert.equal(failed?.detail, "Couldn't reach the update server.");
+  });
+
+  it("leaves a found or ready update to the app window", () => {
+    for (const status of ["available", "downloading", "verifying", "downloaded"] as const) {
+      assert.isNull(DesktopApplicationMenu.describeMenuUpdateCheck({ ...base, status }));
+    }
+  });
 });

@@ -1,4 +1,8 @@
-import { type EnvironmentId, type ScopedProjectRef } from "@starkfuture/contracts";
+import {
+  type EnvironmentId,
+  type ScopedProjectRef,
+  type ServerProvider,
+} from "@starkfuture/contracts";
 import { NeedsYouInbox } from "./sidebar/NeedsYouInbox";
 import { showContextMenuFallback } from "../contextMenuFallback";
 import { openThreadWithSideChat } from "../lib/sideChatNavigation";
@@ -19,7 +23,7 @@ import { requestCustomSnooze } from "./CustomSnoozeDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@starkfuture/shared/threadPullRequests";
 import { useAtomValue } from "@effect/atom-react";
-import { replaceComposerContextReferences } from "@starkfuture/shared/composerContextReferences";
+import { resolveChatDisplayTitle, resolveComposerDraftTitle } from "./composerDraftTitle";
 import * as Schema from "effect/Schema";
 import {
   DndContext,
@@ -45,6 +49,7 @@ import {
   type EnvironmentThreadSearchMatch,
 } from "@starkfuture/client-runtime/state/thread-search";
 import {
+  threadRunEndedUnfinished,
   threadRuntimeCanArchive,
   type EnvironmentThreadShell,
 } from "@starkfuture/client-runtime/state/models";
@@ -83,7 +88,6 @@ import {
   PlusIcon,
   SettingsIcon,
   ShieldQuestionIcon,
-  SquarePenIcon,
   TerminalIcon,
   Undo2Icon,
   XIcon,
@@ -147,6 +151,7 @@ import {
 } from "../threadSelectionStore";
 import { useAcknowledgeThreadWoke, useThreadActions } from "../hooks/useThreadActions";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
+import { useScratchProject } from "../hooks/useScratchProject";
 import { useTerminalFocus } from "../hooks/useTerminalFocus";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
@@ -163,6 +168,7 @@ import {
 import {
   readThreadShell,
   useAllEnvironmentProjectSnapshotsReady,
+  useAllEnvironmentShellsBootstrapped,
   useProjects,
   useThreadShells,
 } from "../state/entities";
@@ -231,6 +237,7 @@ import {
   sortSidebarV2ProjectGroups,
   sortThreadsForSidebar,
   sortWorkingThreadsBySend,
+  threadHandoffProviderNames,
   useThreadJumpHintVisibility,
   useRetainedValue,
   useSidebarRowSubscriptionLease,
@@ -287,6 +294,7 @@ import { SidebarContent, SidebarGroup, SidebarMenuButton, useSidebar } from "./u
 import { SidebarNavigationButton } from "./sidebar/SidebarNavigationButton";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
+import { mergeSidebarChatRows } from "./sidebar/sidebarChatList";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
 import { Tooltip, TooltipPopup, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { MiddleTruncate } from "./ui/middle-truncate";
@@ -406,15 +414,24 @@ function SidebarThreadTooltip({
   terminalProcessCount: number;
   statusLabel?: string | undefined;
 }) {
+  const displayTitle = resolveChatDisplayTitle({
+    title: thread.title,
+    environmentId: thread.environmentId,
+    providers: providerEntry ? [providerEntry.snapshot] : [],
+    providerInstanceId: modelInstanceId,
+    cwd: thread.worktreePath ?? project?.workspaceRoot,
+  });
   const driverKind = providerEntry?.driverKind ?? null;
-  const previousProviderNames = thread.providerInstanceHistory
-    .filter((instanceId) => instanceId !== modelInstanceId)
-    .map((instanceId) => providerEntryByInstanceId.get(instanceId)?.displayName ?? instanceId);
+  const previousProviderNames = threadHandoffProviderNames(
+    thread.providerInstanceHistory,
+    modelInstanceId,
+    providerEntryByInstanceId,
+  );
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
   return (
     <ThreadHoverCardPopup side="right" align="start" sideOffset={4}>
       <ThreadHoverCard
-        title={thread.title}
+        title={displayTitle}
         footer={
           supportsMultiplePullRequests && thread.pullRequests.length > 0 ? (
             <div className="border-t border-border/60 pt-2 pl-0.5 text-xs text-muted-foreground">
@@ -623,10 +640,7 @@ function SortableThreadRow(props: {
   return props.children(bag);
 }
 
-// Unsent work shares one look: the new-thread draft rows and thread rows
-// with unsent composer text both use this tint and pen so they read alike.
-const draftSurfaceClassName = "bg-warning/4 hover:bg-warning/8";
-const draftPenClassName = "size-3 shrink-0 text-warning-foreground";
+const draftLabelClassName = "shrink-0 text-2xs font-normal text-sidebar-muted-foreground";
 
 // Structural list items — the section headers and the
 // empty-section placeholders — take part in the sortable list so they shift
@@ -777,12 +791,13 @@ function SidebarSectionHeader(props: {
 // shares the same compact row as saved conversations. All the draft's
 // settings (model, env mode, branch, worktree) still travel with it —
 // clicking is a plain navigation to /draft/$draftId, which touches nothing.
-// While the draft is open the row renders a frozen snapshot (see
-// SidebarDraftBlock); memoized so per-keystroke block re-renders skip it
-// entirely.
+// Typing updates only the draft-list subscription, not the whole sidebar.
 const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   draftId: DraftId;
   composer: ComposerThreadDraftState;
+  providers: readonly ServerProvider[];
+  environmentId: EnvironmentId;
+  cwd: string | null;
   project: ProjectFaviconProject | null;
   projectDisplayName: string | null;
   isActive: boolean;
@@ -791,22 +806,15 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   onContextMenu: (draftId: DraftId, position: { x: number; y: number }) => void;
 }) {
   const { composer, draftId, onContextMenu, onDiscard, onNavigate } = props;
-  const promptPreview =
-    replaceComposerContextReferences(composer.prompt, (occurrence) => occurrence.label)
-      .trim()
-      .split("\n", 1)[0] ?? "";
-  // images mirrors persistedAttachments once rehydration finishes; before
-  // that only the persisted list is populated, hence max not sum.
-  const attachmentCount =
-    Math.max(composer.images.length, composer.persistedAttachments.length) +
-    composer.files.length +
-    composer.terminalContexts.length +
-    composer.previewAnnotations.length +
-    composer.reviewComments.length;
+  const explicitTitle = useComposerDraftStore((store) => store.getDraftSession(draftId)?.title);
   const preview =
-    promptPreview.length > 0
-      ? promptPreview
-      : `${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"}`;
+    explicitTitle ??
+    resolveComposerDraftTitle({
+      composer,
+      providers: props.providers,
+      environmentId: props.environmentId,
+      cwd: props.cwd,
+    });
   const accessibility = resolveSidebarRowAccessibility({
     title: preview,
     statusLabel: "Unsent draft",
@@ -856,7 +864,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
         data-testid="sidebar-draft-row"
         className={cn(
           "group/sidebar-row relative w-full cursor-pointer overflow-hidden rounded-md text-left text-sidebar-foreground outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-          props.isActive ? "bg-sidebar-row-active" : draftSurfaceClassName,
+          props.isActive ? "bg-sidebar-row-active" : "hover:bg-sidebar-row-hover",
         )}
         onClick={handleActivate}
         onContextMenu={handleContextMenu}
@@ -864,12 +872,14 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
       >
         <span className="sr-only">{preview}</span>
         <div className="relative z-10 flex h-8 min-w-0 items-center gap-2 px-(--sidebar-row-content-inset)">
-          <SquarePenIcon aria-hidden className={draftPenClassName} />
           <span
             aria-hidden
             className="min-w-0 flex-1 truncate stark-sidebar-chat-title font-normal text-foreground/90"
           >
             {preview}
+          </span>
+          <span aria-hidden className={draftLabelClassName}>
+            Draft
           </span>
           <span className="ml-auto flex h-5 min-w-5 shrink-0 items-center justify-end">
             <Tooltip>
@@ -900,114 +910,77 @@ interface SidebarDraftRowData {
   composer: ComposerThreadDraftState;
 }
 
-// Draft sessions with user content, surfaced above the pinned block so an
-// interrupted "new thread" stays one click away. Self-contained (own store
-// subscription + closing divider) so per-keystroke composer updates
-// re-render only this block, never the whole sidebar. Vanishes at count 0.
-const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
+// This subscription owns draft previews so typing never rebuilds the full sidebar.
+// Drafts are ordinary rows in the recent-chat order; opening one keeps its full
+// composer state rather than reconstructing it from the preview.
+const SidebarChatRows = memo(function SidebarChatRows(props: {
   projectByKey: ReadonlyMap<string, EnvironmentProject>;
   projectDisplayNameByKey: ReadonlyMap<string, string>;
   scopedProjectKeys: ReadonlySet<string> | null;
   routeDraftId: string | null;
   onNavigateToDraft: (draftId: DraftId) => void;
   onDraftContextMenu: (draftId: DraftId, position: { x: number; y: number }) => void;
+  recentThreads: readonly EnvironmentThreadShell[] | null;
+  threadRows: readonly ReactNode[];
 }) {
+  const serverConfigs = useAtomValue(environmentServerConfigsAtom);
   const draftThreadsByThreadKey = useComposerDraftStore((store) => store.draftThreadsByThreadKey);
   const draftsByThreadKey = useComposerDraftStore((store) => store.draftsByThreadKey);
-  // The open draft's row is FROZEN at the moment the draft became the route:
-  // it stays visible (like a thread row) but never repaints while the user
-  // types. A draft that was never navigated away from has no snapshot to
-  // freeze, so a fresh typing session shows no row at all. Captured
-  // synchronously on route change (setState-during-render derived state) so
-  // the row never flickers out for a frame between route change and capture.
-  const [frozenActive, setFrozenActive] = useState<{
-    routeDraftId: string | null;
-    row: SidebarDraftRowData | null;
-  }>({ routeDraftId: null, row: null });
-  if (frozenActive.routeDraftId !== props.routeDraftId) {
-    let row: SidebarDraftRowData | null = null;
-    if (props.routeDraftId !== null) {
-      const draftId = DraftId.make(props.routeDraftId);
-      const store = useComposerDraftStore.getState();
-      const session = store.getDraftSession(draftId);
-      const composer = store.getComposerDraft(draftId);
-      row =
-        session && session.promotedTo == null && composer && composerDraftHasUserContent(composer)
-          ? { draftId, session, composer }
-          : null;
-    }
-    setFrozenActive({ routeDraftId: props.routeDraftId, row });
-  }
   const drafts = useMemo(() => {
     const rows: SidebarDraftRowData[] = [];
-    // Every non-promoted session with content gets a row, mapped or not:
-    // new-thread surfaces mint fresh drafts and leave invested ones behind
-    // unmapped, so the mapping only knows about the latest per project.
     for (const [draftKey, session] of Object.entries(draftThreadsByThreadKey)) {
-      if (session.promotedTo != null) {
-        continue;
-      }
+      if (session.promotedTo != null) continue;
       if (
         props.scopedProjectKeys !== null &&
         !props.scopedProjectKeys.has(`${session.environmentId}:${session.projectId}`)
-      ) {
+      )
         continue;
-      }
-      if (draftKey === props.routeDraftId) {
-        // Open draft: render the frozen entry snapshot, or nothing for a
-        // draft that has never been left. Gated on the LIVE session above so
-        // send/discard still removes the row immediately.
-        if (frozenActive.routeDraftId === draftKey && frozenActive.row !== null) {
-          rows.push(frozenActive.row);
-        }
-        continue;
-      }
       const composer = draftsByThreadKey[draftKey];
-      if (!composer || !composerDraftHasUserContent(composer)) {
-        continue;
-      }
+      if (!composer || !composerDraftHasUserContent(composer)) continue;
       rows.push({ draftId: DraftId.make(draftKey), session, composer });
     }
     rows.sort((left, right) => right.session.createdAt.localeCompare(left.session.createdAt));
     return rows;
-  }, [
-    draftThreadsByThreadKey,
-    draftsByThreadKey,
-    frozenActive,
-    props.routeDraftId,
-    props.scopedProjectKeys,
-  ]);
-  if (drafts.length === 0) {
-    return null;
+  }, [draftThreadsByThreadKey, draftsByThreadKey, props.scopedProjectKeys]);
+  const draftRows = drafts.map(({ composer, draftId, session }) => {
+    const projectKey = `${session.environmentId}:${session.projectId}`;
+    return {
+      key: `draft:${draftId}`,
+      timestamp: session.createdAt,
+      pinned: false,
+      element: (
+        <SidebarDraftRow
+          key={`draft:${draftId}`}
+          draftId={draftId}
+          composer={composer}
+          providers={serverConfigs.get(session.environmentId)?.providers ?? []}
+          environmentId={session.environmentId}
+          cwd={session.worktreePath ?? props.projectByKey.get(projectKey)?.workspaceRoot ?? null}
+          project={props.projectByKey.get(projectKey) ?? null}
+          projectDisplayName={props.projectDisplayNameByKey.get(projectKey) ?? null}
+          isActive={draftId === props.routeDraftId}
+          onNavigate={props.onNavigateToDraft}
+          onDiscard={discardComposerDraft}
+          onContextMenu={props.onDraftContextMenu}
+        />
+      ),
+    };
+  });
+  if (props.recentThreads === null) {
+    return (
+      <>
+        {draftRows.map((row) => row.element)}
+        {props.threadRows}
+      </>
+    );
   }
-  return (
-    <>
-      {drafts.map(({ composer, draftId, session }) => {
-        const projectKey = `${session.environmentId}:${session.projectId}`;
-        return (
-          <SidebarDraftRow
-            key={draftId}
-            draftId={draftId}
-            composer={composer}
-            project={props.projectByKey.get(projectKey) ?? null}
-            projectDisplayName={props.projectDisplayNameByKey.get(projectKey) ?? null}
-            isActive={draftId === props.routeDraftId}
-            onNavigate={props.onNavigateToDraft}
-            // The /draft/$draftId route redirects home on its own when the
-            // draft it renders disappears, so discarding the open draft needs
-            // no special-casing here.
-            onDiscard={discardComposerDraft}
-            onContextMenu={props.onDraftContextMenu}
-          />
-        );
-      })}
-      <li
-        aria-hidden
-        data-testid="sidebar-draft-divider"
-        className="mx-2.5 my-1.5 h-px list-none bg-sidebar-border/60"
-      />
-    </>
-  );
+  const threadRows = props.recentThreads.map((thread, index) => ({
+    key: scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+    timestamp: thread.latestUserAuthoredMessageAt ?? thread.latestUserMessageAt ?? thread.createdAt,
+    pinned: thread.pinnedAt != null,
+    element: props.threadRows[index],
+  }));
+  return <>{mergeSidebarChatRows(threadRows, draftRows).map((row) => row.element)}</>;
 });
 
 // Verb and icon on the lifted row while it hovers over another section. Uses
@@ -1164,9 +1137,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   });
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
   const terminalProcessCount = runningTerminalIds.length;
-  // Unsent composer text on this thread. The open thread shows its own
-  // composer, so the marker only decorates rows you have navigated away from.
-  const hasUnsentDraft = useThreadHasUnsentDraft(threadRef) && !props.isActive;
+  const hasUnsentDraft = useThreadHasUnsentDraft(threadRef);
   const handleDiscardDraftClick = useCallback(
     (event: ReactMouseEvent) => {
       event.preventDefault();
@@ -1283,13 +1254,21 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                       icon: "woke" as const,
                       className: "text-warning",
                     }
-                  : isUnread
+                  : isUnread && threadRunEndedUnfinished(thread.latestRun)
                     ? {
-                        label: "Done",
-                        icon: "done" as const,
-                        className: "text-success",
+                        // A restart or stop cut this turn short; its partial
+                        // reply is not a finished answer.
+                        label: "Interrupted",
+                        icon: null,
+                        className: "text-warning",
                       }
-                    : null;
+                    : isUnread
+                      ? {
+                          label: "Done",
+                          icon: "done" as const,
+                          className: "text-success",
+                        }
+                      : null;
   const isWokeStatus = topStatus?.icon === "woke";
 
   const branchMismatch = resolveLocalCheckoutBranchMismatch({
@@ -1302,6 +1281,13 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
 
   const modelInstanceId = thread.runtime?.providerInstanceId ?? thread.modelSelection.instanceId;
   const providerEntry = props.providerEntryByInstanceId.get(modelInstanceId) ?? null;
+  const displayTitle = resolveChatDisplayTitle({
+    title: thread.title,
+    environmentId: thread.environmentId,
+    providers: providerEntry ? [providerEntry.snapshot] : [],
+    providerInstanceId: modelInstanceId,
+    cwd: thread.worktreePath ?? props.project?.workspaceRoot,
+  });
   const showInstanceBadge =
     providerEntry !== null &&
     shouldShowInstanceBadge(providerEntry, props.providerEntryByInstanceId.values());
@@ -1527,11 +1513,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       ? "bg-sidebar-row-active text-sidebar-foreground"
       : isSelected || props.sweepAction !== null
         ? "bg-sidebar-row-selected text-sidebar-foreground"
-        : hasUnsentDraft
-          ? cn(draftSurfaceClassName, "text-sidebar-foreground")
-          : shouldRecede
-            ? "text-sidebar-muted-foreground/75 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
-            : "bg-transparent text-sidebar-foreground hover:bg-sidebar-row-hover",
+        : shouldRecede
+          ? "text-sidebar-muted-foreground/75 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+          : "bg-transparent text-sidebar-foreground hover:bg-sidebar-row-hover",
     // Background work fades as a whole row, status label included, so it
     // takes less attention than rows that need a human (input, approval).
     shouldRecede &&
@@ -1582,8 +1566,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     ) : null;
 
   const accessibility = resolveSidebarRowAccessibility({
-    title: thread.title,
-    statusLabel: topStatus?.label ?? null,
+    title: displayTitle,
+    statusLabel:
+      [topStatus?.label, hasUnsentDraft ? "Unsent draft" : null].filter(Boolean).join(", ") || null,
     projectDisplayName: props.projectDisplayName,
     isActive: props.isActive,
   });
@@ -1634,10 +1619,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           isRegeneratingTitle && "opacity-55",
         )}
       >
-        {thread.title}
+        {displayTitle}
       </span>
     );
-  const accessibleTitle = isRenaming ? null : <span className="sr-only">{thread.title}</span>;
+  const accessibleTitle = isRenaming ? null : <span className="sr-only">{displayTitle}</span>;
 
   // Stacks show their layer count; multiple unrelated links show their total count.
   // Either opens the thread's pull requests tab; a single PR link opens that PR and still
@@ -1669,24 +1654,14 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       onThreadActivate={onThreadActivate}
     />
   );
-  // Same pen the new-thread draft rows lead with, so both kinds of unsent
-  // work read the same way in the list.
   const draftIndicator = hasUnsentDraft ? (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <span
-            role="img"
-            aria-label="Unsent draft"
-            data-testid={`sidebar-draft-indicator-${thread.id}`}
-            className="inline-flex shrink-0 items-center"
-          />
-        }
-      >
-        <SquarePenIcon aria-hidden className={draftPenClassName} />
-      </TooltipTrigger>
-      <TooltipPopup side="top">Unsent draft</TooltipPopup>
-    </Tooltip>
+    <span
+      aria-hidden
+      data-testid={`sidebar-draft-indicator-${thread.id}`}
+      className={draftLabelClassName}
+    >
+      Draft
+    </span>
   ) : null;
   const showPin =
     props.isPinned && (!sortable?.isDragging || (props.dragOverPinned && props.dropVerb === null));
@@ -1783,8 +1758,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
             }
           >
             {accessibleTitle}
-            {draftIndicator}
             {title}
+            {draftIndicator}
             {pinIndicator}
             {terminalStatusIcon}
             {isRegeneratingTitle ? (
@@ -1933,8 +1908,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
         >
           {accessibleTitle}
           <div className="relative z-10 flex h-8 min-w-0 items-center gap-2 px-(--sidebar-row-content-inset)">
-            {draftIndicator}
             {title}
+            {draftIndicator}
             {isRegeneratingTitle ? (
               <span role="status" className="sr-only">
                 Regenerating title
@@ -2059,7 +2034,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 <button
                   type="button"
                   aria-haspopup="menu"
-                  aria-label={`Actions for ${thread.title}`}
+                  aria-label={`Actions for ${displayTitle}`}
                   className={cn(
                     "inline-flex size-7 cursor-pointer items-center justify-center rounded-md border-0 outline-none hover:bg-sidebar hover:text-stark-gold-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                     props.isActive
@@ -2093,7 +2068,7 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
   thread: SidebarThreadSummary;
   project: EnvironmentProject | null;
   projectDisplayName: string | null;
-  sideChatParentTitle?: string | undefined;
+  sideChatParent?: EnvironmentThreadShell | undefined;
   environmentLabel: string | null;
   environmentMachine: EnvironmentMachineKind;
   providerEntryByInstanceId: ReadonlyMap<string, ProviderInstanceEntry>;
@@ -2107,9 +2082,34 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
   onFileDropThreads: (threadRef: ScopedThreadRef, files: File[]) => void;
 }) {
   const { thread } = props;
-  const accessibility = resolveSidebarRowAccessibility({
+  const titleProviderInstanceId =
+    thread.runtime?.providerInstanceId ?? thread.modelSelection.instanceId;
+  const titleProvider = props.providerEntryByInstanceId.get(titleProviderInstanceId);
+  const displayTitle = resolveChatDisplayTitle({
     title: thread.title,
-    statusLabel: null,
+    environmentId: thread.environmentId,
+    providers: titleProvider ? [titleProvider.snapshot] : [],
+    providerInstanceId: titleProviderInstanceId,
+    cwd: thread.worktreePath ?? props.project?.workspaceRoot,
+  });
+  const parent = props.sideChatParent;
+  const parentProviderId = parent?.runtime?.providerInstanceId ?? parent?.modelSelection.instanceId;
+  const parentProvider = parentProviderId
+    ? props.providerEntryByInstanceId.get(parentProviderId)
+    : null;
+  const parentDisplayTitle = parent
+    ? resolveChatDisplayTitle({
+        title: parent.title,
+        environmentId: parent.environmentId,
+        providers: parentProvider ? [parentProvider.snapshot] : [],
+        providerInstanceId: parentProviderId,
+        cwd: parent.worktreePath ?? parent.localSession?.cwd ?? props.project?.workspaceRoot,
+      })
+    : null;
+  const hasUnsentDraft = useThreadHasUnsentDraft(scopeThreadRef(thread.environmentId, thread.id));
+  const accessibility = resolveSidebarRowAccessibility({
+    title: displayTitle,
+    statusLabel: hasUnsentDraft ? "Unsent draft" : null,
     projectDisplayName: props.projectDisplayName,
     isActive: props.isRouteActive,
   });
@@ -2230,8 +2230,13 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
                   thread.titleRegeneration != null && "opacity-55",
                 )}
               >
-                {thread.title}
+                {displayTitle}
               </span>
+              {hasUnsentDraft ? (
+                <span aria-hidden className={draftLabelClassName}>
+                  Draft
+                </span>
+              ) : null}
               <span id={`${props.resultId}-pr`} className="contents">
                 <ThreadSearchPullRequestNumber
                   thread={thread}
@@ -2244,9 +2249,9 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
                 {threadTimeLabel(thread)}
               </span>
             </span>
-            {props.sideChatParentTitle ? (
+            {parentDisplayTitle ? (
               <span className="truncate text-xs text-sidebar-muted-foreground">
-                Side chat in {props.sideChatParentTitle}
+                Side chat in {parentDisplayTitle}
               </span>
             ) : null}
             {props.searchMatch ? (
@@ -2371,6 +2376,9 @@ export default function Sidebar() {
     },
   });
   const newThreadContext = useHandleNewThread();
+  const allShellsBootstrapped = useAllEnvironmentShellsBootstrapped();
+  const { scratchEnvironmentId, startScratchThread } = useScratchProject();
+  const [startingScratch, setStartingScratch] = useState(false);
   const openFolder = useOpenFolder();
   const [openFolderDialog, setOpenFolderDialog] = useState(false);
   const [localChatImportOpen, setLocalChatImportOpen] = useState(false);
@@ -2634,11 +2642,10 @@ export default function Sidebar() {
     setProjectScopeKey,
   ]);
   // Count-only subscription: the parent needs "are there draft rows" for the
-  // empty state, while SidebarDraftBlock owns the per-keystroke content
+  // empty state, while SidebarChatRows owns the per-keystroke content
   // subscription. Selecting a number keeps typing in a draft composer from
-  // re-rendering the whole sidebar. Approximates the block's row filter
-  // (every non-promoted session with content); it can overcount by one for
-  // an open never-left draft, which only softens the empty state.
+  // re-rendering the whole sidebar. Matches the row filter, including an
+  // open draft as soon as it has user content.
   const routeDraftIdForRows = routeTarget?.kind === "draft" ? routeTarget.draftId : null;
   const visibleDraftSessionCount = useComposerDraftStore((store) => {
     let count = 0;
@@ -4979,6 +4986,26 @@ export default function Sidebar() {
   // for multi-project setups.
   const handleNewThreadClick = useCallback(
     (event?: ReactMouseEvent) => {
+      if (projects.length === 0) {
+        if (startingScratch || !allShellsBootstrapped) return;
+        if (isMobile) setOpenMobile(false);
+        const environmentId = scratchEnvironmentId(primaryEnvironmentId);
+        if (environmentId) {
+          setStartingScratch(true);
+          void startScratchThread(environmentId)
+            .catch((error: unknown) => {
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Could not start chat",
+                  description: error instanceof Error ? error.message : "Try opening a folder.",
+                }),
+              );
+            })
+            .finally(() => setStartingScratch(false));
+        } else openFolderPicker();
+        return;
+      }
       if (newThreadContext.selectedProjectRef) {
         if (isMobile) setOpenMobile(false);
         void startNewThreadFromContext({
@@ -5003,7 +5030,19 @@ export default function Sidebar() {
       if (isMobile) setOpenMobile(false);
       openCommandPalette({ open: "new-thread-in" });
     },
-    [isMobile, newThreadContext, projectGroups.length, setOpenMobile],
+    [
+      allShellsBootstrapped,
+      isMobile,
+      newThreadContext,
+      projectGroups.length,
+      projects.length,
+      setOpenMobile,
+      startingScratch,
+      scratchEnvironmentId,
+      primaryEnvironmentId,
+      startScratchThread,
+      openFolderPicker,
+    ],
   );
 
   // New chat uses the selected folder. All folders retains the chooser;
@@ -5207,7 +5246,9 @@ export default function Sidebar() {
                 void router.navigate({ to: "/settings/archived" });
               }}
               onNewThread={handleNewThreadClick}
-              newThreadDisabled={projects.length === 0}
+              newThreadDisabled={
+                startingScratch || (projects.length === 0 && !allShellsBootstrapped)
+              }
               newThreadShortcutLabel={newThreadShortcutLabel}
               newThreadInProjectShortcutLabel={newThreadInProjectShortcutLabel}
               showNewThreadInProjectHint={scopedProjectGroup === null && projectGroups.length > 1}
@@ -5250,7 +5291,7 @@ export default function Sidebar() {
                         isSettled={settledThreadKeys.has(threadKey)}
                         key={threadKey}
                         thread={thread}
-                        sideChatParentTitle={sideChatGroups.parentByChildKey.get(threadKey)?.title}
+                        sideChatParent={sideChatGroups.parentByChildKey.get(threadKey)}
                         project={
                           projectByKey.get(`${thread.environmentId}:${thread.projectId}`) ?? null
                         }
@@ -5295,6 +5336,22 @@ export default function Sidebar() {
                 {threadSearch.isPending ? "Searching chat messages…" : "No chats found"}
               </p>
             )
+          ) : null}
+          {isSearchingThreads && threadSearchQuery.trim().length >= 2 ? (
+            // Sidebar search covers active threads only; History adds archived ones.
+            <Button
+              variant="ghost-muted"
+              size="xs"
+              className="mx-auto mt-1"
+              onClick={() => {
+                const q = threadSearchQuery.trim();
+                clearThreadSearch();
+                if (isMobile) setOpenMobile(false);
+                void router.navigate({ to: "/history", search: { q } });
+              }}
+            >
+              Search all history
+            </Button>
           ) : null}
           {!isSearchingThreads ? (
             <TooltipProvider
@@ -5481,17 +5538,7 @@ export default function Sidebar() {
                         );
                       };
                       const from = isContextDrag ? null : (dragState?.activeSection ?? null);
-                      const items: ReactNode[] = [
-                        <SidebarDraftBlock
-                          key="draft-sessions"
-                          projectByKey={projectByKey}
-                          projectDisplayNameByKey={projectDisplayNameByKey}
-                          scopedProjectKeys={scopedProjectKeys}
-                          routeDraftId={routeDraftIdForRows}
-                          onNavigateToDraft={navigateToDraft}
-                          onDraftContextMenu={handleDraftContextMenu}
-                        />,
-                      ];
+                      const items: ReactNode[] = [];
                       for (const item of sidebarListItems) {
                         if (item.kind === "thread") {
                           items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
@@ -5616,7 +5663,18 @@ export default function Sidebar() {
                             break;
                         }
                       }
-                      return items;
+                      return (
+                        <SidebarChatRows
+                          projectByKey={projectByKey}
+                          projectDisplayNameByKey={projectDisplayNameByKey}
+                          scopedProjectKeys={scopedProjectKeys}
+                          routeDraftId={routeDraftIdForRows}
+                          onNavigateToDraft={navigateToDraft}
+                          onDraftContextMenu={handleDraftContextMenu}
+                          recentThreads={groupChatsByStatus ? null : visibleRecentChats}
+                          threadRows={items}
+                        />
+                      );
                     })()}
                     {!groupChatsByStatus && hiddenRecentChatsCount > 0 ? (
                       <li className="list-none">

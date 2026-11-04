@@ -25,7 +25,8 @@ beforeEach(() => {
   useRightPanelStore.setState({
     byThreadKey: {},
     auxiliaryPanelByThreadKey: {},
-    threadPanelVisibilityByThreadKey: {},
+    threadPanelInlineOpen: true,
+    threadPanelPopoverOpenByThreadKey: {},
     userActionRevisionByThreadKey: {},
     closeRevisionByThreadKey: {},
   });
@@ -488,7 +489,7 @@ describe("rightPanelStore", () => {
           surfaces: [{ id: "browser:tab-a", kind: "preview", resourceId: "tab-a" }],
         },
       },
-      threadPanelVisibilityByThreadKey: {},
+      threadPanelInlineOpen: true,
     });
   });
 
@@ -519,7 +520,7 @@ describe("rightPanelStore", () => {
           ],
         },
       },
-      threadPanelVisibilityByThreadKey: {},
+      threadPanelInlineOpen: true,
     });
   });
 
@@ -550,7 +551,7 @@ describe("rightPanelStore", () => {
           ],
         },
       },
-      threadPanelVisibilityByThreadKey: {},
+      threadPanelInlineOpen: true,
     });
   });
 
@@ -594,7 +595,7 @@ describe("rightPanelStore", () => {
           ],
         },
       },
-      threadPanelVisibilityByThreadKey: {},
+      threadPanelInlineOpen: true,
     });
   });
 
@@ -626,7 +627,7 @@ describe("rightPanelStore", () => {
       }),
     ).toEqual({
       byThreadKey: { "env-1:thread-A": panelState },
-      threadPanelVisibilityByThreadKey: {},
+      threadPanelInlineOpen: true,
     });
   });
 
@@ -666,63 +667,70 @@ describe("rightPanelStore", () => {
           surfaces: [{ id: "diff", kind: "diff" }],
         },
       },
-      threadPanelVisibilityByThreadKey: {},
+      threadPanelInlineOpen: true,
     });
   });
 
-  it("persists inline preference without restoring an open popover", () => {
+  it("persists the client-wide hidden card without restoring an open popover", () => {
+    // Before v15 the card was hidden per thread; those choices start it shown again.
     expect(
       migratePersistedRightPanelState({
         threadPanelVisibilityByThreadKey: {
           "env-1:thread-A": { inlineOpen: false, popoverOpen: true },
-          "env-1:thread-B": { inlineOpen: true, popoverOpen: true },
         },
       }),
-    ).toEqual({
+    ).toEqual({ byThreadKey: {}, threadPanelInlineOpen: true });
+    expect(migratePersistedRightPanelState({ threadPanelInlineOpen: false })).toEqual({
       byThreadKey: {},
-      threadPanelVisibilityByThreadKey: {
-        "env-1:thread-A": { inlineOpen: false, popoverOpen: false },
-      },
+      threadPanelInlineOpen: false,
     });
+
+    useRightPanelStore.getState().setThreadPanelOpen(refA, "inline", false);
+    useRightPanelStore.getState().setThreadPanelOpen(refA, "popover", true);
+    const persisted = useRightPanelStore.persist
+      .getOptions()
+      .partialize?.(useRightPanelStore.getState());
+    expect(persisted).toMatchObject({ threadPanelInlineOpen: false });
+    expect(persisted).not.toHaveProperty("threadPanelPopoverOpenByThreadKey");
   });
 
-  it("tracks inline and popover visibility independently", () => {
+  it("hides the inline card in every thread until it is shown again", () => {
     const store = useRightPanelStore.getState();
+    expect(selectThreadPanelOpen(store, refA, "inline")).toBe(true);
+    expect(selectThreadPanelOpen(store, refA, "popover")).toBe(false);
 
-    expect(selectThreadPanelOpen(store.threadPanelVisibilityByThreadKey, refA, "inline")).toBe(
-      true,
-    );
-    expect(selectThreadPanelOpen(store.threadPanelVisibilityByThreadKey, refA, "popover")).toBe(
-      false,
-    );
+    store.setThreadPanelOpen(refA, "inline", false);
+    expect(selectThreadPanelOpen(useRightPanelStore.getState(), refA, "inline")).toBe(false);
+    expect(selectThreadPanelOpen(useRightPanelStore.getState(), refB, "inline")).toBe(false);
 
+    // Tools → Chat details toggles the same choice back, from any thread.
+    store.toggleThreadPanel(refB, "inline");
+    expect(selectThreadPanelOpen(useRightPanelStore.getState(), refA, "inline")).toBe(true);
+  });
+
+  it("keeps popover visibility per thread", () => {
+    const store = useRightPanelStore.getState();
     store.setThreadPanelOpen(refA, "inline", false);
     store.toggleThreadPanel(refA, "popover");
 
-    expect(
-      selectThreadPanelVisibility(
-        useRightPanelStore.getState().threadPanelVisibilityByThreadKey,
-        refA,
-      ),
-    ).toEqual({ inlineOpen: false, popoverOpen: true });
-    expect(
-      selectThreadPanelVisibility(
-        useRightPanelStore.getState().threadPanelVisibilityByThreadKey,
-        refB,
-      ),
-    ).toEqual({ inlineOpen: true, popoverOpen: false });
+    expect(selectThreadPanelVisibility(useRightPanelStore.getState(), refA)).toEqual({
+      inlineOpen: false,
+      popoverOpen: true,
+    });
+    expect(selectThreadPanelVisibility(useRightPanelStore.getState(), refB)).toEqual({
+      inlineOpen: false,
+      popoverOpen: false,
+    });
   });
 
   it("closes the popover atomically when the real right panel opens", () => {
     useRightPanelStore.getState().setThreadPanelOpen(refA, "popover", true);
     useRightPanelStore.getState().open(refA, "diff");
 
-    expect(
-      selectThreadPanelVisibility(
-        useRightPanelStore.getState().threadPanelVisibilityByThreadKey,
-        refA,
-      ),
-    ).toEqual({ inlineOpen: true, popoverOpen: false });
+    expect(selectThreadPanelVisibility(useRightPanelStore.getState(), refA)).toEqual({
+      inlineOpen: true,
+      popoverOpen: false,
+    });
   });
 
   it("keeps an open popover visible by promoting it to inline when the real panel closes", () => {
@@ -732,12 +740,52 @@ describe("rightPanelStore", () => {
     store.setThreadPanelOpen(refA, "popover", true);
     store.close(refA);
 
+    expect(selectThreadPanelVisibility(useRightPanelStore.getState(), refA)).toEqual({
+      inlineOpen: true,
+      popoverOpen: true,
+    });
+  });
+
+  it("keeps the card hidden after Hide in the popover once it fits inline again", () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "diff");
+    // Tools → Chat details opens the card as a popover beside the real panel.
+    store.toggleThreadPanel(refA, "popover");
+    store.hideThreadPanel(refA);
+
+    expect(selectThreadPanelVisibility(useRightPanelStore.getState(), refA)).toEqual({
+      inlineOpen: false,
+      popoverOpen: false,
+    });
+    store.close(refA);
+    expect(selectThreadPanelVisibility(useRightPanelStore.getState(), refA)).toEqual({
+      inlineOpen: false,
+      popoverOpen: false,
+    });
     expect(
-      selectThreadPanelVisibility(
-        useRightPanelStore.getState().threadPanelVisibilityByThreadKey,
-        refA,
-      ),
-    ).toEqual({ inlineOpen: true, popoverOpen: true });
+      useRightPanelStore.persist.getOptions().partialize?.(useRightPanelStore.getState()),
+    ).toMatchObject({ threadPanelInlineOpen: false });
+
+    // Tools → Chat details brings it back, as a popover and then inline.
+    store.open(refA, "diff");
+    store.toggleThreadPanel(refA, "popover");
+    expect(selectThreadPanelOpen(useRightPanelStore.getState(), refA, "popover")).toBe(true);
+    store.close(refA);
+    expect(selectThreadPanelOpen(useRightPanelStore.getState(), refA, "inline")).toBe(true);
+  });
+
+  it("leaves the remembered choice alone when the popover is only dismissed", () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "diff");
+    store.toggleThreadPanel(refA, "popover");
+    // A click outside or Escape closes only this popover.
+    store.setThreadPanelOpen(refA, "popover", false);
+    store.close(refA);
+
+    expect(selectThreadPanelVisibility(useRightPanelStore.getState(), refA)).toEqual({
+      inlineOpen: true,
+      popoverOpen: false,
+    });
   });
 
   it("open sets the active panel for a thread", () => {
@@ -1354,5 +1402,21 @@ describe("rightPanelStore", () => {
     expect(surfaceIds()).toEqual(["browser:tab-a", "terminal:term-1", "diff", "browser:tab-b"]);
     // Reordering is not a choice about what the panel shows.
     expect(store.getUserActionRevision(refA)).toBe(revision);
+  });
+});
+
+describe("Conversation tools tab requests", () => {
+  it("opens Conversation tools on the requested view once, for that thread only", () => {
+    useRightPanelStore.setState({ pendingSideWorkTab: null });
+    const store = useRightPanelStore.getState();
+    store.openBrowser(refA, "tab-1");
+    store.requestSideWorkTab(refA, "workers");
+
+    const state = useRightPanelStore.getState();
+    expect(selectAuxiliaryPanel(state.auxiliaryPanelByThreadKey, refA)).toBe("side-work");
+    // Another thread's panel does not take the request.
+    expect(state.consumeSideWorkTabRequest(refB)).toBeNull();
+    expect(state.consumeSideWorkTabRequest(refA)).toBe("workers");
+    expect(useRightPanelStore.getState().consumeSideWorkTabRequest(refA)).toBeNull();
   });
 });

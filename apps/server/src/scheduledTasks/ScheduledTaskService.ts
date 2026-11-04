@@ -2,11 +2,21 @@ import {
   CommandId,
   MessageId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
+  ProjectId,
+  ProviderInteractionMode,
+  RuntimeMode,
+  RunId,
   ScheduledTask,
   ScheduledTaskError,
+  DEFAULT_RUNTIME_MODE,
   ScheduledTaskId,
+  ScheduledTaskRunId,
   ThreadId,
   ScheduledTaskWebhookDeliveryId,
+  type OrchestrationV2Run,
+  type ScheduledTaskListRunsInput,
+  type ScheduledTaskListRunsResult,
+  type ScheduledTaskRun,
   type ScheduledTaskDeleteInput,
   type ScheduledTaskDeleteResult,
   type ScheduledTaskGetWebhookDeliveryInput,
@@ -29,6 +39,7 @@ import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
+import * as Fiber from "effect/Fiber";
 import * as Metric from "effect/Metric";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -41,11 +52,40 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import { DispatchSettingsWrite } from "../orchestration-v2/DispatchSettingsWrite.ts";
+import { clampsToSupervised, effectiveRuntimeMode } from "../orchestration-v2/PermissionPolicy.ts";
+import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import { resolveProjectSettings } from "@starkfuture/shared/projectSettings";
 import * as Metrics from "../observability/Metrics.ts";
+import * as PermissionContainment from "../orchestration-v2/PermissionContainment.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as MaintenanceGate from "../maintenance/MaintenanceGate.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
+import {
+  RUN_ERRORS,
+  RUN_HISTORY_LIMIT,
+  applyAgentObservation,
+  insertRun,
+  isFinishedAgentStatus,
+  occurrenceKeys,
+  pruneRuns,
+  runCommandId,
+  runMessageId,
+  selectLatestRuns,
+  selectObservedRuns,
+  selectRunByOccurrence,
+  selectTaskRuns,
+  selectUnsettledRuns,
+  selectRun,
+  toScheduledTaskRun,
+  type NewRun,
+  type RunDispatchKind,
+  type RunDispatchState,
+  type ScheduledTaskRunRow,
+} from "./ScheduledTaskRuns.ts";
 import {
   redactHeaders,
   redactQuery,
@@ -216,6 +256,36 @@ interface WebhookDeliveryRow {
   readonly error: string | null;
 }
 
+/** What a scheduled run's prompt was sent as, for reading back what became of it. */
+export interface ScheduledTaskRunTarget {
+  readonly commandId: CommandId;
+  readonly messageId: MessageId;
+  readonly projectId: ProjectId;
+  /** The bound thread of a send, or the thread a launch created once that is known. */
+  readonly threadId: ThreadId | null;
+  readonly dispatchKind: RunDispatchKind;
+  /** The agent run the scheduled run follows, once one was observed. */
+  readonly agentRunId: RunId | null;
+}
+
+/** What the orchestrator recorded for a run's prompt, as read after a restart. */
+export type ScheduledTaskRunRecovery =
+  /** No command was recorded: the server stopped before the prompt went out. */
+  | { readonly _tag: "NotDispatched" }
+  | { readonly _tag: "Rejected"; readonly threadId: ThreadId | null }
+  /** A launch created its thread, but the prompt was never sent to it. */
+  | { readonly _tag: "ThreadOnly"; readonly threadId: ThreadId }
+  /** The prompt was accepted but its thread or run can no longer be found. */
+  | { readonly _tag: "Missing"; readonly threadId: ThreadId | null }
+  /** The agent run, following restart continuations, read at `sequence` or later. */
+  | { readonly _tag: "Observed"; readonly run: OrchestrationV2Run; readonly sequence: number }
+  /** The records could not be read; the run is left for the next pass. */
+  | { readonly _tag: "Unknown" };
+
+export type ScheduledTaskRunInspector = (
+  target: ScheduledTaskRunTarget,
+) => Effect.Effect<ScheduledTaskRunRecovery>;
+
 export class ScheduledTaskService extends Context.Service<
   ScheduledTaskService,
   {
@@ -253,6 +323,26 @@ export class ScheduledTaskService extends Context.Service<
     readonly triggerWebhook: (
       request: WebhookTriggerRequest,
     ) => Effect.Effect<WebhookTriggerResult, ScheduledTaskError>;
+    /** Newest runs of one task, newest first. */
+    readonly listRuns: (
+      input: ScheduledTaskListRunsInput,
+    ) => Effect.Effect<ScheduledTaskListRunsResult, ScheduledTaskError>;
+    /**
+     * Applies one orchestration run event, stored at `sequence`, to the
+     * scheduled runs it belongs to. Fed by ScheduledTaskRunTracker.
+     */
+    readonly observeRun: (observation: {
+      readonly run: OrchestrationV2Run;
+      readonly sequence: number;
+    }) => Effect.Effect<void, ScheduledTaskError>;
+    /**
+     * Settles runs a stopped server left open, asking `inspect` what the
+     * orchestrator recorded for each. Runs this server is still holding are
+     * left alone. ScheduledTaskRunTracker calls it once it follows run events.
+     */
+    readonly reconcileRuns: (
+      inspect: ScheduledTaskRunInspector,
+    ) => Effect.Effect<void, ScheduledTaskError>;
   }
 >()("stark-code/scheduledTasks/ScheduledTaskService") {}
 
@@ -262,6 +352,50 @@ function taskError(message: string, input?: { taskId?: ScheduledTaskId; cause?: 
     ...(input?.taskId === undefined ? {} : { taskId: input.taskId }),
     ...(input?.cause === undefined ? {} : { cause: input.cause }),
   });
+}
+
+const isScheduledTaskError = Schema.is(ScheduledTaskError);
+const isProviderInstanceDisabled = Schema.is(
+  ThreadManagementService.ThreadManagementProviderInstanceDisabledError,
+);
+const isThreadLaunchError = Schema.is(ThreadLaunchService.ThreadLaunchError);
+
+/**
+ * A run on a bound thread uses that thread's own settings, so it starts only
+ * while the thread stays within the task's limit. Its reason is the run's
+ * visible error; the thread is never widened or changed for the run.
+ */
+class ScheduledTaskBoundRunRefusedError extends Schema.TaggedError<ScheduledTaskBoundRunRefusedError>()(
+  "ScheduledTaskBoundRunRefusedError",
+  {
+    taskId: ScheduledTaskId,
+    threadId: ThreadId,
+    reason: Schema.Literals(["inherit", "provider_changed", "above_task_limit"]),
+    task: Schema.Struct({ runtimeMode: RuntimeMode, interactionMode: ProviderInteractionMode }),
+    thread: Schema.Struct({ runtimeMode: RuntimeMode, interactionMode: ProviderInteractionMode }),
+  },
+) {
+  override get message(): string {
+    return PermissionContainment.boundRunRefusalMessage(this);
+  }
+}
+const isBoundRunRefused = Schema.is(ScheduledTaskBoundRunRefusedError);
+
+/**
+ * The fixed reason a run shows for a failed dispatch, which read-scope
+ * clients can see, and the thread a failed launch already created. The cause
+ * itself can carry request data, so it only reaches the server log.
+ */
+function dispatchFailure(cause: Cause.Cause<unknown>) {
+  const error = Cause.squash(cause);
+  return {
+    error: isProviderInstanceDisabled(error)
+      ? RUN_ERRORS.providerDisabled
+      : isBoundRunRefused(error)
+        ? error.message
+        : RUN_ERRORS.notStarted,
+    threadId: isThreadLaunchError(error) ? (error.threadId ?? null) : null,
+  };
 }
 
 function iso(value: DateTime.DateTime): string {
@@ -396,7 +530,113 @@ export const layer = Layer.effect(
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const secretRequests = yield* SecretRequests.SecretRequests;
     const scheduler = yield* Scheduler.Scheduler;
+    const maintenance = yield* MaintenanceGate.MaintenanceGate;
     const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
+    // Optional so narrow test layers keep working; the runtime provides both.
+    const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+    const runtimePolicy = yield* Effect.serviceOption(RuntimePolicy.RuntimePolicyV2);
+    /**
+     * The preset a saved task runs: the one it names, else the project's
+     * default mode, aligned to what its provider actually runs. Full access is
+     * refused for a provider Stark always runs Supervised, rather than stored
+     * as a mode it never gets.
+     */
+    const projectDefaultMode = (input: ScheduledTaskUpsertInput, taskId: ScheduledTaskId) =>
+      Option.isSome(serverSettings)
+        ? serverSettings.value.getSettings.pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not read the project's default mode.", { taskId, cause }),
+            ),
+            Effect.map(
+              (settings) =>
+                resolveProjectSettings(settings, input.projectId).settings.defaultRuntimeMode,
+            ),
+          )
+        : Effect.succeed(DEFAULT_RUNTIME_MODE);
+    const taskCapabilities = (input: ScheduledTaskUpsertInput) =>
+      Option.isNone(runtimePolicy)
+        ? Effect.succeed(undefined)
+        : runtimePolicy.value.permissionCapabilities(input.modelSelection.instanceId);
+    const taskRuntimeMode = (input: ScheduledTaskUpsertInput, taskId: ScheduledTaskId) =>
+      Effect.gen(function* () {
+        const requested = input.runtimeMode ?? (yield* projectDefaultMode(input, taskId));
+        const capabilities = yield* taskCapabilities(input);
+        if (capabilities === undefined) return requested;
+        if (requested === "full-access" && clampsToSupervised(capabilities.driver)) {
+          return yield* taskError(
+            "Full access is not available for this provider. Choose Supervised.",
+            { taskId },
+          );
+        }
+        return effectiveRuntimeMode(requested, capabilities);
+      });
+    /**
+     * A sender without the settings-write scope may save a task only at a mode
+     * that widens nothing (O12), checked on the mode the task will actually
+     * store, whether it was named or resolved from the project default. That
+     * is: the narrowest preset; for an existing task, no more than it already
+     * allows on the same provider instance; for a new task, no more than the
+     * project default every new chat gets (O9) or, for a task bound to a
+     * thread, than that thread already runs. RPC authorization only sees a
+     * named mode; this check also covers an omitted one.
+     */
+    const authorizeTaskMode = (input: {
+      readonly upsert: ScheduledTaskUpsertInput;
+      readonly taskId: ScheduledTaskId;
+      readonly existing: ScheduledTask | null;
+      readonly runtimeMode: RuntimeMode;
+    }) =>
+      Effect.gen(function* () {
+        if ((yield* DispatchSettingsWrite) !== false) return;
+        const { upsert, existing, runtimeMode } = input;
+        if (runtimeMode === "approval-required") return;
+        const instanceId = upsert.modelSelection.instanceId;
+        if (existing !== null) {
+          if (
+            existing.modelSelection.instanceId === instanceId &&
+            PermissionContainment.presetWithin(runtimeMode, existing.runtimeMode)
+          )
+            return;
+        } else {
+          const capabilities = yield* taskCapabilities(upsert);
+          const projectDefault = yield* projectDefaultMode(upsert, input.taskId);
+          const defaultPreset =
+            capabilities === undefined
+              ? projectDefault
+              : effectiveRuntimeMode(projectDefault, capabilities);
+          if (PermissionContainment.presetWithin(runtimeMode, defaultPreset)) return;
+          const thread =
+            upsert.threadId == null
+              ? null
+              : yield* threadManagement
+                  .getThreadShell(upsert.threadId)
+                  .pipe(Effect.orElseSucceed(() => null));
+          if (
+            thread !== null &&
+            thread.deletedAt === null &&
+            thread.providerInstanceId === instanceId &&
+            PermissionContainment.presetWithin(
+              runtimeMode,
+              PermissionContainment.grantingPreset(
+                thread,
+                capabilities?.driver === undefined
+                  ? undefined
+                  : {
+                      driver: capabilities.driver,
+                      supportedRuntimeModes: capabilities.supportedRuntimeModes,
+                    },
+              ),
+            )
+          )
+            return;
+        }
+        return yield* taskError(
+          existing === null
+            ? "Saving a scheduled task with broader permissions than new chats get needs permission to change settings."
+            : "Widening this scheduled task's permissions needs permission to change settings.",
+          { taskId: input.taskId },
+        );
+      });
     // Webhook deliveries for one task dispatch in arrival order rather than
     // being dropped while an earlier delivery is still dispatching.
     const webhookPermits = yield* Ref.make<ReadonlyMap<ScheduledTaskId, Semaphore.Semaphore>>(
@@ -412,6 +652,56 @@ export const layer = Layer.effect(
     // latest signal — an unbounded backlog would just grow memory.
     const changesPubSub = yield* PubSub.sliding<void>(1);
     const notifyChanged = PubSub.publish(changesPubSub, undefined).pipe(Effect.asVoid);
+    /**
+     * Refuses a bound run while its thread asks for more than the task allows
+     * (see ScheduledTaskBoundRunRefusedError), so the run's history says why.
+     * The run also carries the task's limit as its permission ceiling, and the
+     * orchestrator checks it again when the run starts, including after it
+     * waited in the queue. A thread that is gone is left to the send.
+     */
+    const refuseBoundRunAboveTaskLimit = (task: ScheduledTask, threadId: ThreadId) =>
+      Effect.gen(function* () {
+        const thread = yield* threadManagement.getThreadShell(threadId);
+        if (thread === null || thread.deletedAt !== null) return;
+        const reason = PermissionContainment.boundRunRefusal({
+          task: { ...task, providerInstanceId: task.modelSelection.instanceId },
+          thread,
+        });
+        if (reason === undefined) return;
+        const refusal = new ScheduledTaskBoundRunRefusedError({
+          taskId: task.id,
+          threadId,
+          reason,
+          task: { runtimeMode: task.runtimeMode, interactionMode: task.interactionMode },
+          thread: { runtimeMode: thread.runtimeMode, interactionMode: thread.interactionMode },
+        });
+        yield* Effect.logWarning("Refused a scheduled run above its task's limit", {
+          taskId: task.id,
+          threadId,
+          reason,
+        });
+        return yield* refusal;
+      });
+    // Webhook runs are detached from the request so the HTTP response does not
+    // wait for them, and Run now from the RPC so a client that disconnects
+    // cannot stop a dispatch halfway; scoped to the service so shutdown
+    // interrupts them.
+    const serviceScope = yield* Effect.scope;
+    // Runs this process is waiting on or dispatching. A reconcile pass treats
+    // every other open run as left behind by a stopped server.
+    const heldRuns = yield* Ref.make<ReadonlySet<string>>(new Set());
+    const holdRun = (runId: string) => Ref.update(heldRuns, (held) => new Set(held).add(runId));
+    const releaseRun = (runId: string) =>
+      Ref.update(heldRuns, (held) => {
+        const next = new Set(held);
+        next.delete(runId);
+        return next;
+      });
+    const newRunId = crypto.randomUUIDv4().pipe(
+      Effect.map((uuid) => ScheduledTaskRunId.make(`scheduled-run:${uuid}`)),
+      Effect.mapError((cause) => taskError("Could not generate run id.", { cause })),
+    );
+    const runError = (message: string) => (cause: unknown) => taskError(message, { cause });
 
     const selectAllRows = () => sql<ScheduledTaskRow>`
       SELECT
@@ -445,7 +735,25 @@ export const layer = Layer.effect(
     const listRows = Effect.fn("ScheduledTaskService.listRows")(function* () {
       const rows = yield* selectAllRows();
       const origin = yield* readWebhookOrigin;
-      return yield* Effect.forEach(rows, (row) => decodeRow(row, origin), { concurrency: 1 });
+      // Keyed by creation time too, so a task recreated under the same id
+      // never shows a run of the one it replaced.
+      const latestRuns = new Map(
+        (yield* selectLatestRuns(sql)).map((run) => [
+          `${run.task_id}\u0000${run.task_created_at}`,
+          toScheduledTaskRun(run),
+        ]),
+      );
+      return yield* Effect.forEach(
+        rows,
+        (row) =>
+          decodeRow(row, origin).pipe(
+            Effect.map((task) => {
+              const latestRun = latestRuns.get(`${task.id}\u0000${task.createdAt}`);
+              return latestRun === undefined ? task : { ...task, latestRun };
+            }),
+          ),
+        { concurrency: 1 },
+      );
     });
 
     const getRows = (id: ScheduledTaskId) => sql<ScheduledTaskRow>`
@@ -615,10 +923,12 @@ export const layer = Layer.effect(
         ),
       );
 
+    // A deleted task's runs go with it; threads they started keep running.
     const deleteRow = (id: ScheduledTaskId) =>
       sql
         .withTransaction(
           sql`DELETE FROM scheduled_task_webhook_deliveries WHERE task_id = ${id}`.pipe(
+            Effect.andThen(sql`DELETE FROM scheduled_task_runs WHERE task_id = ${id}`),
             Effect.andThen(sql`DELETE FROM scheduled_tasks WHERE task_id = ${id}`),
           ),
         )
@@ -631,23 +941,144 @@ export const layer = Layer.effect(
     // Run-state transitions use targeted UPDATEs (never the full-row upsert) so
     // a completing run cannot resurrect a deleted task or clobber concurrent
     // edits to the task definition.
-    const markRunning = (id: ScheduledTaskId, startedAtIso: string) =>
-      sql<{ task_id: string }>`
-        UPDATE scheduled_tasks
-        SET updated_at = ${startedAtIso},
-            last_run_at = ${startedAtIso},
-            last_run_status = 'running',
-            last_run_error = NULL
-        WHERE task_id = ${id}
-        RETURNING task_id
-      `.pipe(
-        Effect.mapError((cause) =>
-          taskError("Could not mark schedule task as running.", { taskId: id, cause }),
-        ),
-        // A task deleted after the re-read must not be dispatched from the stale snapshot.
-        Effect.flatMap((rows) =>
-          rows.length > 0 ? Effect.void : taskError("Schedule task not found.", { taskId: id }),
-        ),
+
+    /**
+     * Reserves a run for its occurrence and marks the task running, in one
+     * transaction. A scheduled run moves next_run_at past its slot in the same
+     * write whether or not the slot already has a run, so a second tick or a
+     * server that stopped mid-run steps over the slot instead of choosing it
+     * again forever. A webhook run claims the row its delivery recorded.
+     */
+    const reserveRun = (input: {
+      readonly task: ScheduledTask;
+      readonly runId: ScheduledTaskRunId;
+      readonly trigger: ScheduledTaskRun["trigger"];
+      readonly occurrenceKey: string;
+      readonly startedAt: DateTime.DateTime;
+      readonly slot: { readonly at: string; readonly next: string | null } | null;
+      readonly claimsWaitingRun: boolean;
+    }) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const startedAtIso = iso(input.startedAt);
+            if (input.slot !== null) {
+              yield* sql`
+                UPDATE scheduled_tasks
+                SET next_run_at = ${input.slot.next}, updated_at = ${startedAtIso}
+                WHERE task_id = ${input.task.id}
+                  AND created_at = ${input.task.createdAt}
+                  AND next_run_at = ${input.slot.at}
+              `;
+            }
+            const reserved = input.claimsWaitingRun
+              ? yield* sql<{ run_id: string }>`
+                  UPDATE scheduled_task_runs
+                  SET dispatch_state = 'dispatching', started_at = ${startedAtIso}
+                  WHERE run_id = ${input.runId} AND dispatch_state = 'waiting'
+                  RETURNING run_id
+                `.pipe(Effect.map((rows) => rows.length > 0))
+              : yield* insertRun(sql, {
+                  runId: input.runId,
+                  task: input.task,
+                  trigger: input.trigger,
+                  occurrenceKey: input.occurrenceKey,
+                  webhookDeliveryId: null,
+                  dispatchState: "dispatching",
+                  createdAt: startedAtIso,
+                  startedAt: startedAtIso,
+                });
+            if (!reserved) {
+              const existing = yield* selectRunByOccurrence(sql, input.occurrenceKey);
+              return existing === null
+                ? ({ _tag: "TaskGone" } as const)
+                : ({ _tag: "Existing", run: toScheduledTaskRun(existing) } as const);
+            }
+            const marked = yield* sql<{ task_id: string }>`
+              UPDATE scheduled_tasks
+              SET updated_at = ${startedAtIso},
+                  last_run_at = ${startedAtIso},
+                  last_run_status = 'running',
+                  last_run_error = NULL
+              WHERE task_id = ${input.task.id}
+              RETURNING task_id
+            `;
+            // A task deleted after the re-read must not be dispatched from the stale snapshot.
+            if (marked.length === 0) {
+              return yield* taskError("Schedule task not found.", { taskId: input.task.id });
+            }
+            yield* pruneRuns(sql, input.task.id, DateTime.toUtc(input.startedAt));
+            return { _tag: "Reserved" } as const;
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isScheduledTaskError(cause)
+              ? cause
+              : taskError("Could not mark schedule task as running.", {
+                  taskId: input.task.id,
+                  cause,
+                }),
+          ),
+        );
+
+    /**
+     * Records what the launch or send returned. Once an agent run was observed
+     * for this run, that observation outranks the dispatch result.
+     */
+    const recordDispatch = (
+      runId: string,
+      outcome: {
+        readonly threadId: string | null;
+        readonly error: string | null;
+        readonly at: string;
+      },
+    ) =>
+      sql`
+        UPDATE scheduled_task_runs
+        SET thread_id = COALESCE(thread_id, ${outcome.threadId}),
+            error = CASE WHEN dispatch_state = 'dispatching' THEN ${outcome.error} ELSE error END,
+            ended_at = CASE
+              WHEN dispatch_state = 'dispatching' AND ${outcome.error} IS NOT NULL THEN ${outcome.at}
+              ELSE ended_at
+            END,
+            dispatch_state = CASE
+              WHEN dispatch_state <> 'dispatching' THEN dispatch_state
+              WHEN ${outcome.error} IS NULL THEN 'dispatched'
+              ELSE 'failed'
+            END
+        WHERE run_id = ${runId}
+      `.pipe(Effect.mapError(runError("Could not record schedule task run.")));
+
+    /** Ends a run whose prompt never reached an agent, if it is still in one of `from`. */
+    const settleRun = (input: {
+      readonly runId: string;
+      readonly from: ReadonlyArray<RunDispatchState>;
+      readonly state: "failed" | "skipped" | "interrupted";
+      readonly error: string;
+      readonly threadId?: string | null;
+      /** Drops an observed agent state that can no longer be read. */
+      readonly forgetAgent?: boolean;
+    }) =>
+      Effect.gen(function* () {
+        const endedAt = iso(yield* localNow);
+        const rows = yield* sql<{ run_id: string }>`
+          UPDATE scheduled_task_runs
+          SET dispatch_state = ${input.state},
+              error = ${input.error},
+              ended_at = ${endedAt},
+              thread_id = COALESCE(thread_id, ${input.threadId ?? null}),
+              agent_status = CASE WHEN ${input.forgetAgent === true ? 1 : 0} = 1 THEN NULL ELSE agent_status END
+          WHERE run_id = ${input.runId} AND dispatch_state IN ${sql.in(input.from)}
+          RETURNING run_id
+        `;
+        return rows.length > 0;
+      }).pipe(Effect.mapError(runError("Could not record schedule task run.")));
+
+    const loadRun = (runId: string) =>
+      selectRun(sql, runId).pipe(
+        Effect.map((row) => (row === null ? null : toScheduledTaskRun(row))),
+        Effect.mapError(runError("Could not load schedule task run.")),
       );
 
     const markCompleted = (input: {
@@ -707,11 +1138,31 @@ export const layer = Layer.effect(
         ),
       );
 
+    /** How a run was triggered, plus what each trigger brings with it. */
+    interface RunContext {
+      readonly trigger: ScheduledTaskRun["trigger"];
+      /** A manual run's click id: a repeated request with it returns the run it started. */
+      readonly clickId?: string | undefined;
+      /** A webhook run: its delivery, the prompt rendered from it, and the run recorded with it. */
+      readonly webhook?: {
+        readonly deliveryId: string;
+        readonly prompt: string;
+        readonly runId: ScheduledTaskRunId;
+      };
+    }
+
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
-      trigger: "scheduled" | "manual" | "webhook",
-      webhook?: { readonly deliveryId: string; readonly prompt: string },
+      context: RunContext,
     ) {
+      const { trigger, webhook } = context;
+      if (trigger === "manual" && context.clickId !== undefined) {
+        const repeated = yield* selectRunByOccurrence(
+          sql,
+          occurrenceKeys.manual(task, context.clickId),
+        ).pipe(Effect.mapError(runError("Could not load schedule task run.")));
+        if (repeated !== null) return { task, run: toScheduledTaskRun(repeated) };
+      }
       const reserved = yield* Ref.modify(activeRuns, (active) => {
         if (active.has(task.id)) return [false, active] as const;
         const next = new Set(active);
@@ -722,8 +1173,12 @@ export const layer = Layer.effect(
         if (trigger !== "scheduled") {
           return yield* taskError("Schedule task is already running.", { taskId: task.id });
         }
-        return task;
+        return { task, run: null };
       }
+      // A webhook run was held when its delivery was accepted, and its
+      // delivery releases it.
+      const runId = webhook?.runId ?? (yield* newRunId);
+      if (webhook === undefined) yield* holdRun(runId);
 
       return yield* Effect.gen(function* () {
         const startedAt = yield* localNow;
@@ -744,7 +1199,7 @@ export const layer = Layer.effect(
           if (trigger !== "scheduled") {
             return yield* taskError("Schedule task not found.", { taskId: task.id });
           }
-          return task;
+          return { task, run: null };
         }
         // A next_run_at corrupted between the poll read and this re-read must
         // not defect the poll; an unparseable value is treated as not due.
@@ -756,7 +1211,7 @@ export const layer = Layer.effect(
             Option.isNone(parsedNextRunAt) ||
             DateTime.toEpochMillis(parsedNextRunAt.value) > DateTime.toEpochMillis(startedAt))
         ) {
-          return active;
+          return { task: active, run: null };
         }
         // A queued delivery must not run a task that was paused, deleted and
         // recreated under the same id, or switched to another trigger while
@@ -773,17 +1228,56 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
-        yield* markRunning(active.id, startedAtIso);
+        const slot = trigger === "scheduled" ? active.nextRunAt : null;
+        const occurrenceKey =
+          webhook !== undefined
+            ? occurrenceKeys.webhook(active.id, webhook.deliveryId)
+            : slot !== null
+              ? occurrenceKeys.scheduled(active, slot)
+              : occurrenceKeys.manual(active, context.clickId ?? runId);
+        const reservation = yield* maintenanceGuardReservation(
+          maintenance,
+          trigger,
+          webhook !== undefined,
+          reserveRun({
+            task: active,
+            runId,
+            trigger,
+            occurrenceKey,
+            startedAt,
+            slot: slot === null ? null : { at: slot, next: nextRunAt(active, startedAt) },
+            claimsWaitingRun: webhook !== undefined,
+          }),
+        );
+        if (reservation === "maintenance-skipped") return { task: active, run: null };
+        if (reservation._tag === "TaskGone") {
+          if (webhook !== undefined) {
+            return yield* new WebhookDeliverySkipped({
+              reason: "The task was deleted before this delivery ran.",
+            });
+          }
+          if (trigger !== "scheduled") {
+            return yield* taskError("Schedule task not found.", { taskId: task.id });
+          }
+          return { task: active, run: null };
+        }
+        if (reservation._tag === "Existing") {
+          if (webhook !== undefined) {
+            return yield* new WebhookDeliverySkipped({ reason: RUN_ERRORS.alreadyRan });
+          }
+          if (slot !== null) {
+            yield* Effect.logInfo("Stepping over a scheduled slot that already has a run", {
+              taskId: active.id,
+              slot,
+            });
+            yield* notifyChanged;
+          }
+          return { task: active, run: reservation.run };
+        }
         yield* notifyChanged;
 
-        // A webhook run is keyed by its delivery so the same delivery can
-        // never dispatch twice.
-        const fireKey =
-          webhook === undefined
-            ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
-            : `${active.id}:webhook:${webhook.deliveryId}`;
-        const commandId = CommandId.make(`scheduled-task:${fireKey}`);
-        const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
+        const commandId = runCommandId(occurrenceKey);
+        const messageId = runMessageId(occurrenceKey);
         // Dispatch from the fresh row so prompt/model/binding edits made
         // after the poll read are honoured. A webhook prompt was rendered
         // from the row when the request arrived.
@@ -795,45 +1289,66 @@ export const layer = Layer.effect(
         const result =
           active.threadId === null
             ? yield* Effect.exit(
-                threadLaunch.launch({
-                  commandId,
-                  projectId: active.projectId,
-                  title: active.title,
-                  modelSelection: active.modelSelection,
-                  runtimeMode: active.runtimeMode,
-                  interactionMode: active.interactionMode,
-                  workspaceStrategy: active.workspaceStrategy,
-                  initialMessage: {
-                    messageId,
-                    scheduledTaskId: active.id,
-                    text: prompt,
-                    attachments: [],
-                  },
-                  createdBy: active.createdBy,
-                  creationSource: active.creationSource,
-                }),
+                threadLaunch
+                  .launch({
+                    commandId,
+                    projectId: active.projectId,
+                    title: active.title,
+                    modelSelection: active.modelSelection,
+                    runtimeMode: active.runtimeMode,
+                    interactionMode: active.interactionMode,
+                    // Scheduled chats run their task's preset, never inherited settings.
+                    permissionSource: "override",
+                    workspaceStrategy: active.workspaceStrategy,
+                    initialMessage: {
+                      messageId,
+                      scheduledTaskId: active.id,
+                      text: prompt,
+                      attachments: [],
+                    },
+                    createdBy: active.createdBy,
+                    creationSource: active.creationSource,
+                  })
+                  .pipe(Effect.map((launched) => launched.threadId)),
               )
             : yield* Effect.exit(
-                threadManagement.sendToThread({
-                  projectId: active.projectId,
-                  commandId,
-                  threadId: ThreadId.make(active.threadId),
-                  messageId,
-                  scheduledTaskId: active.id,
-                  text: prompt,
-                  attachments: [],
-                  modelSelection: active.modelSelection,
-                  // Scheduled prompts must not interrupt tools in the bound thread.
-                  mode: "queue",
-                  createdBy: active.createdBy,
-                  creationSource: active.creationSource,
-                }),
+                refuseBoundRunAboveTaskLimit(active, ThreadId.make(active.threadId)).pipe(
+                  Effect.andThen(
+                    threadManagement.sendToThread({
+                      projectId: active.projectId,
+                      commandId,
+                      threadId: ThreadId.make(active.threadId),
+                      messageId,
+                      scheduledTaskId: active.id,
+                      text: prompt,
+                      attachments: [],
+                      modelSelection: active.modelSelection,
+                      // Scheduled prompts must not interrupt tools in the bound thread.
+                      mode: "queue",
+                      permissionCeiling: {
+                        providerInstanceId: active.modelSelection.instanceId,
+                        runtimeMode: active.runtimeMode,
+                        interactionMode: active.interactionMode,
+                      },
+                      createdBy: active.createdBy,
+                      creationSource: active.creationSource,
+                    }),
+                  ),
+                  // The bound thread was recorded when the run was reserved.
+                  Effect.as(null),
+                ),
               );
 
         const completedAt = yield* localNow;
         const runSucceeded = result._tag === "Success";
         const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
         const lastRunError = runSucceeded ? null : errorMessage(result.cause);
+        const failure = result._tag === "Success" ? null : dispatchFailure(result.cause);
+        yield* recordDispatch(runId, {
+          threadId: result._tag === "Success" ? result.value : (failure?.threadId ?? null),
+          error: failure?.error ?? null,
+          at: iso(completedAt),
+        });
         // Re-read the task so the next run is computed from the schedule as it
         // is *now* (the user may have edited or deleted it while we ran).
         const current = yield* findTask(task.id);
@@ -859,9 +1374,9 @@ export const layer = Layer.effect(
             error: lastRunError,
             startedAtIso,
           });
-          yield* notifyChanged;
         }
-        return completed;
+        yield* notifyChanged;
+        return { task: completed, run: yield* loadRun(runId) };
       }).pipe(
         Effect.onError((cause) => releaseStuckRun(task, errorMessage(cause))),
         Effect.ensuring(
@@ -869,33 +1384,59 @@ export const layer = Layer.effect(
             const next = new Set(active);
             next.delete(task.id);
             return next;
-          }),
+          }).pipe(Effect.andThen(webhook === undefined ? releaseRun(runId) : Effect.void)),
         ),
       );
     });
 
     // A due fixed-time run that is long past its slot (server was off or
     // asleep) is skipped and re-aimed at its next occurrence, not fired late.
+    // The skipped slot is kept as a run, so the history explains the gap.
     const rescheduleMissedRun = Effect.fn("ScheduledTaskService.rescheduleMissedRun")(function* (
       task: ScheduledTask,
       now: DateTime.DateTime,
     ) {
       const next = nextRunAt(task, now);
+      const slot = task.nextRunAt;
+      const runId = yield* newRunId;
       yield* Effect.logInfo("Skipping missed schedule task run", {
         taskId: task.id,
-        missedRunAt: task.nextRunAt,
+        missedRunAt: slot,
         rescheduledTo: next,
       });
-      yield* sql`
-        UPDATE scheduled_tasks
-        SET next_run_at = ${next},
-            updated_at = ${iso(now)}
-        WHERE task_id = ${task.id}
-      `.pipe(
-        Effect.mapError((cause) =>
-          taskError("Could not reschedule missed schedule task run.", { taskId: task.id, cause }),
-        ),
-      );
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              UPDATE scheduled_tasks
+              SET next_run_at = ${next},
+                  updated_at = ${iso(now)}
+              WHERE task_id = ${task.id}
+            `;
+            if (slot === null) return;
+            yield* insertRun(sql, {
+              runId,
+              task,
+              trigger: "scheduled",
+              occurrenceKey: occurrenceKeys.missed(task, slot),
+              webhookDeliveryId: null,
+              dispatchState: "skipped",
+              error: RUN_ERRORS.missedSlot,
+              createdAt: slot,
+              startedAt: null,
+              endedAt: iso(now),
+            });
+            yield* pruneRuns(sql, task.id, DateTime.toUtc(now));
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not reschedule missed schedule task run.", {
+              taskId: task.id,
+              cause,
+            }),
+          ),
+        );
       yield* notifyChanged;
     });
 
@@ -913,7 +1454,7 @@ export const layer = Layer.effect(
           Effect.suspend(() =>
             isMissedFixedTimeRun(task.schedule, dueAt, now)
               ? rescheduleMissedRun(task, now)
-              : runTask(task, "scheduled"),
+              : runTask(task, { trigger: "scheduled" }),
           ).pipe(
             Effect.catch((cause) =>
               Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
@@ -1076,6 +1617,13 @@ export const layer = Layer.effect(
                 return { token, secret, secretChanged };
               })
             : { token: null, secret: null, secretChanged: true };
+        const runtimeMode = yield* taskRuntimeMode(input, id);
+        yield* authorizeTaskMode({
+          upsert: input,
+          taskId: id,
+          existing: existingTask,
+          runtimeMode,
+        });
         const scheduleUnchanged =
           existingTask !== null &&
           existingTask.enabled === input.enabled &&
@@ -1090,7 +1638,7 @@ export const layer = Layer.effect(
           threadId: input.threadId ?? null,
           workspaceStrategy: input.workspaceStrategy,
           modelSelection: input.modelSelection,
-          runtimeMode: input.runtimeMode,
+          runtimeMode,
           interactionMode: input.interactionMode,
           createdBy: existingTask?.createdBy ?? input.createdBy ?? "user",
           creationSource: input.creationSource ?? "web",
@@ -1167,12 +1715,17 @@ export const layer = Layer.effect(
             taskId: input.id,
           });
         }
-        const next = yield* runTask(task, "manual").pipe(
+        const outcome = yield* runTask(task, { trigger: "manual", clickId: input.commandId }).pipe(
+          // The run belongs to the service, not the request: a client that
+          // disconnects mid-dispatch must not leave it half-recorded.
+          Effect.forkIn(serviceScope),
+          Effect.flatMap(Fiber.join),
           Effect.mapError((cause) =>
             taskError("Could not run schedule task.", { taskId: input.id, cause }),
           ),
         );
-        return { task: next };
+        const { task: next, run } = outcome;
+        return run === null ? { task: next } : { task: next, run };
       });
 
     const rotateWebhookToken: ScheduledTaskService["Service"]["rotateWebhookToken"] = (input) =>
@@ -1267,6 +1820,8 @@ export const layer = Layer.effect(
       readonly missing: ReadonlyArray<string>;
       readonly renderedPrompt: string | null;
       readonly error?: string;
+      /** The run an accepted delivery waits as, written with the log entry so neither exists without the other. */
+      readonly run?: { readonly row: NewRun; readonly now: DateTime.DateTime };
     }) => {
       const truncated = input.request.body.byteLength > WEBHOOK_DELIVERY_LOG_BODY_LIMIT;
       const loggedBody = truncated
@@ -1313,6 +1868,10 @@ export const layer = Layer.effect(
                 LIMIT ${WEBHOOK_DELIVERY_RETENTION}
               )
           `;
+            if (input.run !== undefined) {
+              yield* insertRun(sql, input.run.row);
+              yield* pruneRuns(sql, input.taskId, DateTime.toUtc(input.run.now));
+            }
           }),
         )
         .pipe(
@@ -1370,10 +1929,6 @@ export const layer = Layer.effect(
             : [raced, permits];
         });
       });
-
-    // Detached from the request so the HTTP response does not wait for the
-    // run; scoped to the service so shutdown interrupts it.
-    const serviceScope = yield* Effect.scope;
 
     /**
      * Records one handled request on the span and in metrics. `outcome` is
@@ -1516,6 +2071,7 @@ export const layer = Layer.effect(
                 readonly missing?: ReadonlyArray<string>;
                 readonly renderedPrompt?: string;
                 readonly error?: string;
+                readonly run?: NewRun;
               } = {},
             ) =>
               recordDelivery({
@@ -1528,6 +2084,7 @@ export const layer = Layer.effect(
                 missing: details.missing ?? [],
                 renderedPrompt: details.renderedPrompt ?? null,
                 ...(details.error === undefined ? {} : { error: details.error }),
+                ...(details.run === undefined ? {} : { run: { row: details.run, now } }),
               });
 
             // Only the first rejected request in a window is logged, so a flood
@@ -1587,6 +2144,7 @@ export const layer = Layer.effect(
               yield* observe("prompt_too_long");
               return { _tag: "accepted" as const, deliveryId, outcome: "prompt_too_long" as const };
             }
+            const runId = yield* newRunId;
             // Bound the deliveries one task holds, so steady traffic to a stuck
             // task cannot pile up parked fibers. A refused request is not logged,
             // so it cannot push real deliveries out of the log.
@@ -1613,22 +2171,46 @@ export const layer = Layer.effect(
               if (count <= 0) next.delete(queueKey);
               else next.set(queueKey, count);
               return next;
-            });
+            }).pipe(Effect.andThen(releaseRun(runId)));
+            yield* holdRun(runId);
+            // The delivery waits as a run, visible in the run history until its
+            // turn comes, and marked interrupted if the server stops first.
             yield* log("accepted", {
               signatureVerified: signature !== null,
               missing: rendered.missing,
               renderedPrompt: rendered.prompt,
+              run: {
+                runId,
+                task,
+                trigger: "webhook",
+                occurrenceKey: occurrenceKeys.webhook(task.id, deliveryId),
+                webhookDeliveryId: deliveryId,
+                dispatchState: "waiting",
+                createdAt: iso(now),
+                startedAt: null,
+              },
             }).pipe(Effect.onError(() => release));
             yield* observe("accepted");
+            yield* notifyChanged;
             const permit = yield* webhookPermit(task.id);
             const runOutcome = (outcome: "started" | "skipped" | "failed") =>
               Effect.all([
                 Effect.annotateCurrentSpan({ "scheduled_task.webhook.run_outcome": outcome }),
                 Metrics.increment(Metrics.webhookRunsTotal, { outcome }),
               ]);
-            yield* runTask(task, "webhook", { deliveryId, prompt: rendered.prompt }).pipe(
+            // A run that never reached an agent ends with the same fixed
+            // reason its delivery shows.
+            const endRun = (state: "skipped" | "failed", reason: string) =>
+              settleRun({ runId, from: ["waiting", "dispatching"], state, error: reason }).pipe(
+                Effect.andThen(notifyChanged),
+                Effect.ignore,
+              );
+            yield* runTask(task, {
+              trigger: "webhook",
+              webhook: { deliveryId, prompt: rendered.prompt, runId },
+            }).pipe(
               Effect.flatMap((completed) =>
-                completed.lastRunStatus === "failed"
+                completed.task.lastRunStatus === "failed"
                   ? runOutcome("failed").pipe(
                       Effect.andThen(markDeliveryFailed(deliveryId, "The run failed to start.")),
                     )
@@ -1638,6 +2220,7 @@ export const layer = Layer.effect(
                 WebhookDeliverySkipped: (skipped) =>
                   runOutcome("skipped").pipe(
                     Effect.andThen(markDeliveryFailed(deliveryId, skipped.reason)),
+                    Effect.andThen(endRun("skipped", skipped.reason)),
                   ),
               }),
               // The log is readable over RPC, so it gets a fixed reason; the
@@ -1646,6 +2229,7 @@ export const layer = Layer.effect(
                 Effect.logWarning("Webhook dispatch failed", { taskId: task.id, cause }).pipe(
                   Effect.andThen(runOutcome("failed")),
                   Effect.andThen(markDeliveryFailed(deliveryId, "The run failed to start.")),
+                  Effect.andThen(endRun("failed", RUN_ERRORS.notStarted)),
                 ),
               ),
               permit.withPermits(1),
@@ -1665,6 +2249,144 @@ export const layer = Layer.effect(
         );
       });
 
+    const listRuns: ScheduledTaskService["Service"]["listRuns"] = (input) =>
+      selectTaskRuns(sql, input.id, input.limit ?? RUN_HISTORY_LIMIT).pipe(
+        Effect.map((rows) => ({ runs: rows.map(toScheduledTaskRun) })),
+        Effect.mapError((cause) =>
+          taskError("Could not list schedule task runs.", { taskId: input.id, cause }),
+        ),
+      );
+
+    const observeRun: ScheduledTaskService["Service"]["observeRun"] = (observation) =>
+      Effect.gen(function* () {
+        const rows = yield* selectObservedRuns(sql, observation.run);
+        if (rows.length === 0) return;
+        const observedAt = yield* DateTime.now;
+        let changed = false;
+        for (const row of rows) {
+          const applied = yield* applyAgentObservation(sql, {
+            runId: row.run_id,
+            run: observation.run,
+            sequence: observation.sequence,
+            observedAt,
+          });
+          changed ||= applied;
+        }
+        if (changed) yield* notifyChanged;
+      }).pipe(Effect.mapError(runError("Could not record schedule task run state.")));
+
+    /**
+     * Settles one open run, or moves one a restart cut on to its continuation,
+     * from what the orchestrator recorded for it. Returns whether it changed.
+     */
+    const reconcileRun = (
+      row: ScheduledTaskRunRow,
+      inspect: ScheduledTaskRunInspector,
+      observedAt: DateTime.Utc,
+    ) =>
+      Effect.gen(function* () {
+        if (row.dispatch_state === "waiting") {
+          // The fiber that would have run this delivery stopped with the old process.
+          const settled = yield* settleRun({
+            runId: row.run_id,
+            from: ["waiting"],
+            state: "interrupted",
+            error: RUN_ERRORS.restartBeforeDelivery,
+          });
+          if (settled && row.webhook_delivery_id !== null) {
+            yield* markDeliveryFailed(row.webhook_delivery_id, RUN_ERRORS.restartBeforeDelivery);
+          }
+          return settled;
+        }
+        const recovery = yield* inspect({
+          commandId: CommandId.make(row.command_id),
+          messageId: MessageId.make(row.message_id),
+          projectId: ProjectId.make(row.project_id),
+          threadId: row.thread_id === null ? null : ThreadId.make(row.thread_id),
+          dispatchKind: row.dispatch_kind === "send" ? "send" : "launch",
+          agentRunId: row.agent_run_id === null ? null : RunId.make(row.agent_run_id),
+        });
+        // A finished run moves on only to a restart continuation of it. Nothing
+        // else read now, such as a since-deleted thread, changes how it ended.
+        if (isFinishedAgentStatus(row.agent_status)) {
+          return recovery._tag === "Observed" && recovery.run.id !== row.agent_run_id
+            ? yield* applyAgentObservation(sql, {
+                runId: row.run_id,
+                run: recovery.run,
+                sequence: recovery.sequence,
+                observedAt,
+              })
+            : false;
+        }
+        const undelivered = ["dispatching", "dispatched"] as const;
+        switch (recovery._tag) {
+          case "Unknown":
+            return false;
+          case "Observed":
+            return yield* applyAgentObservation(sql, {
+              runId: row.run_id,
+              run: recovery.run,
+              sequence: recovery.sequence,
+              observedAt,
+            });
+          case "NotDispatched":
+            return yield* settleRun({
+              runId: row.run_id,
+              from: ["dispatching"],
+              state: "interrupted",
+              error: RUN_ERRORS.restartBeforeStart,
+            });
+          case "ThreadOnly":
+            return yield* settleRun({
+              runId: row.run_id,
+              from: undelivered,
+              state: "interrupted",
+              error: RUN_ERRORS.restartBeforePrompt,
+              threadId: recovery.threadId,
+            });
+          case "Rejected":
+            return yield* settleRun({
+              runId: row.run_id,
+              from: undelivered,
+              state: "failed",
+              error: RUN_ERRORS.notStarted,
+              threadId: recovery.threadId,
+            });
+          case "Missing":
+            return yield* settleRun({
+              runId: row.run_id,
+              from: undelivered,
+              state: "interrupted",
+              error: RUN_ERRORS.threadMissing,
+              threadId: recovery.threadId,
+              forgetAgent: true,
+            });
+        }
+      });
+
+    const reconcileRuns: ScheduledTaskService["Service"]["reconcileRuns"] = (inspect) =>
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const rows = yield* selectUnsettledRuns(sql, now).pipe(
+          Effect.mapError(runError("Could not list open schedule task runs.")),
+        );
+        let changed = false;
+        for (const row of rows) {
+          // Read per row: a run reserved while this pass works is this process's own.
+          if ((yield* Ref.get(heldRuns)).has(row.run_id)) continue;
+          const settled = yield* reconcileRun(row, inspect, now).pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not reconcile schedule task run", {
+                runId: row.run_id,
+                cause,
+              }).pipe(Effect.as(false)),
+            ),
+          );
+          changed ||= settled;
+        }
+        if (changed) yield* notifyChanged;
+      });
+
     return ScheduledTaskService.of({
       list,
       subscribeList,
@@ -1676,6 +2398,37 @@ export const layer = Layer.effect(
       listWebhookDeliveries,
       getWebhookDelivery,
       triggerWebhook,
+      listRuns,
+      observeRun,
+      reconcileRuns,
     });
   }),
 );
+
+/**
+ * Admits a run's reservation through the maintenance gate. A scheduled slot
+ * is skipped during an update and runs on a later tick, since its
+ * `next_run_at` is untouched; Run now is refused so the person can retry. A
+ * webhook delivery was accepted before the gate closed and already counts as
+ * a blocker, so it runs.
+ */
+const maintenanceGuardReservation = <A, E, R>(
+  maintenance: MaintenanceGate.MaintenanceGateService,
+  trigger: ScheduledTaskRun["trigger"],
+  acceptedWebhook: boolean,
+  reserve: Effect.Effect<A, E, R>,
+): Effect.Effect<A | "maintenance-skipped", E | ScheduledTaskError, R> =>
+  Effect.gen(function* () {
+    if (acceptedWebhook) return yield* reserve;
+    const source = trigger === "scheduled" ? "scheduler" : "manual-run";
+    const reserved = yield* maintenance.guard(source, reserve);
+    if (Option.isSome(reserved)) return reserved.value;
+    if (trigger === "scheduled") return "maintenance-skipped" as const;
+    const refusal = yield* maintenance.refusal(source);
+    return yield* taskError(
+      Option.match(refusal, {
+        onNone: () => "Stark Code is updating; try again in a moment.",
+        onSome: (error) => error.message,
+      }),
+    );
+  });

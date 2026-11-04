@@ -14,6 +14,7 @@ import {
 } from "@starkfuture/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientError from "effect/http/HttpClientError";
@@ -142,6 +143,7 @@ const operationOf = (
 const replayHttpClient = (
   controller: OpenCodeReplayController,
   replayGate: ProviderReplayGate | undefined,
+  legacySupervisedReplay = false,
 ) =>
   HttpClient.make((request, url) =>
     Effect.tryPromise({
@@ -160,6 +162,26 @@ const replayHttpClient = (
           query,
           raw === undefined ? undefined : decodeJson(raw),
         );
+        // Old Full-access recordings never queried agent paths. Their derived
+        // Supervised fixture declares no extra paths; current path-rule fixtures
+        // record this request and keep the normal strict HTTP comparison.
+        if (legacySupervisedReplay && operation.type === "agent.list") {
+          return new Response(
+            encodeJson({
+              location: { directory: query["location[directory]"] },
+              data: ["build", "plan"].map((id) => ({
+                id,
+                name: id,
+                description: "Legacy replay agent",
+                mode: "primary",
+                hidden: false,
+                request: { settings: {}, headers: {}, body: {} },
+                permissions: [],
+              })),
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
         // The event stream and requests are separate connections: a request
         // is matched only once what was recorded before it was delivered.
         if (operation.type !== "event.subscribe") await controller.untilInboundDelivered();
@@ -223,7 +245,11 @@ export const replayServer = (
     const opencode = yield* OpenCode2Client.make.pipe(
       Effect.provideService(
         HttpClient.HttpClient,
-        replayHttpClient(controller, options?.replayGate),
+        replayHttpClient(
+          controller,
+          options?.replayGate,
+          transcript.metadata?.legacySupervisedReplay === true,
+        ),
       ),
     );
     const connection = {
@@ -326,6 +352,50 @@ export const OpenCode2OrchestratorReplayHarness: OrchestratorV2ProviderReplayHar
   driver: OPENCODE_PROVIDER,
   decodeTranscript: (transcript: ProviderReplayTranscript) =>
     decodeOpenCode2ReplayTranscript(transcript).pipe(
+      Effect.map((decoded) => {
+        const legacy =
+          typeof decoded.metadata?.source === "string" &&
+          !decoded.entries.some(
+            (entry) =>
+              entry.type === "expect_outbound" &&
+              Predicate.isObject(entry.frame) &&
+              entry.frame.type === "agent.list",
+          );
+        if (!legacy) return decoded;
+        // Keep recorded lifecycle events, with strict requests derived for the
+        // current Supervised preset. These old fixtures declare no agent paths;
+        // newly authored permission fixtures exercise the real paths response.
+        const supervised = (value: unknown): unknown => {
+          if (Array.isArray(value)) return value.map(supervised);
+          if (!Predicate.isObject(value)) return value;
+          return Object.fromEntries(
+            Object.entries(value).map(([key, entry]) => [
+              key,
+              key === "permissions" && Array.isArray(entry)
+                ? entry.flatMap((rule) =>
+                    Predicate.isObject(rule) &&
+                    rule.action === "*" &&
+                    rule.resource === "*" &&
+                    rule.effect === "allow"
+                      ? [
+                          { action: "shell", resource: "*", effect: "ask" },
+                          { action: "edit", resource: "*", effect: "ask" },
+                          { action: "external_directory", resource: "*", effect: "ask" },
+                        ]
+                      : [rule],
+                  )
+                : supervised(entry),
+            ]),
+          );
+        };
+        return {
+          ...decoded,
+          metadata: { ...decoded.metadata, legacySupervisedReplay: true },
+          entries: decoded.entries.map((entry) =>
+            "frame" in entry ? { ...entry, frame: supervised(entry.frame) } : entry,
+          ),
+        };
+      }),
       Effect.mapError(
         (cause) =>
           new OpenCodeReplayTranscriptDecodeError({

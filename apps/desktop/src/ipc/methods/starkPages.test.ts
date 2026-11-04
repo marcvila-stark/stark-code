@@ -45,15 +45,19 @@ it.effect("only the trusted main frame may read local document metadata", () =>
   }),
 );
 
-it.effect("rejects remote origins and accepts only the configured development origin", () =>
+it.effect("rejects remote origins and accepts only this build's app scheme", () =>
   Effect.gen(function* () {
+    // The main window loads starkcode-dev://app in development, never the dev server origin.
     for (const [url, dev, allowed] of [
       ["https://pages.starkfuture.com/", false, false],
       ["starkcode://other/", false, false],
       ["starkcode://user:pass@app/", false, false],
+      ["starkcode://app:4317/", false, false],
+      ["starkcode-dev://app/", false, false],
       ["http://localhost:5173/", false, false],
-      ["http://localhost:5173/", true, true],
-      ["http://localhost:5174/", true, false],
+      ["http://localhost:5173/", true, false],
+      ["starkcode://app/", true, false],
+      ["starkcode-dev://app/", true, true],
     ] as const) {
       const f = fixture(url, dev);
       expect(yield* f.run(listPages.handler("/project", f.event))).toEqual(allowed ? [] : null);

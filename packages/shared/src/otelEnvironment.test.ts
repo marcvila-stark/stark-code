@@ -306,7 +306,7 @@ describe("OtelEnvironment", () => {
       },
       {
         name: "headers are comma-separated pairs with percent-encoded values",
-        env: { ...ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS: "api-key=a%20b,tenant=stark" },
+        env: { ...ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS: "api-key=a%20b,tenant=stark-code" },
         traces: { protocol: "http/protobuf", headers: { "api-key": "a b", tenant: "stark-code" } },
         logs: { protocol: "http/protobuf", headers: { "api-key": "a b", tenant: "stark-code" } },
         warnings: [],

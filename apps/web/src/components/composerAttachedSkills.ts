@@ -1,8 +1,11 @@
 import type { ServerProviderSkill } from "@starkfuture/contracts";
 
 /** Keep the provider's prompt intact; only the editable view omits attached skills. */
-export function splitAttachedSkills(value: string, skills: readonly ServerProviderSkill[]) {
-  const attached: { skill: ServerProviderSkill; start: number; end: number }[] = [];
+export function splitAttachedSkills<T extends Pick<ServerProviderSkill, "name">>(
+  value: string,
+  skills: readonly T[],
+) {
+  const attached: { skill: T; start: number; end: number }[] = [];
   let offset = 0;
   while (offset < value.length) {
     const match = /^([$\/])([A-Za-z0-9][A-Za-z0-9:_-]*)(\s+)/.exec(value.slice(offset));

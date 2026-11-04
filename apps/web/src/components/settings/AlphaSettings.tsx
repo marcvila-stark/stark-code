@@ -24,9 +24,7 @@ export function SettingsDestination({
     >
       <span className="min-w-0 flex-1">
         <span className="block text-sm font-medium">{title}</span>
-        <span className="mt-1 block text-sm text-muted-foreground">
-          {description}
-        </span>
+        <span className="mt-1 block text-sm text-muted-foreground">{description}</span>
       </span>
       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
     </Link>

@@ -83,6 +83,13 @@ const legacyOwnerIsLive = Effect.fn("legacyOwnerIsLive")(function* (
   return !Number.isFinite(startedAt) || startedAt <= recordedAt + 1_000;
 });
 
+// The lock is held per process, so whether this process holds it is process state.
+const ownedStateDirs = new Set<string>();
+
+/** Whether this process holds the server ownership lock of `stateDir`. */
+export const holdsServerOwnership = (stateDir: string) =>
+  ownedStateDirs.has(NodePath.resolve(stateDir));
+
 /**
  * Hold an exclusive lock on the state directory until the scope closes. The
  * lock is an exclusive transaction on `server-owner.sqlite`, which never holds
@@ -108,6 +115,7 @@ export const acquireServerOwnership = Effect.fn("acquireServerOwnership")(functi
           db.close();
           throw cause;
         }
+        ownedStateDirs.add(NodePath.resolve(stateDir));
         return db;
       },
       catch: (cause) =>
@@ -124,7 +132,12 @@ export const acquireServerOwnership = Effect.fn("acquireServerOwnership")(functi
             : Effect.void,
         ),
         Effect.ignore({ log: true }),
-        Effect.ensuring(Effect.sync(() => db.close())),
+        Effect.ensuring(
+          Effect.sync(() => {
+            ownedStateDirs.delete(NodePath.resolve(stateDir));
+            db.close();
+          }),
+        ),
       ),
   );
 

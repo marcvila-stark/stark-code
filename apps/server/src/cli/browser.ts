@@ -124,7 +124,7 @@ const browserSetupCommand = Command.make("setup", { baseDir: baseDirFlag }).pipe
         return yield* Console.log(
           Option.isSome(browser)
             ? "This host is ready for Stark's browser."
-            : "Chrome's sandbox is allowed here. Stark's browser installs on first use; if it then reports missing libraries, run this again.",
+            : "Chrome's sandbox is allowed here. Stark's browser is not installed yet: install it in Settings → Agents & accounts → Setup doctor, then run this again to check its libraries.",
         );
       }
 

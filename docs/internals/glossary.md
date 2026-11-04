@@ -15,7 +15,7 @@ Terms whose meaning matters across Stark Code. Architecture and lifecycle constr
 | Thread         | The durable conversation and work history for a project. It survives provider process exits.      |
 | Turn           | One user-to-agent cycle, a V2 run. Provider work can end before checkpoint and diff work settles. |
 | Activity       | A non-message timeline item, such as a tool action, approval, or failure.                         |
-| Stark home        | The base data directory. Runtime state normally lives under its `userdata` directory.             |
+| Stark home     | The base data directory. Runtime state normally lives under its `userdata` directory.             |
 
 ## Orchestration
 
@@ -33,10 +33,10 @@ Terms whose meaning matters across Stark Code. Architecture and lifecycle constr
 
 | Term                | Meaning                                                                                                      |
 | ------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Provider            | The agent runtime Stark Code controls, such as Codex or Claude Code.                                            |
+| Provider            | The agent runtime Stark Code controls, such as Codex or Claude Code.                                         |
 | Driver              | The integration for a provider kind.                                                                         |
 | Provider instance   | One configured provider, with its own settings and lifecycle. Multiple instances can use the same driver.    |
-| Adapter             | The boundary translating a provider's native protocol into Stark Code operations and events.                    |
+| Adapter             | The boundary translating a provider's native protocol into Stark Code operations and events.                 |
 | Session             | The provider runtime attached to a thread. A session can be stopped and resumed without deleting the thread. |
 | Runtime mode        | The thread's permission policy. See [permission modes](../user/permission-modes.md).                         |
 | Interaction mode    | How the agent approaches the task, such as planning. Separate from permission policy.                        |
@@ -54,11 +54,11 @@ Terms whose meaning matters across Stark Code. Architecture and lifecycle constr
 
 ## Composer context
 
-| Term                 | Meaning                                                                                                                             |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Context record       | The typed payload behind a composer chip, keyed by `contextId` in `message.context.records`. It never holds bytes.                  |
+| Term                 | Meaning                                                                                                                                |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Context record       | The typed payload behind a composer chip, keyed by `contextId` in `message.context.records`. It never holds bytes.                     |
 | Context reference    | One occurrence of a record in message text: `[label](stark-context://v1/<kind>/<contextId>)`. Several references can share one record. |
-| Attachment binding   | The link from an image or file record to its server-owned attachment. Its attachment ID can change without changing `contextId`.    |
-| Attachment inventory | The ordered image records shown as thumbnails above the prose, including images with no inline references.                          |
+| Attachment binding   | The link from an image or file record to its server-owned attachment. Its attachment ID can change without changing `contextId`.       |
+| Attachment inventory | The ordered image records shown as thumbnails above the prose, including images with no inline references.                             |
 
 See [composer context references](./composer-context-references.md) for the contract and lifecycle.

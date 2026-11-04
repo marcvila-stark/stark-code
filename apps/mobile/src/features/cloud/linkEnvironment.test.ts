@@ -12,6 +12,18 @@ import * as MobileStorage from "../../persistence/mobile-storage";
 
 import { linkEnvironmentToCloudWithPreference } from "./linkEnvironment";
 
+// The default app is local-only; these requests use a configured fake relay.
+vi.mock("./publicConfig", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./publicConfig")>();
+  return {
+    ...actual,
+    resolveCloudPublicConfig: () => ({
+      ...actual.resolveCloudPublicConfig(),
+      relay: { url: "https://relay.example.test" },
+    }),
+  };
+});
+
 vi.mock("expo-constants", () => ({
   default: {
     expoConfig: {

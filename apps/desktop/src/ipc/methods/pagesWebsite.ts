@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as DesktopEnvironment from "../../app/DesktopEnvironment.ts";
+import { DESKTOP_HOST, getDesktopScheme } from "../../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
 import * as Website from "../../starkPages/PagesWebsite.ts";
 import * as DesktopIpc from "../DesktopIpc.ts";
@@ -29,15 +30,14 @@ const authorize = Effect.fn("desktop.pagesWebsite.authorize")(function* (
     frame !== window.value.webContents.mainFrame
   )
     return yield* new Website.PagesWebsiteError({ reason: "sender" });
+  // The main window always loads getDesktopUrl, so only this build's app scheme is trusted.
   const trusted = yield* Effect.try(() => {
     const url = new URL(frame.url);
     return (
       !url.username &&
       !url.password &&
-      ((url.protocol === "starkcode:" && url.hostname === "app") ||
-        (environment.isDevelopment &&
-          Option.isSome(environment.devServerUrl) &&
-          url.origin === environment.devServerUrl.value.origin))
+      url.protocol === `${getDesktopScheme(environment.isDevelopment)}:` &&
+      url.host === DESKTOP_HOST
     );
   }).pipe(Effect.orElseSucceed(() => false));
   if (!trusted) return yield* new Website.PagesWebsiteError({ reason: "sender" });

@@ -39,7 +39,9 @@ export function deriveNativeFinishEvidence(
     commands,
     files: evidence.changes.map((change) => change.path),
     unconfirmedFileChanges: evidence.unconfirmedChanges,
+    declinedFileChanges: 0,
     failedCount: commands.filter((command) => command.outcome === "failed").length,
+    declinedCount: 0,
     unknownCount: commands.filter((command) => command.outcome === "unknown").length,
     zeroExitChecks: successfulChecks.filter((command) => command.outcome === "exit-zero").length,
     completedToolChecks: successfulChecks.filter((command) => command.outcome === "tool-completed")

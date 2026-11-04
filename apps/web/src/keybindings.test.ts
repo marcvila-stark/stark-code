@@ -1412,7 +1412,8 @@ describe("composer and pull request shortcuts", () => {
       ["k", "pullRequest.copyNumber"],
       ["8", "thread.copyReference"],
       ["c", null],
-      ["y", null],
+      // The default for History, not a pull request shortcut.
+      ["y", "history.open"],
     ] as const) {
       assert.strictEqual(
         resolveShortcutCommand(event({ key, metaKey: true, shiftKey: true }), bindings, {

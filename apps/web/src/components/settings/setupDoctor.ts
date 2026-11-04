@@ -1,13 +1,23 @@
-import type {
-  McpServersListResult,
-  ServerProvider,
-  StarkPublishedPagesStatus,
+import {
+  previewBrowserDownloadSize,
+  previewBrowserInstallProgress,
+  type McpServersListResult,
+  type PreviewBrowserStatus,
+  type ServerProvider,
+  type StarkPublishedPagesStatus,
 } from "@starkfuture/contracts";
 
 export type SetupFinding = {
   id: string;
   title: string;
-  state: "ready" | "attention" | "unknown" | "disabled";
+  state:
+    | "ready"
+    | "attention"
+    | "unknown"
+    | "disabled"
+    | "not-installed"
+    | "installing"
+    | "unavailable";
   detail: string;
 };
 
@@ -155,4 +165,77 @@ export function pagesSetupFindings(input: {
             : "Open Pages in a chat and choose Sign in. Browser sessions are not copied for this check.",
     },
   ];
+}
+
+/**
+ * The preview browser row and the install the user can start from it. Nothing
+ * installs it except that button: agents only read its status.
+ */
+export function previewBrowserSetup(
+  status: PreviewBrowserStatus | null,
+  failed: boolean,
+): { readonly finding: SetupFinding; readonly installLabel: string | null } {
+  const common = { id: "preview-browser", title: "Preview browser" };
+  if (failed || status === null)
+    return {
+      finding: {
+        ...common,
+        state: "unknown",
+        detail: failed
+          ? "Could not read the preview browser status."
+          : "Checking the preview browser…",
+      },
+      installLabel: null,
+    };
+  const size = previewBrowserDownloadSize(status);
+  const withSize = (label: string) => (size === null ? label : `${label} (${size})`);
+  switch (status.state) {
+    case "ready":
+      return {
+        finding: {
+          ...common,
+          state: "ready",
+          detail: "Installed. Agents use it to check HTML pages before showing them.",
+        },
+        installLabel: null,
+      };
+    case "not-installed":
+      return {
+        finding: {
+          ...common,
+          state: "not-installed",
+          detail:
+            "Agents use it to check HTML pages before showing them. Previews never download it on their own. Pages and mermaid diagrams still show without it.",
+        },
+        installLabel: withSize("Install preview browser"),
+      };
+    case "installing":
+      return {
+        finding: {
+          ...common,
+          state: "installing",
+          detail: `Installing: ${previewBrowserInstallProgress(status)}.`,
+        },
+        installLabel: null,
+      };
+    case "failed":
+      return {
+        finding: {
+          ...common,
+          state: "attention",
+          detail: `The last install failed. ${status.failure ?? ""}`.trim(),
+        },
+        installLabel: withSize("Try installing again"),
+      };
+    case "unsupported":
+      return {
+        finding: {
+          ...common,
+          state: "unavailable",
+          detail:
+            "There is no preview browser build for this machine. Pages still show, but agents cannot check them first.",
+        },
+        installLabel: null,
+      };
+  }
 }

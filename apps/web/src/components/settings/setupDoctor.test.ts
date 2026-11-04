@@ -5,7 +5,12 @@ import {
   type ServerProvider,
   type McpServerStatusEntry,
 } from "@starkfuture/contracts";
-import { providerSetupFindings, mcpSetupFindings, pagesSetupFindings } from "./setupDoctor";
+import {
+  providerSetupFindings,
+  mcpSetupFindings,
+  pagesSetupFindings,
+  previewBrowserSetup,
+} from "./setupDoctor";
 const provider: ServerProvider = {
   instanceId: ProviderInstanceId.make("claude-work"),
   driver: ProviderDriverKind.make("claudeAgent"),
@@ -81,4 +86,39 @@ it("separates local Pages kit availability from sign-in and actual page access",
   });
   expect(connected.map((row) => row.state)).toEqual(["attention", "ready"]);
   expect(connected[1]?.detail).toContain("Page access is checked when a page opens");
+});
+
+it("offers the preview browser install only while it is missing or failed", () => {
+  const totalBytes = 99_221_129;
+  expect(previewBrowserSetup({ state: "not-installed", totalBytes }, false)).toMatchObject({
+    finding: { state: "not-installed" },
+    installLabel: "Install preview browser (about 99 MB)",
+  });
+  expect(
+    previewBrowserSetup(
+      { state: "installing", totalBytes, downloadedBytes: 37_200_000, unpacking: false },
+      false,
+    ),
+  ).toEqual({
+    finding: expect.objectContaining({
+      state: "installing",
+      detail: "Installing: 37 of 99 MB downloaded.",
+    }),
+    installLabel: null,
+  });
+  expect(
+    previewBrowserSetup({ state: "failed", totalBytes, failure: "The disk is full." }, false),
+  ).toMatchObject({
+    finding: { state: "attention", detail: "The last install failed. The disk is full." },
+    installLabel: "Try installing again (about 99 MB)",
+  });
+  expect(previewBrowserSetup({ state: "ready", totalBytes }, false).installLabel).toBeNull();
+  expect(
+    previewBrowserSetup({ state: "unsupported", totalBytes: null }, false).installLabel,
+  ).toBeNull();
+  // An unread status never claims either way.
+  expect(previewBrowserSetup(null, true)).toMatchObject({
+    finding: { state: "unknown" },
+    installLabel: null,
+  });
 });

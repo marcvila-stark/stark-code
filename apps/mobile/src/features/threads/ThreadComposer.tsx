@@ -3,11 +3,14 @@ import { useAppearancePreferences } from "../settings/appearance/AppearancePrefe
 import type { EnvironmentThreadShell } from "@starkfuture/client-runtime/state/shell";
 import { useAtomValue } from "@effect/atom-react";
 import { clampFileAttachmentUploadBytes } from "@starkfuture/client-runtime/state/attachments";
+import { runtimeModeDisabledReason } from "@starkfuture/client-runtime/approvals/permission-presentation";
+import { useEnvironmentScope } from "../../state/session";
 import {
   pastedTextDisposition,
   replaceTextSelection,
 } from "@starkfuture/client-runtime/text-paste";
 import {
+  AuthSettingsWriteScope,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   type ChatAttachment,
@@ -696,6 +699,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     [currentModelOption?.capabilities, currentModelSelection.options],
   );
   const settingsOwnerId = composerOwnerKey;
+  // The server refuses to widen a chat from a client without the settings grant (O12).
+  const canWriteSettings = useEnvironmentScope(props.environmentId, AuthSettingsWriteScope);
   const settingsRouteSession = useMemo<ExistingThreadSettingsRouteSession>(
     () => ({
       ownerId: settingsOwnerId,
@@ -719,8 +724,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       },
       runtimeMode: currentRuntimeMode,
       onUpdateRuntimeMode: props.onUpdateRuntimeMode,
+      runtimeModeDisabledReason: (mode) => runtimeModeDisabledReason(mode, canWriteSettings),
     }),
     [
+      canWriteSettings,
       currentModelSelection,
       props.reportedModelSelection,
       currentRuntimeMode,

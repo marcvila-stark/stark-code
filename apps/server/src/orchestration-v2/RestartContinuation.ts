@@ -1,4 +1,5 @@
 import { runRanAfter } from "@starkfuture/shared/orchestrationV2ThreadError";
+import { isOpenLostRuntimeRequest } from "@starkfuture/shared/orchestrationV2LostRequests";
 import { resolveProjectSettings } from "@starkfuture/shared/projectSettings";
 import {
   CommandId,
@@ -32,10 +33,10 @@ const MAX_CONTINUATION_CHAIN = 3;
 
 /**
  * Whether a restart must leave this run for the user: the thread is put away,
- * the provider turn already ended, or the user owes an answer. Checked when
- * intent is recorded and again when the continuation is delivered. A
- * `settled` run is woken for the awaited work it lost, so its ended provider
- * turn does not block it.
+ * the provider turn already ended, the user owes an answer, or an answer may
+ * not have reached the agent. Checked when intent is recorded and again when
+ * the continuation is delivered. A `settled` run is woken for the awaited work
+ * it lost, so its ended provider turn does not block it.
  */
 function restartContinuationBlocked(
   projection: Pick<
@@ -76,6 +77,15 @@ function restartContinuationBlocked(
           turn.id === request.providerTurnId)),
   );
   if (waitingRequest) return true;
+  // An answer that may not have reached the agent leaves the step it decided
+  // to the user until they ask again or dismiss it, whichever turn asked: a
+  // settled root's background work or no run at all.
+  if (
+    projection.runtimeRequests.some(
+      (request) => request.lost?.deliveryUncertain === true && isOpenLostRuntimeRequest(request),
+    )
+  )
+    return true;
   return projection.turnItems.some(
     (item) =>
       item.type === "secret_request" &&

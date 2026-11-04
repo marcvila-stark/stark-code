@@ -10,8 +10,8 @@ import { PublishedPagesFailure } from "./publishedPagesPolicy.ts";
 
 export const PAGES_DOCUMENT_BYTES = 1024 * 1024;
 export const PAGES_ASSET_BYTES = 2 * 1024 * 1024;
-export const PAGES_BUNDLE_BYTES = 10 * 1024 * 1024;
-export const PAGES_ASSET_COUNT = 64;
+const PAGES_BUNDLE_BYTES = 10 * 1024 * 1024;
+const PAGES_ASSET_COUNT = 64;
 const PAGES_DOWNLOAD_HOST = "vibecoded-apps.s3.eu-west-1.amazonaws.com";
 
 type ReadPageTool = (

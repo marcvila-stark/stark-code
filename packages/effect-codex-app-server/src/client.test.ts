@@ -10,6 +10,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 
 import * as CodexClient from "./client.ts";
+import * as CodexReplay from "./replay.ts";
 
 const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
   path.join(import.meta.dirname, "../test/fixtures/codex-app-server-mock-peer.ts"),
@@ -153,6 +154,99 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       );
 
       assert.equal(initialized.userAgent, "mock-codex-app-server");
+    }),
+  );
+
+  it.effect("decodes 0.163 approval fields and hands each server request its JSON-RPC id", () =>
+    Effect.gen(function* () {
+      const amendment = {
+        acceptWithExecpolicyAmendment: { execpolicy_amendment: ["npm", "test"] },
+      };
+      const network = {
+        applyNetworkPolicyAmendment: {
+          network_policy_amendment: { host: "registry.npmjs.org", action: "allow" as const },
+        },
+      };
+      const seen = yield* Ref.make<Array<unknown>>([]);
+      const transcript: CodexReplay.CodexAppServerReplayTranscript = {
+        provider: "codex",
+        protocol: "codex.app-server",
+        version: "0.163.0",
+        scenario: "approval-fields-0163",
+        entries: [
+          // Codex asks only after the client speaks, so the handler is registered by then.
+          {
+            type: "expect_outbound",
+            frame: {
+              id: 1,
+              method: "initialize",
+              params: {
+                clientInfo: { name: "test", title: "test", version: "0.0.0" },
+                capabilities: { experimentalApi: true, optOutNotificationMethods: null },
+              },
+            },
+          },
+          {
+            type: "emit_inbound",
+            frame: {
+              id: 7,
+              method: "item/commandExecution/requestApproval",
+              params: {
+                threadId: "thread-1",
+                turnId: "turn-1",
+                itemId: "item-1",
+                startedAtMs: 1,
+                command: "npm test",
+                additionalPermissions: { network: { enabled: true }, fileSystem: null },
+                availableDecisions: ["accept", amendment, network, "cancel"],
+              },
+            },
+          },
+          { type: "expect_outbound", frame: { id: 7, result: { decision: network } } },
+          {
+            type: "emit_inbound",
+            frame: {
+              id: 1,
+              result: {
+                userAgent: "test",
+                codexHome: "/tmp/codex-home",
+                platformFamily: "unix",
+                platformOs: "macos",
+              },
+            },
+          },
+        ],
+      };
+      const scope = yield* Scope.make();
+      const context = yield* Layer.buildWithScope(CodexReplay.layerReplay(transcript), scope);
+      const answered = yield* Effect.gen(function* () {
+        const client = yield* CodexClient.CodexAppServerClient;
+        yield* client.handleServerRequest(
+          "item/commandExecution/requestApproval",
+          (payload, requestContext) =>
+            Ref.update(seen, (current) => [
+              ...current,
+              {
+                requestId: requestContext.requestId,
+                availableDecisions: payload.availableDecisions,
+                additionalPermissions: payload.additionalPermissions,
+              },
+            ]).pipe(Effect.as({ decision: network } as const)),
+        );
+        return yield* client.request("initialize", {
+          clientInfo: { name: "test", title: "test", version: "0.0.0" },
+          capabilities: { experimentalApi: true, optOutNotificationMethods: null },
+        });
+      }).pipe(Effect.provide(context), Effect.ensuring(Scope.close(scope, Exit.void)));
+
+      assert.equal(answered.userAgent, "test");
+      assert.deepEqual(yield* Ref.get(seen), [
+        {
+          requestId: 7,
+          availableDecisions: ["accept", amendment, network, "cancel"],
+          additionalPermissions: { network: { enabled: true }, fileSystem: null },
+        },
+      ]);
     }),
   );
 });

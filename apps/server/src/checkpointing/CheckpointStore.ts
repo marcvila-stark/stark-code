@@ -62,6 +62,8 @@ export class CheckpointStore extends Context.Service<
   {
     /** Check whether cwd is inside a Git worktree. */
     readonly isGitRepository: (cwd: string) => Effect.Effect<boolean, CheckpointStoreError>;
+    /** The repository's top folder as Git reports it (symlinks resolved), or null outside one. */
+    readonly repositoryRoot: (cwd: string) => Effect.Effect<string | null, CheckpointStoreError>;
 
     /**
      * Capture a checkpoint commit and store it at the provided checkpoint ref.
@@ -147,6 +149,11 @@ export const make = Effect.gen(function* () {
       .detect({ cwd, requestedKind: "git" })
       .pipe(Effect.map((repository) => repository !== null));
 
+  const repositoryRoot: CheckpointStore["Service"]["repositoryRoot"] = (cwd) =>
+    vcsRegistry
+      .detect({ cwd, requestedKind: "git" })
+      .pipe(Effect.map((handle) => handle?.repository.rootPath ?? null));
+
   const captureCheckpoint: CheckpointStore["Service"]["captureCheckpoint"] = Effect.fn(
     "captureCheckpoint",
   )(function* (input) {
@@ -204,6 +211,7 @@ export const make = Effect.gen(function* () {
       return yield* checkpoints.restorePaths(input);
     }),
     isGitRepository,
+    repositoryRoot,
     captureCheckpoint,
     hasCheckpointRef,
     restoreCheckpoint,

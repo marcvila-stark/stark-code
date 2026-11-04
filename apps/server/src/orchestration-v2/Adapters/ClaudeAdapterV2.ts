@@ -1,4 +1,5 @@
 import { PROVIDER_PRIVACY_ENV } from "@starkfuture/shared/providerPrivacy";
+import type * as Types from "effect/Types";
 import { redactProviderAuthValue } from "./ProviderAuthRedaction.ts";
 import { STARK_PAGES_ENV } from "@starkfuture/shared/starkPages";
 import {
@@ -9,10 +10,18 @@ import {
   STARK_WORKBENCH_NODE_ENV,
 } from "@starkfuture/shared/starkWorkbench";
 import {
+  CLAUDE_CHILD_BYPASS_POLICY,
   claudeApprovalOptions,
-  isStarkPublishRequest,
   toPermissionUpdates,
 } from "./ApprovalRulePolicy.ts";
+import {
+  isStarkPagesPublish,
+  STARK_PAGES_CONNECTOR_DISALLOWED_TOOLS,
+  STARK_PAGES_PUBLISH_DENIED,
+  STARK_PAGES_PUBLISH_UNCERTAIN,
+  starkPagesPublishVerdict,
+} from "./StarkPagesGuard.ts";
+import { resolveApprovalChoice } from "../PermissionPolicy.ts";
 import {
   cleanHookText,
   makeClaudeHookEventMapper,
@@ -35,6 +44,7 @@ import {
 } from "../../provider/Drivers/McpServerControls.ts";
 import { makeIdleStatusResources } from "../../provider/Drivers/IdleStatusResources.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
+import { claudeProposedFileChanges, type ProposedFileChangeFields } from "./ProposedFileChanges.ts";
 import {
   dynamicToolTitle,
   formatReadToolLabel,
@@ -117,8 +127,11 @@ import {
   type OrchestrationV2WorkflowRunHandles,
   type OrchestrationV2TurnItem,
   type OrchestrationV2WebSearchResult,
+  type PermissionSource,
+  type ProviderActivePermissionReport,
   type ProviderApprovalDecision,
   type ProviderApprovalOption,
+  type ProviderApprovalOptionId,
   ProviderDriverKind,
   type ProviderInstanceId,
   type ProviderRequestKind,
@@ -189,7 +202,10 @@ import {
 } from "../../provider/claudeUsageLimits.ts";
 import type { ManagedServerProvider } from "@starkfuture/provider-core/server/snapshot";
 import { mergeProviderInstanceEnvironment } from "@starkfuture/provider-core/server/instanceEnvironment";
-import { STARK_CODE_ORCHESTRATION_INSTRUCTIONS } from "@starkfuture/provider-core/server/orchestrationInstructions";
+import {
+  STARK_CODE_ORCHESTRATION_INSTRUCTIONS,
+  starkPreviewBrowserContext,
+} from "@starkfuture/provider-core/server/orchestrationInstructions";
 import { buildRuntimeInstructions } from "@starkfuture/provider-core/server/runtimeInstructions";
 import {
   mcpToolPresentation,
@@ -202,6 +218,7 @@ import {
   makeProviderFailure,
   makeProviderRetryTurnItem,
 } from "@starkfuture/provider-core/server/failure";
+import { resolveStarkMcpToolId } from "@starkfuture/shared/starkMcpToolPresentation";
 import { turnScopedSelectionTransition } from "@starkfuture/provider-core/server/selectionTransition";
 import { providerMessageTextWithAttachmentPaths } from "@starkfuture/provider-core/server/attachmentPrompt";
 import * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
@@ -445,7 +462,8 @@ export type ClaudeAgentSdkQueryOptions = Omit<
 > & {
   readonly model: string;
   readonly tools: NonNullable<ClaudeQueryOptions["tools"]>;
-  readonly permissionMode: NonNullable<ClaudeQueryOptions["permissionMode"]>;
+  /** Absent when the chat inherits Claude's own settings. */
+  readonly permissionMode?: NonNullable<ClaudeQueryOptions["permissionMode"]>;
 } & ClaudeAgentSdkThreadIdentity;
 
 export interface ClaudeAgentSdkQueryOpenInput {
@@ -599,7 +617,7 @@ export function claudeQueryMessages(queryRuntime: ClaudeQuery): AsyncIterable<SD
 export interface ClaudeAgentSdkLoggedQueryOptions {
   readonly model: ClaudeAgentSdkQueryOptions["model"];
   readonly tools: ClaudeAgentSdkQueryOptions["tools"];
-  readonly permissionMode: ClaudeAgentSdkQueryOptions["permissionMode"];
+  readonly permissionMode?: ClaudeAgentSdkQueryOptions["permissionMode"];
   readonly sessionId?: string;
   readonly resume?: string;
   readonly resumeSessionAt?: ClaudeAgentSdkQueryOptions["resumeSessionAt"];
@@ -722,7 +740,7 @@ export function loggedClaudeQueryOptions(
   return {
     model: options.model,
     tools: options.tools,
-    permissionMode: options.permissionMode,
+    ...(options.permissionMode === undefined ? {} : { permissionMode: options.permissionMode }),
     ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
     ...(options.resume === undefined ? {} : { resume: options.resume }),
     ...(options.resumeSessionAt === undefined ? {} : { resumeSessionAt: options.resumeSessionAt }),
@@ -1134,6 +1152,48 @@ export const layerQueryRunner: Layer.Layer<
   }),
 );
 
+export class ClaudeImportedSessionMissingError extends Schema.TaggedError<ClaudeImportedSessionMissingError>()(
+  "ClaudeImportedSessionMissingError",
+  { nativeThreadId: Schema.String },
+) {
+  override get message(): string {
+    return "Claude no longer has the imported session's history.";
+  }
+}
+
+const CLAUDE_NATIVE_SESSION_ID_PATTERN = /^[A-Za-z0-9-]+$/;
+
+/**
+ * Whether Claude still keeps a session's transcript in its config directory
+ * (the instance's `CLAUDE_CONFIG_DIR`, else `~/.claude`). The CLI files each
+ * session under a folder named for the directory it ran in; session ids are
+ * unique, so every folder is checked instead of repeating the CLI's naming.
+ */
+const claudeSessionTranscriptExists = Effect.fn("claudeSessionTranscriptExists")(function* (input: {
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly sessionId: string;
+}) {
+  if (!CLAUDE_NATIVE_SESSION_ID_PATTERN.test(input.sessionId)) return false;
+  const configured = input.environment.CLAUDE_CONFIG_DIR?.trim() ?? "";
+  const configDir =
+    configured.length > 0
+      ? input.path.resolve(configured)
+      : input.path.join(yield* HostProcess.HomeDirectory, ".claude");
+  const projectsDir = input.path.join(configDir, "projects");
+  const folders = yield* input.fileSystem
+    .readDirectory(projectsDir)
+    .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+  for (const folder of folders) {
+    const transcript = input.path.join(projectsDir, folder, `${input.sessionId}.jsonl`);
+    if (yield* input.fileSystem.exists(transcript).pipe(Effect.orElseSucceed(() => false))) {
+      return true;
+    }
+  }
+  return false;
+});
+
 export function makeClaudeQueryOptions(input: {
   readonly modelSelection: ModelSelection;
   readonly nativeThreadId: string;
@@ -1154,7 +1214,13 @@ export function makeClaudeQueryOptions(input: {
   readonly tools?: ClaudeAgentSdkQueryTools;
   readonly allowedTools?: ReadonlyArray<string>;
   readonly disallowedTools?: ReadonlyArray<string>;
-  readonly permissionMode?: PermissionMode;
+  readonly permissionMode?: PermissionMode | undefined;
+  /**
+   * `inherit` sends no mode, so the profile's own `permissions.defaultMode` applies; only an
+   * explicit mode (Plan, or the account's `--permission-mode` launch flag) is still sent.
+   * `override` (the default) sends the thread's mode, or `default` when none is given.
+   */
+  readonly permissionSource?: ClaudePermissionSource;
   readonly canUseTool?: CanUseTool;
   readonly onUserDialog?: ClaudeQueryOptions["onUserDialog"];
   readonly supportedDialogKinds?: ClaudeQueryOptions["supportedDialogKinds"];
@@ -1228,12 +1294,18 @@ export function makeClaudeQueryOptions(input: {
     typeof effectiveQuerySettings === "object" && effectiveQuerySettings !== null
       ? effectiveQuerySettings
       : {};
+  const inherit = input.permissionSource === "inherit";
+  // An inheriting chat must not get a defaultMode from Stark's own settings tier either.
+  const { defaultMode: _starkDefaultMode, ...inheritedPermissions } = current.permissions ?? {};
+  const flagPermissions = inherit ? inheritedPermissions : current.permissions;
+  // The user's disableAllHooks is never overridden: Stark's guard below is an SDK callback hook,
+  // which Claude Code runs even when settings hooks are off ("SDK callback hooks still run").
   effectiveQuerySettings = {
     ...current,
-    ...(input.canUseTool === undefined ? {} : { disableAllHooks: false }),
+    ...(inherit && current.permissions !== undefined ? { permissions: flagPermissions } : {}),
     ...(input.settings?.allowBypassPermissions === true
       ? {}
-      : { permissions: { ...current.permissions, disableBypassPermissionsMode: "disable" } }),
+      : { permissions: { ...flagPermissions, disableBypassPermissionsMode: "disable" } }),
     env: claudeModelEnvironment({
       ...current.env,
       ...(openRouter ? { ANTHROPIC_BASE_URL: OPENROUTER_BASE_URL } : {}),
@@ -1243,15 +1315,17 @@ export function makeClaudeQueryOptions(input: {
     }),
   } as ClaudeSdkSettings;
   // The thread's selected mode wins over account launch arguments. Without a
-  // thread policy, honor the account's native CLI configuration.
-  const permissionMode =
-    input.permissionMode ??
+  // thread policy, honor the account's native CLI configuration. An inheriting
+  // chat with no account flag sends no mode at all.
+  const accountPermissionMode =
     (launchArgPermissionMode === "manual"
       ? "default"
       : (launchArgPermissionMode as PermissionMode | null | undefined)) ??
     (launchArgSkipPermissions === null || launchArgSkipPermissions === "true"
       ? "bypassPermissions"
-      : "default");
+      : undefined);
+  const permissionMode: PermissionMode | undefined =
+    input.permissionMode ?? accountPermissionMode ?? (inherit ? undefined : "default");
   if (
     (permissionMode === "bypassPermissions" ||
       input.allowDangerouslySkipPermissions === true ||
@@ -1269,7 +1343,7 @@ export function makeClaudeQueryOptions(input: {
       : {}),
     model: compiledSelection.apiModelId,
     tools: claudeAgentSdkQueryToolsForSdk(selectedTools),
-    permissionMode,
+    ...(permissionMode === undefined ? {} : { permissionMode }),
     hooks: {
       PreToolUse: [
         {
@@ -1284,18 +1358,25 @@ export function makeClaudeQueryOptions(input: {
                   hookSpecificOutput: {
                     hookEventName: "PreToolUse",
                     permissionDecision: "deny",
-                    permissionDecisionReason:
-                      "Child agents cannot use Bypass permissions. Switch this chat to Manual, Accept edits or Auto before starting an agent, and remove Bypass from custom agent definitions.",
+                    permissionDecisionReason: CLAUDE_CHILD_BYPASS_POLICY.detail,
                   },
                 };
               }
-              if (!isStarkPublishRequest(hook.tool_name, hook.tool_input)) return {};
+              const pages = starkPagesPublishVerdict({
+                toolName: hook.tool_name,
+                toolInput: hook.tool_input,
+              });
+              if (pages === "none") return {};
+              // A publish is denied; a command that may publish is put to the
+              // user in every mode, Auto and Accept edits included.
               return {
                 hookSpecificOutput: {
                   hookEventName: "PreToolUse",
-                  permissionDecision: "deny",
+                  permissionDecision: pages === "publish" ? "deny" : "ask",
                   permissionDecisionReason:
-                    "Stark Pages publishing is available only in native Claude shell mode until its SDK approval hooks have been verified.",
+                    pages === "publish"
+                      ? STARK_PAGES_PUBLISH_DENIED
+                      : STARK_PAGES_PUBLISH_UNCERTAIN,
                 },
               };
             },
@@ -1314,17 +1395,16 @@ export function makeClaudeQueryOptions(input: {
     ...threadIdentity,
     ...(input.resumeSessionAt === undefined ? {} : { resumeSessionAt: input.resumeSessionAt }),
     ...(input.allowedTools === undefined ? {} : { allowedTools: [...input.allowedTools] }),
-    ...(input.disallowedTools === undefined ? {} : { disallowedTools: [...input.disallowedTools] }),
+    // Native deny rules for the Pages connector's writes hold in every mode, hooks or not.
+    disallowedTools: [
+      ...new Set([...(input.disallowedTools ?? []), ...STARK_PAGES_CONNECTOR_DISALLOWED_TOOLS]),
+    ],
     ...(input.canUseTool === undefined
       ? {}
       : {
           canUseTool: async (toolName, toolInput, options) =>
-            isStarkPublishRequest(toolName, toolInput)
-              ? {
-                  behavior: "deny",
-                  message:
-                    "Stark Pages publishing is available only in native Claude shell mode until its SDK approval hooks have been verified.",
-                }
+            isStarkPagesPublish({ toolName, toolInput, mcpServer: options.mcpServer })
+              ? { behavior: "deny", message: STARK_PAGES_PUBLISH_DENIED }
               : input.canUseTool!(toolName, toolInput, options),
         }),
     ...(input.allowDangerouslySkipPermissions === true || permissionMode === "bypassPermissions"
@@ -1756,6 +1836,23 @@ function isSupportedClaudeImageMimeType(
   return supportedClaudeImageMimeTypes.has(mimeType);
 }
 
+/**
+ * The preview browser note to put ahead of this prompt, if any. Claude has no
+ * per-turn system channel, so the note rides in the prompt, and only when it
+ * changed: a session that never saw a missing browser hears nothing while it
+ * is ready.
+ */
+export function claudePreviewBrowserContextToSend(input: {
+  readonly status: ProviderAdapter.ProviderAdapterV2TurnInput["previewBrowser"];
+  readonly hasStarkMcp: boolean;
+  readonly lastSent: string | undefined;
+}): string | undefined {
+  if (input.status === undefined || !input.hasStarkMcp) return undefined;
+  const context = starkPreviewBrowserContext(input.status);
+  if (context === input.lastSent) return undefined;
+  return input.status.state === "ready" && input.lastSent === undefined ? undefined : context;
+}
+
 export function makeClaudeUserMessage(input: {
   readonly text: string;
   readonly priority?: SDKUserMessage["priority"];
@@ -2021,18 +2118,42 @@ function permissionModeForClaudeRuntimePolicy(
   }
 }
 
+/**
+ * Where a Claude chat's permission mode comes from: `inherit` lets the selected profile's own
+ * settings decide, `override` sends the chat's Stark preset.
+ */
+export type ClaudePermissionSource = PermissionSource;
+
+// A missing source means override (PLAN-002 §2). RuntimePolicy sets inherit only for an
+// instance whose presentation reports nativePermissionInherit.
+function claudePermissionSourceForRuntimePolicy(
+  runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+): ClaudePermissionSource {
+  return runtimePolicy.permissionSource === "inherit" ? "inherit" : "override";
+}
+
 export interface ClaudeRuntimeQueryPolicy {
-  readonly permissionMode: PermissionMode;
+  /** Undefined when the chat inherits Claude's settings and is not in Plan: no mode is sent. */
+  readonly permissionMode: PermissionMode | undefined;
+  readonly permissionSource: ClaudePermissionSource;
   readonly tools?: ClaudeAgentSdkQueryTools;
   readonly allowedTools?: ReadonlyArray<string>;
   readonly allowDangerouslySkipPermissions?: true;
-  readonly installPermissionCallback: boolean;
+  /**
+   * Always true: every permission request Claude raises becomes a visible request, in every
+   * mode, Bypass included. Kept as a field for the permission wire golden.
+   */
+  readonly installPermissionCallback: true;
 }
 
 export function claudeRuntimeQueryPolicyForRuntimePolicy(
   runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
 ): ClaudeRuntimeQueryPolicy {
-  const permissionMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
+  const permissionSource = claudePermissionSourceForRuntimePolicy(runtimePolicy);
+  const selectedMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
+  // Plan is Stark's interaction mode, so it is sent either way; a runtime mode is not.
+  const permissionMode =
+    permissionSource === "inherit" && selectedMode !== "plan" ? undefined : selectedMode;
   const readOnlyTools =
     sandboxPolicyKindForClaudeRuntimePolicy(runtimePolicy) === "readOnly"
       ? CLAUDE_READ_ONLY_ALLOWED_TOOLS
@@ -2041,45 +2162,20 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
     readOnlyTools !== undefined && readOnlyPolicyAllowsGlobalReads(runtimePolicy)
       ? readOnlyTools
       : undefined;
-  // Claude approves routine actions before invoking the callback. Keep prompts
-  // available for Manual, Plan, and Auto classifier fallbacks.
-  const installPermissionCallback =
-    runtimePolicy.approvalPolicy === undefined
-      ? permissionMode !== "bypassPermissions" && permissionMode !== "dontAsk"
-      : runtimePolicy.approvalPolicy !== "never";
-
-  if (permissionMode === "plan") {
-    return {
-      permissionMode,
-      ...(readOnlyTools === undefined ? {} : { tools: readOnlyTools }),
-      ...(allowedTools === undefined ? {} : { allowedTools }),
-      installPermissionCallback,
-    };
-  }
-
   return {
     permissionMode,
+    permissionSource,
     ...(readOnlyTools === undefined ? {} : { tools: readOnlyTools }),
     ...(allowedTools === undefined ? {} : { allowedTools }),
     ...(permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
-    installPermissionCallback,
+    installPermissionCallback: true,
   };
-}
-
-function shouldInstallClaudePermissionCallback(policy: ClaudeRuntimeQueryPolicy): boolean {
-  return policy.installPermissionCallback;
-}
-
-// Whether a tool's permission callback must ask the user before answering.
-function requiresClaudeApproval(context: ActiveClaudeTurnContext): boolean {
-  return shouldInstallClaudePermissionCallback(
-    claudeRuntimeQueryPolicyForRuntimePolicy(context.input.runtimePolicy),
-  );
 }
 
 function claudeRuntimeQueryPolicyKey(policy: ClaudeRuntimeQueryPolicy): string {
   return JSON.stringify({
     permissionMode: policy.permissionMode,
+    permissionSource: policy.permissionSource,
     tools: policy.tools,
     allowedTools: policy.allowedTools,
     allowDangerouslySkipPermissions: policy.allowDangerouslySkipPermissions,
@@ -2492,7 +2588,22 @@ function webSearchResultsFromClaudeOutput(
   });
 }
 
+/**
+ * Approval prompt for Stark's HTML tools. A whole page cut to a JSON preview
+ * reads as noise, so the prompt names the page; the approval card shows every
+ * argument from the tool call itself.
+ */
+export function starkHtmlToolApprovalPrompt(toolName: string, input: unknown): string | undefined {
+  const starkTool = resolveStarkMcpToolId(toolName);
+  if (starkTool === "html_preview") return "Preview an HTML page";
+  if (starkTool !== "html_render") return undefined;
+  const title = firstStringInputField(claudeNativeToolInputFromUnknown(input), ["title"]);
+  return `Render an HTML page${title === undefined ? "" : `: ${title.slice(0, 200)}`}`;
+}
+
 function summarizeClaudeToolRequest(toolName: string, input: ClaudeNativeToolInput): string {
+  const htmlPrompt = starkHtmlToolApprovalPrompt(toolName, claudeNativeToolInputValue(input));
+  if (htmlPrompt !== undefined) return htmlPrompt;
   const command = firstStringInputField(input, ["command", "cmd", "script"]);
   if (command !== undefined) {
     return `${toolName}: ${command.slice(0, 400)}`;
@@ -2727,65 +2838,303 @@ function parentToolUseIdFromSdkMessage(message: SDKMessage): string | null {
     : null;
 }
 
-export function permissionResultFromDecision(input: {
+/** Where a permission request is shown: in the active turn, or on the thread between turns. */
+interface ClaudeRequestTarget {
+  readonly context: ActiveClaudeTurnContext | null;
+  readonly threadId: ThreadId;
+  readonly providerThreadId: ProviderThreadId | null;
+  readonly cwd: string | null;
+  readonly isWorktree: boolean;
+}
+
+/** The mode an answered request switches the session to, when the user approved one. */
+function approvedSessionMode(result: PermissionResult): PermissionMode | undefined {
+  if (result.behavior !== "allow") return undefined;
+  return result.updatedPermissions
+    ?.flatMap((update) =>
+      update.type === "setMode" && update.destination === "session" ? [update.mode] : [],
+    )
+    .at(-1);
+}
+
+// The prompt Stark's Implement action sends (apps/web/src/proposedPlan.ts), possibly after the
+// effort prefix. It is the one explicit way out of a plan mode Claude entered by itself (O4).
+const PLAN_IMPLEMENTATION_PROMPT = /^(?:Ultrathink:\s*)?PLEASE IMPLEMENT THIS PLAN:\n/;
+
+export function isClaudePlanImplementationTurn(turnInput: {
+  readonly message: { readonly text: string };
+  readonly runtimePolicy: { readonly interactionMode: string };
+}): boolean {
+  return (
+    turnInput.runtimePolicy.interactionMode === "default" &&
+    PLAN_IMPLEMENTATION_PROMPT.test(turnInput.message.text)
+  );
+}
+
+/**
+ * The mode to put a reused Claude process in before the next prompt, or undefined to leave it
+ * as Claude reports it. Claude's own mode changes stand: plan mode it entered stays until
+ * Stark's Implement action, which restores the mode reported before plan, and a mode the user
+ * approved for the session stays until the process ends. Only a chat that overrides Claude's
+ * settings and drifted to some other mode is put back to the chat's mode. Bypass is never
+ * restored without the account's opt-in.
+ */
+export function claudeModeBeforePrompt(input: {
+  readonly permissionSource: ClaudePermissionSource;
+  readonly openedMode: PermissionMode | undefined;
+  readonly liveMode: PermissionMode | undefined;
+  readonly approvedSessionMode: PermissionMode | undefined;
+  readonly modeBeforePlan: PermissionMode | undefined;
+  readonly implementsPlan: boolean;
+  readonly allowBypassPermissions: boolean;
+}): PermissionMode | undefined {
+  const stands = (mode: PermissionMode) =>
+    input.permissionSource === "inherit" ||
+    mode === input.openedMode ||
+    mode === input.approvedSessionMode;
+  if (input.liveMode === undefined) return undefined;
+  if (input.liveMode !== "plan") return stands(input.liveMode) ? undefined : input.openedMode;
+  if (!input.implementsPlan || input.openedMode === "plan") return undefined;
+  const restored =
+    input.modeBeforePlan !== undefined && stands(input.modeBeforePlan)
+      ? input.modeBeforePlan
+      : (input.openedMode ?? "default");
+  return restored === "bypassPermissions" && !input.allowBypassPermissions ? "default" : restored;
+}
+
+/** Callback text Claude reports for a request, cleaned for display; undefined when empty. */
+function claudeRequestText(value: string | undefined, limit = 2000): string | undefined {
+  if (value === undefined) return undefined;
+  const cleaned = cleanHookText(value, limit).trim();
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+type ClaudeApprovalScopeFields = Partial<
+  Pick<
+    Extract<OrchestrationV2TurnItem, { readonly type: "approval_request" }>,
+    "agentId" | "agentName" | "blockedPath" | "mcpServerSource" | "defaultToNo"
+  >
+>;
+
+/**
+ * What Claude reports about who asked and what the request reaches: the native subagent,
+ * the path outside the allowed folders, the MCP server and where it was configured, and
+ * whether the card should lead with Decline. Claude reports no network host, requested
+ * permissions or grant root, so those stay unset.
+ */
+function claudeApprovalScope(options: {
+  readonly agentID?: string | undefined;
+  readonly blockedPath?: string | undefined;
+  readonly mcpServer?: { readonly name: string; readonly source: string } | undefined;
+  readonly defaultToNo?: boolean | undefined;
+}): ClaudeApprovalScopeFields {
+  const agentId = claudeRequestText(options.agentID, 200);
+  const blockedPath = claudeRequestText(options.blockedPath, 4096);
+  const serverName = claudeRequestText(options.mcpServer?.name, 200);
+  const serverSource = claudeRequestText(options.mcpServer?.source, 100);
+  return {
+    ...(agentId === undefined ? {} : { agentId }),
+    ...(blockedPath === undefined ? {} : { blockedPath }),
+    ...(serverName === undefined
+      ? {}
+      : {
+          mcpServerSource: {
+            name: serverName,
+            ...(serverSource === undefined ? {} : { source: serverSource }),
+          },
+        }),
+    ...(options.defaultToNo === true ? { defaultToNo: true } : {}),
+  };
+}
+
+/**
+ * Whether `target` lies inside `root` once both are real paths: Claude can
+ * report a path under a symlinked project (`/tmp` → `/private/tmp`) as
+ * outside the folder it runs in, because it compares the resolved path with
+ * the unresolved working directory.
+ */
+function claudePathWithinRoot(
+  path: Pick<Path.Path, "relative" | "isAbsolute">,
+  target: string,
+  root: string,
+): boolean {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * What an approval card calls the native subagent that asked: its task's
+ * title, else the first line of its prompt, else "Subagent". Never the raw
+ * agent id Claude reports.
+ */
+export function claudeSubagentDisplayName(
+  task: Pick<OrchestrationV2Subagent, "title" | "prompt"> | undefined,
+): string {
+  const title = task?.title?.trim();
+  const firstLine = task?.prompt.split("\n")[0]?.trim();
+  const name = title || firstLine || "Subagent";
+  return name.length > 80 ? `${name.slice(0, 79)}…` : name;
+}
+
+/** A Claude permission request as the SDK's canUseTool callback describes it. */
+export interface ClaudeApprovalRequestInput {
   readonly toolName: string;
-  readonly decision: ProviderApprovalDecision;
   readonly toolInput: Record<string, unknown>;
   readonly toolUseID: string;
   readonly suggestions?: Parameters<CanUseTool>[2]["suggestions"];
   readonly matchedAskRule?: Parameters<CanUseTool>[2]["matchedAskRule"];
   readonly suppressAlwaysAllowRule?: boolean;
-}): PermissionResult {
-  const offered = claudeApprovalOptions(input);
-  if (
-    (input.decision === "accept" ||
-      input.decision === "acceptForSession" ||
-      input.decision === "acceptAlways") &&
-    offered.some((option) => option.decision === input.decision)
-  ) {
+  readonly mcpServer?: Parameters<CanUseTool>[2]["mcpServer"];
+  readonly isWorktree?: boolean;
+}
+
+/** One answer a Claude request offers, bound to the exact PermissionResult it sends. */
+export interface ClaudeApprovalChoice {
+  readonly option: ProviderApprovalOption;
+  readonly result: PermissionResult;
+}
+
+function claudePermissionResult(
+  input: ClaudeApprovalRequestInput,
+  option: ProviderApprovalOption,
+): PermissionResult {
+  switch (option.decision) {
+    case "accept":
+      return {
+        behavior: "allow",
+        updatedInput: input.toolInput,
+        toolUseID: input.toolUseID,
+        decisionClassification: "user_temporary",
+      };
+    case "acceptForSession":
+    case "acceptAlways":
+      return {
+        behavior: "allow",
+        updatedInput: input.toolInput,
+        toolUseID: input.toolUseID,
+        decisionClassification: "user_permanent",
+        updatedPermissions: toPermissionUpdates(
+          input,
+          option.decision === "acceptAlways" ? "project" : "session",
+        ),
+      };
+    case "decline":
+      return {
+        behavior: "deny",
+        message: "User declined tool execution.",
+        toolUseID: input.toolUseID,
+        decisionClassification: "user_reject",
+      };
+    case "cancel":
+      return {
+        behavior: "deny",
+        message: "User cancelled tool execution.",
+        toolUseID: input.toolUseID,
+        decisionClassification: "user_reject",
+        interrupt: true,
+      };
+  }
+}
+
+/**
+ * The answers a Claude request offers (claudeApprovalOptions), each bound to the exact
+ * PermissionResult it sends and carrying that result as its `nativePayload`. The recorded
+ * payload leaves out `updatedInput`, which is always the unchanged tool input already on the
+ * request, so a large Write is not stored once per option.
+ */
+function claudeApprovalChoices(
+  input: ClaudeApprovalRequestInput,
+): ReadonlyArray<ClaudeApprovalChoice> {
+  return claudeApprovalOptions(input).map((option) => {
+    const result = claudePermissionResult(input, option);
+    const nativePayload =
+      result.behavior === "allow"
+        ? (({ updatedInput: _updatedInput, ...payload }) => payload)(result)
+        : result;
+    return { option: { ...option, nativePayload }, result };
+  });
+}
+
+/**
+ * Matches an answer to the offered choices with the core's rule: an option id must be one
+ * the request offered; an older client's plain decision takes the narrowest option with that
+ * decision; a reason is accepted only by an option that takes one.
+ */
+function resolveClaudeApprovalAnswer(input: {
+  readonly choices: ReadonlyArray<ClaudeApprovalChoice>;
+  readonly optionId?: ProviderApprovalOptionId | undefined;
+  readonly decision?: ProviderApprovalDecision | undefined;
+  readonly feedback?: string | undefined;
+}):
+  | { readonly _tag: "chosen"; readonly answer: ClaudeApprovalAnswer }
+  | { readonly _tag: "refused"; readonly reason: string } {
+  const resolved = resolveApprovalChoice({
+    optionId: input.optionId,
+    decision: input.decision,
+    feedback: input.feedback,
+    options: input.choices.map((choice) => choice.option),
+  });
+  if (resolved._tag === "refused") return resolved;
+  const choice = input.choices.find(
+    (candidate) => candidate.option.optionId === resolved.choice.optionId,
+  );
+  if (choice === undefined) {
     return {
-      behavior: "allow",
-      updatedInput: input.toolInput,
-      toolUseID: input.toolUseID,
-      decisionClassification: input.decision !== "accept" ? "user_permanent" : "user_temporary",
-      ...(input.decision !== "accept"
-        ? {
-            updatedPermissions: toPermissionUpdates(
-              input.toolName,
-              input.suggestions,
-              input.decision === "acceptAlways" ? "project" : "session",
-            ),
-          }
-        : {}),
+      _tag: "refused",
+      reason: "This choice is no longer offered. Choose again from the request.",
     };
   }
-
   return {
-    behavior: "deny",
-    message:
-      input.decision === "cancel"
-        ? "User cancelled tool execution."
-        : "User declined tool execution.",
-    toolUseID: input.toolUseID,
-    decisionClassification: "user_reject",
-    ...(input.decision === "cancel" ? { interrupt: true } : {}),
+    _tag: "chosen",
+    answer: { choice, ...(input.feedback === undefined ? {} : { feedback: input.feedback }) },
   };
 }
 
-export const awaitClaudeApprovalDecision = Effect.fn("awaitClaudeApprovalDecision")(function* (
-  decision: Deferred.Deferred<ProviderApprovalDecision>,
+/** What Claude receives for an answer: the chosen option's result, with the user's reason. */
+function claudeAnswerResult(answer: ClaudeApprovalAnswer): PermissionResult {
+  const { result } = answer.choice;
+  if (answer.feedback === undefined || result.behavior !== "deny") return result;
+  return { ...result, message: `${result.message} Their reason: ${answer.feedback}` };
+}
+
+/**
+ * The PermissionResult a plain decision maps to, as an answer from a client that predates
+ * option ids would: the narrowest offered option with that decision. An allow nobody offered
+ * becomes a decline.
+ */
+export function permissionResultFromDecision(
+  input: Omit<ClaudeApprovalRequestInput, "isWorktree" | "mcpServer"> & {
+    readonly decision: ProviderApprovalDecision;
+  },
+): PermissionResult {
+  const choices = claudeApprovalChoices(input);
+  const resolved = resolveClaudeApprovalAnswer({ choices, decision: input.decision });
+  if (resolved._tag === "chosen") return claudeAnswerResult(resolved.answer);
+  return choices.find((choice) => choice.option.decision === "decline")!.result;
+}
+
+/** A Claude approval answer: the choice the user made and any reason they typed. */
+export interface ClaudeApprovalAnswer {
+  readonly choice: ClaudeApprovalChoice;
+  readonly feedback?: string;
+}
+
+/** Waits for the user's answer; an aborted request resolves to `aborted` instead. */
+export function awaitClaudeApprovalDecision<A>(
+  answer: Deferred.Deferred<A>,
   signal: AbortSignal,
-) {
-  const cancellation = Effect.callback<ProviderApprovalDecision>((resume) => {
-    const abort = () => resume(Effect.succeed("cancel"));
+  aborted: A,
+): Effect.Effect<A> {
+  const cancellation = Effect.callback<A>((resume) => {
+    const abort = () => resume(Effect.succeed(aborted));
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) {
       abort();
     }
     return Effect.sync(() => signal.removeEventListener("abort", abort));
   });
-  return yield* Effect.raceFirst(Deferred.await(decision), cancellation);
-});
+  return Effect.raceFirst(Deferred.await(answer), cancellation);
+}
 
 const awaitClaudeUserInputAnswers = Effect.fn("awaitClaudeUserInputAnswers")(function* (
   answers: Deferred.Deferred<ProviderUserInputAnswers>,
@@ -3161,6 +3510,9 @@ const CLAUDE_USAGE_LIMIT_WINDOWS = {
   overage: "overage",
 } satisfies Record<NonNullable<SDKRateLimitInfo["rateLimitType"]>, string>;
 
+const CLAUDE_CREDITS_REQUIRED_MESSAGE =
+  "This Claude model requires usage credits. Switch to another model, or add usage credits to your Claude account, then send the message again.";
+
 /** Beyond this the reset time is not credible, so the row ships without a wait. */
 const CLAUDE_USAGE_LIMIT_MAX_WAIT_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -3236,6 +3588,9 @@ interface ActiveClaudeTurnContext {
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimited: boolean;
+  // A rejection the CLI marked `errorCode: "credits_required"`: the model needs
+  // usage credits, so no window reset will let the turn run.
+  creditsRequired: boolean;
   readonly subagentsByTaskId: Map<string, ActiveClaudeSubagent>;
   readonly subagentsByToolUseId: Map<string, ActiveClaudeSubagent>;
   readonly subagentNodesByTaskId: Map<string, OrchestrationV2ExecutionNode["id"]>;
@@ -3320,11 +3675,17 @@ interface ClaudeLiveQueryContext {
   // uuid before any echo, so it echoes, but a resume's own turns can still
   // run ahead of that prompt.
   promptEchoMode: "unknown" | "acknowledged" | "early" | "result_only";
-  // The mode this process was opened in, and the mode the CLI last reported
-  // (init and status frames). Claude changes the latter itself through
-  // EnterPlanMode.
-  readonly openedPermissionMode: PermissionMode;
-  permissionMode: PermissionMode;
+  // Whether the chat inherits Claude's settings or overrides them with a mode.
+  readonly permissionSource: ClaudePermissionSource;
+  // The mode this process was opened with (undefined when inheriting), and
+  // the mode the CLI last reported (init and status frames). Claude changes
+  // the latter itself through EnterPlanMode and approved session updates.
+  readonly openedPermissionMode: PermissionMode | undefined;
+  permissionMode: PermissionMode | undefined;
+  // The mode the user last approved for this process ("Allow for this session").
+  approvedSessionMode: PermissionMode | undefined;
+  // The mode the CLI reported before it last entered plan mode.
+  modeBeforePlan: PermissionMode | undefined;
   // Stop, rollback or fork is closing this process; its work is ending.
   stopping: boolean;
   // Registry entries still running when this process opened. Their process
@@ -3447,18 +3808,62 @@ function rememberClaudeSubagentLaunch(
   }
 }
 
+/**
+ * Completes once the SDK took the callback's result while the request was
+ * still open (see `claudeSdkHandover`); fails with the reason it did not.
+ */
+type ClaudeSdkHandover = Deferred.Deferred<void, string>;
+
 type PendingClaudeRuntimeRequest =
   | {
       readonly type: "approval";
       readonly requestId: OrchestrationV2RuntimeRequest["id"];
       readonly requestKind: ProviderRequestKind;
-      readonly decision: Deferred.Deferred<ProviderApprovalDecision, never>;
+      readonly choices: ReadonlyArray<ClaudeApprovalChoice>;
+      readonly answer: Deferred.Deferred<ClaudeApprovalAnswer, never>;
+      readonly handedOver: ClaudeSdkHandover;
     }
   | {
       readonly type: "user_input";
       readonly requestId: OrchestrationV2RuntimeRequest["id"];
       readonly answers: Deferred.Deferred<ProviderUserInputAnswers, never>;
+      readonly handedOver: ClaudeSdkHandover;
     };
+
+/**
+ * Runs an SDK permission callback and settles `handedOver` with whether its
+ * result went back to the SDK while the request was still open. The SDK
+ * writes the control response to Claude in the continuation of the promise
+ * returned here, unless it cancelled the request or closed the query first;
+ * either aborts the callback's signal. So the answer counts as handed over
+ * when the callback returns it with the signal still live. The SDK reports no
+ * write acknowledgement, so a write that fails on an already closed pipe
+ * before the query notices is not seen here.
+ */
+export function claudeSdkHandover<A>(
+  signal: AbortSignal,
+  handedOver: ClaudeSdkHandover,
+  callback: Promise<A>,
+): Promise<A> {
+  const settle = (reason: string | undefined) =>
+    Effect.runSync(
+      reason === undefined
+        ? Deferred.succeed(handedOver, undefined)
+        : Deferred.fail(handedOver, reason),
+    );
+  return callback.then(
+    (result) => {
+      settle(
+        signal.aborted ? "Claude cancelled the request before the answer was sent." : undefined,
+      );
+      return result;
+    },
+    (error: unknown) => {
+      settle("The answer was not handed to Claude.");
+      throw error;
+    },
+  );
+}
 
 export function claudeUserInputQuestions(
   input: unknown,
@@ -3924,7 +4329,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
         const sessionScope = yield* Effect.scope;
         const now = yield* DateTime.now;
-        const session = providerSession({
+        // Mutable only for activePermissions (reportActivePermissions): the session manager
+        // writes this object again at every turn start and release.
+        const session: Types.Mutable<OrchestrationV2ProviderSession> = providerSession({
           providerSessionId: input.providerSessionId,
           providerInstanceId: adapterOptions.instanceId,
           cwd: input.runtimePolicy.cwd,
@@ -3933,6 +4340,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         });
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
+        // The preview browser note this session last delivered, so it is sent only on change.
+        const sentPreviewBrowserContext = yield* Ref.make<string | undefined>(undefined);
         let localShellExecution: ClaudeUserShellExecution | null = null;
         const userShellAppendUuids = new Set<string>();
         const userShellAppendReceipts = new Map<
@@ -4071,6 +4480,36 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         // the turn that launched the subagent (wake drain, later turns) resolve
         // their subagent through this index into sessionSubagentsByTaskId.
         const sessionSubagentTaskIdsByToolUseId = yield* Ref.make(new Map<string, string>());
+        /**
+         * What an approval card calls the native subagent that asked: its task's
+         * title, else the first line of its prompt, else "Subagent". Never the
+         * raw agent id Claude reports.
+         */
+        /** A real path, or its parent's real path for a file not written yet. */
+        const realPathOrParent = (target: string) =>
+          fileSystem.realPath(target).pipe(
+            Effect.catch(() =>
+              fileSystem
+                .realPath(path.dirname(target))
+                .pipe(Effect.map((parent) => path.join(parent, path.basename(target)))),
+            ),
+            Effect.orElseSucceed(() => target),
+          );
+        /**
+         * Whether a path Claude reports as outside the allowed folders is in
+         * fact inside the chat's folder once symlinks are resolved; the card
+         * then does not call it outside.
+         */
+        const blockedPathInsideWorkspace = (blockedPath: string, cwd: string | null) =>
+          cwd === null || !path.isAbsolute(blockedPath)
+            ? Effect.succeed(false)
+            : Effect.all([realPathOrParent(blockedPath), realPathOrParent(cwd)]).pipe(
+                Effect.map(([target, root]) => claudePathWithinRoot(path, target, root)),
+              );
+        const subagentDisplayName = (agentId: string) =>
+          Ref.get(sessionSubagentsByTaskId).pipe(
+            Effect.map((subagents) => claudeSubagentDisplayName(subagents.get(agentId)?.task)),
+          );
         // A subagent's tool calls can outlive the turn that started them, so
         // they live here rather than on a turn context: a turn that ends while
         // one runs neither fails it nor hides it from the turn that follows.
@@ -4271,6 +4710,35 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
+
+        // The permission mode Claude last reported for this session (PLAN-002 §1 "Active"):
+        // system/init and system/status frames, and a mode the user approved for the session.
+        // It is kept on the runtime's session object too, so the session manager's later writes
+        // of that object (each turn start, the release) carry it instead of wiping it.
+        const reportActivePermissions = Effect.fnUntraced(function* (
+          nativeMode: PermissionMode,
+          reportedBy: ProviderActivePermissionReport,
+        ) {
+          // Status frames repeat the mode; a change, a new process or an approval is news.
+          if (
+            session.activePermissions?.nativeMode === nativeMode &&
+            reportedBy === "session-status"
+          )
+            return;
+          const reportedAt = yield* DateTime.now;
+          session.activePermissions = {
+            nativeMode,
+            interactionMode: nativeMode === "plan" ? "plan" : "default",
+            reportedBy,
+            reportedAt: DateTime.formatIso(reportedAt),
+          };
+          session.updatedAt = reportedAt;
+          yield* emitProviderEvent({
+            type: "provider_session.updated",
+            driver: CLAUDE_PROVIDER,
+            providerSession: { ...session },
+          });
+        });
 
         // Claude emits retry progress but no recovered frame; the next
         // assistant message is the first reliable evidence of recovery.
@@ -6175,32 +6643,45 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         });
 
         const buildApprovalRequestArtifacts = Effect.fnUntraced(function* (input: {
-          readonly context: ActiveClaudeTurnContext;
+          readonly target: ClaudeRequestTarget;
           readonly nativeItemId: string;
           readonly nativeRequestId: string;
           readonly requestKind: OrchestrationV2RuntimeRequest["kind"];
           readonly prompt?: string;
           readonly questions?: ReadonlyArray<OrchestrationV2UserInputQuestion>;
           readonly options?: ReadonlyArray<ProviderApprovalOption>;
+          readonly scope?: ClaudeApprovalScopeFields;
+          readonly preview?: ProposedFileChangeFields;
+          /** The shell command the request runs, for a Bash call. */
+          readonly command?: string;
         }) {
+          const { context, threadId } = input.target;
           const createdAt = yield* DateTime.now;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
             driver: CLAUDE_PROVIDER,
-            providerTurnId: input.context.providerTurnId,
+            ...(context === null ? {} : { providerTurnId: context.providerTurnId }),
             nativeRequestId: input.nativeRequestId,
           });
           const nodeId = idAllocator.derive.approvalNode({ requestId });
-          const providerSessionId = input.context.input.providerThread.providerSessionId;
+          const providerSessionId =
+            context === null ? session.id : context.input.providerThread.providerSessionId;
           if (providerSessionId === null) {
             return yield* new ProviderAdapter.ProviderAdapterProtocolError({
               driver: CLAUDE_PROVIDER,
-              detail: `Provider thread ${input.context.input.providerThread.id} is missing a provider session id.`,
+              detail: `Provider thread ${input.target.providerThreadId} is missing a provider session id.`,
             });
           }
-          const ordinal = yield* resolveItemOrdinal(
-            input.context,
-            `${input.nativeItemId}:approval:${input.nativeRequestId}`,
-          );
+          // A request between turns belongs to no run: it is its own root,
+          // like any session-scoped request, and is persisted on the thread.
+          const ordinal =
+            context === null
+              ? 1
+              : yield* resolveItemOrdinal(
+                  context,
+                  `${input.nativeItemId}:approval:${input.nativeRequestId}`,
+                );
+          const runId = context === null ? null : context.input.runId;
+          const providerTurnId = context === null ? null : context.providerTurnId;
           const nativeItemRef = {
             driver: CLAUDE_PROVIDER,
             nativeId: input.nativeRequestId,
@@ -6208,18 +6689,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           };
           const node: OrchestrationV2ExecutionNode = {
             id: nodeId,
-            threadId: input.context.input.threadId,
-            runId: input.context.input.runId,
-            parentNodeId: idAllocator.derive.nodeFromProviderItem({
-              driver: CLAUDE_PROVIDER,
-              nativeItemId: input.nativeItemId,
-            }),
-            rootNodeId: input.context.input.rootNodeId,
+            threadId,
+            runId,
+            parentNodeId:
+              context === null
+                ? null
+                : idAllocator.derive.nodeFromProviderItem({
+                    driver: CLAUDE_PROVIDER,
+                    nativeItemId: input.nativeItemId,
+                  }),
+            rootNodeId: context === null ? nodeId : context.input.rootNodeId,
             kind: input.questions === undefined ? "approval_request" : "user_input_request",
             status: "waiting",
             countsForRun: false,
-            providerThreadId: input.context.input.providerThread.id,
-            providerTurnId: input.context.providerTurnId,
+            providerThreadId: input.target.providerThreadId,
+            providerTurnId,
             nativeItemRef,
             runtimeRequestId: requestId,
             checkpointScopeId: null,
@@ -6229,7 +6713,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const request: OrchestrationV2RuntimeRequest = {
             id: requestId,
             nodeId,
-            providerTurnId: input.context.providerTurnId,
+            providerTurnId,
             nativeRequestRef: {
               driver: CLAUDE_PROVIDER,
               nativeId: input.nativeRequestId,
@@ -6246,11 +6730,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           };
           const turnItem: OrchestrationV2TurnItem = {
             id: idAllocator.derive.approvalTurnItem({ requestId }),
-            threadId: input.context.input.threadId,
-            runId: input.context.input.runId,
+            threadId,
+            runId,
             nodeId,
-            providerThreadId: input.context.input.providerThread.id,
-            providerTurnId: input.context.providerTurnId,
+            providerThreadId: input.target.providerThreadId,
+            providerTurnId,
             nativeItemRef,
             parentItemId: null,
             ordinal,
@@ -6265,7 +6749,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   requestId,
                   requestKind: input.requestKind as ProviderRequestKind,
                   ...(input.prompt === undefined ? {} : { prompt: input.prompt }),
+                  ...(input.command === undefined ? {} : { command: input.command }),
                   ...(input.options === undefined ? {} : { options: [...input.options] }),
+                  ...input.scope,
+                  ...input.preview,
                 }
               : {
                   type: "user_input_request" as const,
@@ -6274,6 +6761,63 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 }),
           };
           return { node, request, turnItem };
+        });
+
+        const emitApprovalRequestArtifacts = (
+          target: ClaudeRequestTarget,
+          artifacts: {
+            readonly node: OrchestrationV2ExecutionNode;
+            readonly request: OrchestrationV2RuntimeRequest;
+            readonly turnItem: OrchestrationV2TurnItem;
+          },
+        ) =>
+          Effect.all(
+            [
+              emitProviderEvent({
+                type: "node.updated",
+                driver: CLAUDE_PROVIDER,
+                node: artifacts.node,
+              }),
+              emitProviderEvent({
+                type: "runtime_request.updated",
+                driver: CLAUDE_PROVIDER,
+                // A request with no turn is routed by its thread.
+                ...(target.context === null ? { threadId: target.threadId } : {}),
+                runtimeRequest: artifacts.request,
+              }),
+              emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CLAUDE_PROVIDER,
+                turnItem: artifacts.turnItem,
+              }),
+            ],
+            { concurrency: 1, discard: true },
+          );
+
+        // The thread a request raised between turns is shown on: the thread of
+        // the turn this process ran last, else the session's own thread.
+        const threadRequestTarget = Effect.gen(function* () {
+          const lastTurn = (yield* Ref.get(queryContext))?.lastTurn ?? null;
+          if (lastTurn !== null)
+            return {
+              context: null,
+              threadId: lastTurn.input.threadId,
+              providerThreadId: lastTurn.input.providerThread.id,
+              cwd: lastTurn.input.runtimePolicy.cwd,
+              isWorktree: lastTurn.input.appThread.worktreePath !== null,
+            } satisfies ClaudeRequestTarget;
+          const live = yield* Ref.get(queryContext);
+          const providerThread =
+            live === null
+              ? undefined
+              : (yield* Ref.get(lastProviderThreadByNativeThread)).get(live.nativeThreadId);
+          return {
+            context: null,
+            threadId: input.threadId,
+            providerThreadId: providerThread?.id ?? null,
+            cwd: input.runtimePolicy.cwd,
+            isWorktree: false,
+          } satisfies ClaudeRequestTarget;
         });
 
         const ensureReasoningBlock = Effect.fnUntraced(function* (
@@ -7357,6 +7901,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               rateLimitInfo.overageStatus === "allowed_warning" ||
               rateLimitInfo.isUsingOverage === true ||
               rateLimitInfo.overageInUse === true;
+            // The model needs usage credits; its window's reset time would only
+            // promise a retry that cannot succeed. The CLI explains it in the
+            // transcript, and the result frame ends the turn.
+            if (
+              rateLimitInfo.status === "rejected" &&
+              !overageAllowed &&
+              rateLimitInfo.errorCode === "credits_required"
+            ) {
+              context.creditsRequired = true;
+              return;
+            }
             const blocked = rateLimitInfo.status === "rejected" && !overageAllowed;
             const limitType = rateLimitInfo.rateLimitType ?? "unknown";
             if (blocked) {
@@ -8364,9 +8919,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               next.delete(context.providerTurnId);
               return next;
             });
+            // The CLI's synthetic limit reply for a credits rejection carries
+            // `error: "rate_limit"`, so only a rejected window proves a limit then.
+            const creditsOnly =
+              context.creditsRequired && context.rejectedRateLimitTypes.size === 0;
             const usageLimited =
               context.authenticationFailureMessage === undefined &&
-              (context.rejectedRateLimitTypes.size > 0 || context.latestAssistantRateLimited) &&
+              (context.rejectedRateLimitTypes.size > 0 ||
+                (context.latestAssistantRateLimited && !creditsOnly)) &&
               (message.subtype !== "success" ||
                 message.api_error_status == null ||
                 message.api_error_status === 429) &&
@@ -8392,9 +8952,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ? null
               : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
             const terminalFailure =
-              resultFailure?.class === "usage_limit"
-                ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
-                : resultFailure;
+              resultFailure?.class === "usage_limit" && creditsOnly
+                ? makeProviderFailure({
+                    class: "provider_error",
+                    code: "credits_required",
+                    message: CLAUDE_CREDITS_REQUIRED_MESSAGE,
+                    retryable: false,
+                  })
+                : resultFailure?.class === "usage_limit"
+                  ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
+                  : resultFailure;
             yield* finalizeActiveTurn({
               context,
               status: interrupted ? "interrupted" : terminalStatusFromResult(message, failureHint),
@@ -8691,16 +9258,22 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           toolName: Parameters<CanUseTool>[0],
           toolInput: Parameters<CanUseTool>[1],
           callbackOptions: Parameters<CanUseTool>[2],
+          handedOver: ClaudeSdkHandover,
         ) {
           const context = yield* Ref.get(activeTurn);
-          if (context === null) {
-            return {
-              behavior: "deny",
-              message: "Claude V2 adapter has no active turn for this tool request.",
-              toolUseID: callbackOptions.toolUseID,
-            } satisfies PermissionResult;
-          }
-
+          // Between turns (a background agent, a wake turn not yet started)
+          // the request goes on the thread itself, so it is still shown and
+          // answered rather than refused unseen.
+          const target: ClaudeRequestTarget =
+            context === null
+              ? yield* threadRequestTarget
+              : {
+                  context,
+                  threadId: context.input.threadId,
+                  providerThreadId: context.input.providerThread.id,
+                  cwd: context.input.runtimePolicy.cwd,
+                  isWorktree: context.input.appThread.worktreePath !== null,
+                };
           const nativeRequestId = callbackOptions.toolUseID;
           const nativeToolInput = claudeNativeToolInputFromRecord(toolInput);
           // While root output awaits its prompt echo, the tool's streamed
@@ -8708,8 +9281,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           // callback must not attach anything to the pending prompt turn:
           // the held tool_use frame starts the tool (and projects an
           // ExitPlanMode plan) in whichever run it is released to.
-          const heldForEcho = context.heldRootFrames.length > 0;
-          if (toolName === "Agent") {
+          const heldForEcho = context !== null && context.heldRootFrames.length > 0;
+          if (context !== null && toolName === "Agent") {
             rememberClaudeSubagentLaunch(
               subagentModelCatalog,
               context,
@@ -8718,7 +9291,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               nativeToolInput,
               null,
             );
-          } else if (!heldForEcho) {
+          } else if (context !== null && !heldForEcho) {
             yield* ensureToolCallStarted({
               context,
               nativeItemId: nativeRequestId,
@@ -8728,11 +9301,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             });
           }
 
-          if (
-            heldForEcho &&
-            toolName !== "ExitPlanMode" &&
-            (toolName === "AskUserQuestion" || requiresClaudeApproval(context))
-          ) {
+          if (context !== null && heldForEcho && toolName !== "ExitPlanMode") {
             // The SDK blocks on the answer, and the prompt echo cannot arrive
             // until the held turn goes on, so the request is raised now and
             // the held output goes with it to the pending prompt turn, as it
@@ -8753,7 +9322,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           if (toolName === "AskUserQuestion") {
             const questions = claudeUserInputQuestions(nativeToolInput);
             const artifacts = yield* buildApprovalRequestArtifacts({
-              context,
+              target,
               nativeItemId: nativeRequestId,
               nativeRequestId,
               requestKind: "user_input",
@@ -8766,29 +9335,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 type: "user_input",
                 requestId: artifacts.request.id,
                 answers,
+                handedOver,
               });
               return updated;
             });
-            yield* Effect.all(
-              [
-                emitProviderEvent({
-                  type: "node.updated",
-                  driver: CLAUDE_PROVIDER,
-                  node: artifacts.node,
-                }),
-                emitProviderEvent({
-                  type: "runtime_request.updated",
-                  driver: CLAUDE_PROVIDER,
-                  runtimeRequest: artifacts.request,
-                }),
-                emitProviderEvent({
-                  type: "turn_item.updated",
-                  driver: CLAUDE_PROVIDER,
-                  turnItem: artifacts.turnItem,
-                }),
-              ],
-              { concurrency: 1 },
-            );
+            yield* emitApprovalRequestArtifacts(target, artifacts);
             const resolvedAnswers = yield* awaitClaudeUserInputAnswers(
               answers,
               callbackOptions.signal,
@@ -8818,18 +9369,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
           if (toolName === "ExitPlanMode") {
             const markdown = claudeProposedPlan(nativeToolInput);
-            // Defer only while the tool_use frame itself is still held, so
-            // the plan is published when that frame is handled; otherwise
-            // publish now. Claude is told the plan was captured either way.
-            if (markdown !== null && heldToolUseIds(context).has(nativeRequestId)) {
-              heldProposedPlansByToolUseId.set(nativeRequestId, markdown);
-            } else if (markdown !== null) {
-              yield* emitClaudePlanProjection({
-                context,
-                nativeItemId: nativeRequestId,
-                kind: "proposed_plan",
-                markdown,
-              });
+            // Defer while the tool_use frame itself is still held (or, between
+            // turns, waits for the run it is replayed into), so the plan is
+            // published when that frame is handled; otherwise publish now.
+            // Claude is told the plan was captured either way.
+            if (markdown !== null) {
+              if (context === null || heldToolUseIds(context).has(nativeRequestId)) {
+                heldProposedPlansByToolUseId.set(nativeRequestId, markdown);
+              } else {
+                yield* emitClaudePlanProjection({
+                  context,
+                  nativeItemId: nativeRequestId,
+                  kind: "proposed_plan",
+                  markdown,
+                });
+              }
             }
             return {
               behavior: "deny",
@@ -8839,86 +9393,105 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             } satisfies PermissionResult;
           }
 
-          // Some SDK releases omit the native decision_reason_type from the
-          // callback. A reason supplied by the CLI still represents an ask and
-          // must survive a legacy permissive host policy.
+          // Every ask Claude raises is shown, in every mode: Claude has already
+          // allowed whatever its mode and rules allow before calling back.
+          // Some SDK releases omit the native decision_reason_type, so a hook
+          // ask is also recognised by its camel-cased field.
           const hookForcedAsk =
             Reflect.get(callbackOptions, "decision_reason_type") === "hook" ||
             Reflect.get(callbackOptions, "decisionReasonType") === "hook";
-          const cliForcedAsk =
-            hookForcedAsk ||
-            (typeof callbackOptions.decisionReason === "string" &&
-              callbackOptions.decisionReason.trim().length > 0);
-          if (
-            !requiresClaudeApproval(context) &&
-            !isStarkPublishRequest(toolName, toolInput) &&
-            !cliForcedAsk &&
-            callbackOptions.matchedAskRule === undefined
-          ) {
-            return {
-              behavior: "allow",
-              updatedInput: toolInput,
-              toolUseID: callbackOptions.toolUseID,
-            } satisfies PermissionResult;
-          }
 
           const requestKind = providerRequestKindFromClaudeTool(toolName);
-          const prompt = cleanHookText(
-            callbackOptions.title ??
-              callbackOptions.description ??
-              callbackOptions.decisionReason ??
-              summarizeClaudeToolRequest(toolName, nativeToolInput),
+          const title = claudeRequestText(callbackOptions.title);
+          const description = claudeRequestText(callbackOptions.description);
+          const claudePrompt = cleanHookText(
+            title !== undefined && description !== undefined && description !== title
+              ? `${title}\n${description}`
+              : (callbackOptions.title ??
+                  callbackOptions.description ??
+                  callbackOptions.decisionReason ??
+                  summarizeClaudeToolRequest(toolName, nativeToolInput)),
             2000,
           );
-          const approvalOptions = claudeApprovalOptions({
+          // Stark's Pages guard asks about a command that may publish in every
+          // mode, but Claude's own title fills the prompt and drops the guard's
+          // reason. The prompt carries it, so the card can say why it asks.
+          const prompt =
+            starkPagesPublishVerdict({
+              toolName,
+              toolInput,
+              mcpServer: callbackOptions.mcpServer,
+            }) === "ambiguous" && !claudePrompt.includes(STARK_PAGES_PUBLISH_UNCERTAIN)
+              ? `${claudePrompt}\n${STARK_PAGES_PUBLISH_UNCERTAIN}`
+              : claudePrompt;
+          const choices = claudeApprovalChoices({
             toolName,
             toolInput,
             ...callbackOptions,
-            isWorktree: context.input.appThread.worktreePath !== null,
+            isWorktree: target.isWorktree,
           });
+          // The card shows the exact command even when no command item links
+          // to the request, as for a native subagent's Bash call.
+          const shellCommand =
+            (toolName === "Bash" || toolName === "Monitor") &&
+            typeof toolInput.command === "string" &&
+            toolInput.command.trim().length > 0
+              ? toolInput.command.slice(0, 100_000)
+              : undefined;
+          // The card shows the files and diff this call would write. Building the
+          // preview never fails; an unreadable target falls back to the edit text.
+          const preview =
+            requestKind === "file-change"
+              ? yield* claudeProposedFileChanges({
+                  toolName,
+                  toolInput,
+                  cwd: target.cwd,
+                })
+              : undefined;
           const artifacts = yield* buildApprovalRequestArtifacts({
-            context,
+            target,
             nativeItemId: nativeRequestId,
             nativeRequestId,
             requestKind,
             prompt: hookForcedAsk ? `Asked by a hook\n${prompt}` : prompt,
-            options: approvalOptions,
+            options: choices.map((choice) => choice.option),
+            scope: {
+              ...claudeApprovalScope({
+                ...callbackOptions,
+                blockedPath:
+                  callbackOptions.blockedPath === undefined ||
+                  (yield* blockedPathInsideWorkspace(callbackOptions.blockedPath, target.cwd))
+                    ? undefined
+                    : callbackOptions.blockedPath,
+              }),
+              ...(callbackOptions.agentID === undefined
+                ? {}
+                : { agentName: yield* subagentDisplayName(callbackOptions.agentID) }),
+            },
+            ...(shellCommand === undefined ? {} : { command: shellCommand }),
+            ...(preview === undefined ? {} : { preview }),
           });
-          const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
+          const answer = yield* Deferred.make<ClaudeApprovalAnswer, never>();
           yield* Ref.update(pendingRuntimeRequests, (current) => {
             const updated = new Map(current);
             updated.set(String(artifacts.request.id), {
               type: "approval",
               requestId: artifacts.request.id,
               requestKind,
-              decision,
+              choices,
+              answer,
+              handedOver,
             });
             return updated;
           });
-          yield* Effect.all(
-            [
-              emitProviderEvent({
-                type: "node.updated",
-                driver: CLAUDE_PROVIDER,
-                node: artifacts.node,
-              }),
-              emitProviderEvent({
-                type: "runtime_request.updated",
-                driver: CLAUDE_PROVIDER,
-                runtimeRequest: artifacts.request,
-              }),
-              emitProviderEvent({
-                type: "turn_item.updated",
-                driver: CLAUDE_PROVIDER,
-                turnItem: artifacts.turnItem,
-              }),
-            ],
-            { concurrency: 1 },
-          );
+          yield* emitApprovalRequestArtifacts(target, artifacts);
 
-          const resolvedDecision = yield* awaitClaudeApprovalDecision(
-            decision,
+          // An aborted request ends as "Decline and stop" would.
+          const stop = choices.find((choice) => choice.option.decision === "cancel")!;
+          const resolvedAnswer = yield* awaitClaudeApprovalDecision(
+            answer,
             callbackOptions.signal,
+            { choice: stop },
           ).pipe(
             Effect.ensuring(
               Ref.update(pendingRuntimeRequests, (current) => {
@@ -8929,116 +9502,119 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ),
           );
 
-          if (
-            resolvedDecision === "acceptAlways" &&
-            approvalOptions.some((option) => option.decision === "acceptAlways")
-          ) {
+          if (resolvedAnswer.choice.option.persistsTo === "claude-local-settings") {
             yield* Effect.logInfo("Provider approval rule saved").pipe(
               Effect.annotateLogs({
-                threadId: context.input.threadId,
+                threadId: target.threadId,
                 provider: "claudeAgent",
                 providerInstanceId: adapterOptions.instanceId,
-                scope: context.input.appThread.worktreePath === null ? "project" : "worktree",
-                rules:
-                  approvalOptions.find((option) => option.decision === "acceptAlways")
-                    ?.rulePreview ?? [],
+                scope: target.isWorktree ? "worktree" : "project",
+                rules: resolvedAnswer.choice.option.rulePreview ?? [],
               }),
             );
           }
-          return permissionResultFromDecision({
-            toolName,
-            decision: resolvedDecision,
-            toolInput,
-            toolUseID: callbackOptions.toolUseID,
-            ...(callbackOptions.suggestions === undefined
-              ? {}
-              : { suggestions: callbackOptions.suggestions }),
-            ...(callbackOptions.matchedAskRule === undefined
-              ? {}
-              : { matchedAskRule: callbackOptions.matchedAskRule }),
-            ...(callbackOptions.suppressAlwaysAllowRule === undefined
-              ? {}
-              : { suppressAlwaysAllowRule: callbackOptions.suppressAlwaysAllowRule }),
-          });
+          const result = claudeAnswerResult(resolvedAnswer);
+          // A mode the user approved for the session stays until the process
+          // ends; the next prompt must not put it back.
+          const approvedMode = approvedSessionMode(result);
+          const liveQuery = yield* Ref.get(queryContext);
+          if (approvedMode !== undefined && liveQuery !== null) {
+            liveQuery.approvedSessionMode = approvedMode;
+            yield* reportActivePermissions(approvedMode, "approved-session-update");
+          }
+          return result;
         });
 
-        const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
-          runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
+        const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) => {
+          const handedOver = Deferred.makeUnsafe<void, string>();
+          return claudeSdkHandover(
+            callbackOptions.signal,
+            handedOver,
+            runPromise(canUseToolEffect(toolName, toolInput, callbackOptions, handedOver)),
+          );
+        };
 
         const onUserDialog: NonNullable<ClaudeQueryOptions["onUserDialog"]> = (
           request,
           callbackOptions,
-        ) =>
-          runPromise(
-            Effect.gen(function* () {
-              if (request.dialogKind !== "resume_return") {
-                return { behavior: "cancelled" as const };
-              }
-              const ageMinutes =
-                typeof request.payload.sessionAgeMinutes === "number" &&
-                Number.isFinite(request.payload.sessionAgeMinutes)
-                  ? Math.max(0, Math.floor(request.payload.sessionAgeMinutes))
-                  : 0;
-              const estimatedTokens =
-                typeof request.payload.estimatedTokens === "number" &&
-                Number.isFinite(request.payload.estimatedTokens)
-                  ? Math.max(0, Math.floor(request.payload.estimatedTokens))
-                  : 0;
-              const question = formatClaudeResumeCompactionQuestion({
-                ageMinutes,
-                estimatedTokens,
-              });
-              const result = yield* canUseToolEffect(
-                "AskUserQuestion",
-                {
-                  questions: [
-                    {
-                      header: "Resume session",
-                      question,
-                      options: [
-                        {
-                          label: "Compact and continue",
-                          description: "Resume with a summary and use fewer tokens.",
-                        },
-                        {
-                          label: "Keep full history",
-                          description: "Resume without changing the conversation.",
-                        },
-                        {
-                          label: CLAUDE_RESUME_COMPACTION_NEVER_ANSWER,
-                          description: "Keep full history and skip future resume prompts.",
-                        },
-                      ],
-                      multiSelect: false,
-                    },
-                  ],
-                },
-                {
-                  signal: callbackOptions.signal,
-                  requestId: callbackOptions.requestId,
-                  toolUseID: request.toolUseID ?? callbackOptions.requestId,
-                },
-              );
-              if (result.behavior !== "allow") return { behavior: "cancelled" as const };
-              const answers =
-                result.updatedInput === undefined
-                  ? undefined
-                  : Reflect.get(result.updatedInput, "answers");
-              const selection =
-                typeof answers === "object" && answers !== null
-                  ? Reflect.get(answers, question)
-                  : undefined;
-              return {
-                behavior: "completed" as const,
-                result:
-                  selection === "Compact and continue"
-                    ? ("compact" as const)
-                    : selection === CLAUDE_RESUME_COMPACTION_NEVER_ANSWER
-                      ? ("never" as const)
-                      : ("continue" as const),
-              };
-            }),
+        ) => {
+          const handedOver = Deferred.makeUnsafe<void, string>();
+          return claudeSdkHandover(
+            callbackOptions.signal,
+            handedOver,
+            runPromise(
+              Effect.gen(function* () {
+                if (request.dialogKind !== "resume_return") {
+                  return { behavior: "cancelled" as const };
+                }
+                const ageMinutes =
+                  typeof request.payload.sessionAgeMinutes === "number" &&
+                  Number.isFinite(request.payload.sessionAgeMinutes)
+                    ? Math.max(0, Math.floor(request.payload.sessionAgeMinutes))
+                    : 0;
+                const estimatedTokens =
+                  typeof request.payload.estimatedTokens === "number" &&
+                  Number.isFinite(request.payload.estimatedTokens)
+                    ? Math.max(0, Math.floor(request.payload.estimatedTokens))
+                    : 0;
+                const question = formatClaudeResumeCompactionQuestion({
+                  ageMinutes,
+                  estimatedTokens,
+                });
+                const result = yield* canUseToolEffect(
+                  "AskUserQuestion",
+                  {
+                    questions: [
+                      {
+                        header: "Resume session",
+                        question,
+                        options: [
+                          {
+                            label: "Compact and continue",
+                            description: "Resume with a summary and use fewer tokens.",
+                          },
+                          {
+                            label: "Keep full history",
+                            description: "Resume without changing the conversation.",
+                          },
+                          {
+                            label: CLAUDE_RESUME_COMPACTION_NEVER_ANSWER,
+                            description: "Keep full history and skip future resume prompts.",
+                          },
+                        ],
+                        multiSelect: false,
+                      },
+                    ],
+                  },
+                  {
+                    signal: callbackOptions.signal,
+                    requestId: callbackOptions.requestId,
+                    toolUseID: request.toolUseID ?? callbackOptions.requestId,
+                  },
+                  handedOver,
+                );
+                if (result.behavior !== "allow") return { behavior: "cancelled" as const };
+                const answers =
+                  result.updatedInput === undefined
+                    ? undefined
+                    : Reflect.get(result.updatedInput, "answers");
+                const selection =
+                  typeof answers === "object" && answers !== null
+                    ? Reflect.get(answers, question)
+                    : undefined;
+                return {
+                  behavior: "completed" as const,
+                  result:
+                    selection === "Compact and continue"
+                      ? ("compact" as const)
+                      : selection === CLAUDE_RESUME_COMPACTION_NEVER_ANSWER
+                        ? ("never" as const)
+                        : ("continue" as const),
+                };
+              }),
+            ),
           );
+        };
 
         // Work the live process still runs. A subagent whose completion is
         // already buffered is done: the buffer outlives the process.
@@ -9103,12 +9679,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             existing.queryPolicyKey === queryPolicyKey &&
             existing.selectionKey === compiledSelection.queryIdentity
           ) {
-            // Claude can switch its own mode mid-session (EnterPlanMode), and
-            // a denied ExitPlanMode leaves it there. Put the live process back
-            // in the thread's mode before the next prompt.
-            if (existing.permissionMode !== existing.openedPermissionMode) {
-              yield* existing.query.setPermissionMode(existing.openedPermissionMode);
-              existing.permissionMode = existing.openedPermissionMode;
+            // Claude can switch its own mode mid-session (EnterPlanMode, an
+            // approved session update), and a denied ExitPlanMode leaves it in
+            // plan. Those changes stand; see claudeModeBeforePrompt.
+            const mode = claudeModeBeforePrompt({
+              permissionSource: existing.permissionSource,
+              openedMode: existing.openedPermissionMode,
+              liveMode: existing.permissionMode,
+              approvedSessionMode: existing.approvedSessionMode,
+              modeBeforePlan: existing.modeBeforePlan,
+              implementsPlan: isClaudePlanImplementationTurn(turnInput),
+              allowBypassPermissions: adapterOptions.settings?.allowBypassPermissions === true,
+            });
+            if (mode !== undefined && mode !== existing.permissionMode) {
+              yield* existing.query.setPermissionMode(mode);
+              existing.permissionMode = mode;
             }
             return existing;
           }
@@ -9170,6 +9755,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ? {}
               : { mcpServers: mcpOverrides.mcpServers }),
             permissionMode: queryPolicy.permissionMode,
+            permissionSource: queryPolicy.permissionSource,
             ...(queryPolicy.allowDangerouslySkipPermissions === undefined
               ? {}
               : {
@@ -9236,8 +9822,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             onUsageLimits,
             lastTurn: null,
             promptEchoMode: "unknown",
+            permissionSource: queryPolicy.permissionSource,
             openedPermissionMode: queryOptions.permissionMode,
             permissionMode: queryOptions.permissionMode,
+            approvedSessionMode: undefined,
+            modeBeforePlan: undefined,
             stopping: false,
             subagentsFromEarlierProcesses: new Set(
               [...(yield* Ref.get(sessionSubagentsByTaskId)).values()].filter(
@@ -9255,7 +9844,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     (message.subtype === "init" || message.subtype === "status") &&
                     message.permissionMode !== undefined
                   ) {
+                    if (message.permissionMode === "plan" && context.permissionMode !== "plan")
+                      context.modeBeforePlan = context.permissionMode;
                     context.permissionMode = message.permissionMode;
+                    return reportActivePermissions(
+                      message.permissionMode,
+                      message.subtype === "init" ? "session-init" : "session-status",
+                    ).pipe(Effect.andThen(handleSdkMessage({ query: querySession, message })));
                   }
                   return handleSdkMessage({ query: querySession, message });
                 }),
@@ -9380,6 +9975,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimited: false,
+              creditsRequired: false,
               subagentsByTaskId: new Map(),
               subagentsByToolUseId: new Map(),
               subagentNodesByTaskId: new Map(),
@@ -9427,6 +10023,32 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 },
               };
             }
+            const previewBrowserContext = Option.fromUndefinedOr(
+              claudePreviewBrowserContextToSend({
+                status:
+                  userMessage === null || overrides !== undefined
+                    ? undefined
+                    : turnInput.previewBrowser,
+                hasStarkMcp: (yield* mcpSessions.read(turnInput.threadId)) !== undefined,
+                lastSent: yield* Ref.get(sentPreviewBrowserContext),
+              }),
+            );
+            if (userMessage !== null && Option.isSome(previewBrowserContext)) {
+              const content =
+                typeof userMessage.message.content === "string"
+                  ? [{ type: "text" as const, text: userMessage.message.content }]
+                  : userMessage.message.content;
+              userMessage = {
+                ...userMessage,
+                message: {
+                  ...userMessage.message,
+                  content: [
+                    { type: "text" as const, text: previewBrowserContext.value },
+                    ...content,
+                  ],
+                },
+              };
+            }
             const querySession = yield* openQuery(turnInput, nativeThreadId);
             const attachTurn = Effect.gen(function* () {
               querySession.lastTurn = context;
@@ -9464,6 +10086,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                         }).pipe(Effect.asVoid, Effect.ignore),
                   ),
                 );
+                if (Option.isSome(previewBrowserContext))
+                  yield* Ref.set(sentPreviewBrowserContext, previewBrowserContext.value);
                 if (overrides !== undefined) overrides.shell.offered = true;
               });
               yield* overrides === undefined ? offer : sdkMessageLock.withPermits(1)(offer);
@@ -10158,6 +10782,28 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         });
         yield* Effect.addFinalizer(() => closeSession());
 
+        /**
+         * An answer counts as delivered once the SDK took it while the request
+         * was still open (claudeSdkHandover); otherwise it is uncertain.
+         */
+        const awaitSdkHandover = (
+          pending: PendingClaudeRuntimeRequest,
+          requestId: OrchestrationV2RuntimeRequest["id"],
+        ) =>
+          Deferred.await(pending.handedOver).pipe(
+            Effect.mapError(
+              (detail) =>
+                new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
+                  driver: CLAUDE_PROVIDER,
+                  requestId,
+                  cause: new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CLAUDE_PROVIDER,
+                    detail,
+                  }),
+                }),
+            ),
+          );
+
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CLAUDE_PROVIDER,
@@ -10354,7 +11000,28 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ),
           ),
           resumeThread: Effect.fn("ClaudeAdapterV2.resumeThread")(
-            function* (threadInput: { readonly providerThread: OrchestrationV2ProviderThread }) {
+            function* (threadInput: {
+              readonly providerThread: OrchestrationV2ProviderThread;
+              readonly importedNativeHistory?: boolean;
+            }) {
+              // The SDK opens the session only when the turn starts, where a
+              // deleted transcript would fail the turn itself. Failing here
+              // instead lets the caller start a fresh session that is given
+              // the imported history as context. A transcript that exists but
+              // that the CLI still rejects fails that turn, like any resume.
+              const nativeThreadId = threadInput.providerThread.nativeThreadRef?.nativeId;
+              if (
+                threadInput.importedNativeHistory === true &&
+                nativeThreadId != null &&
+                !(yield* claudeSessionTranscriptExists({
+                  fileSystem,
+                  path,
+                  environment: adapterOptions.environment,
+                  sessionId: nativeThreadId,
+                }))
+              ) {
+                return yield* new ClaudeImportedSessionMissingError({ nativeThreadId });
+              }
               const updatedAt = yield* DateTime.now;
               return {
                 ...threadInput.providerThread,
@@ -10498,9 +11165,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               }
               if (pending.type === "user_input") {
                 yield* Deferred.succeed(pending.answers, requestInput.answers ?? {});
-                return;
+                return yield* awaitSdkHandover(pending, requestInput.requestId);
               }
-              if (requestInput.decision === undefined) {
+              if (requestInput.decision === undefined && requestInput.optionId === undefined) {
                 return yield* new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
                   driver: CLAUDE_PROVIDER,
                   requestId: requestInput.requestId,
@@ -10510,7 +11177,26 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   }),
                 });
               }
-              yield* Deferred.succeed(pending.decision, requestInput.decision);
+              // The chosen option's exact PermissionResult; a plain decision from an older
+              // client takes the narrowest option with that decision.
+              const resolved = resolveClaudeApprovalAnswer({
+                choices: pending.choices,
+                optionId: requestInput.optionId,
+                decision: requestInput.decision,
+                feedback: requestInput.feedback,
+              });
+              if (resolved._tag === "refused") {
+                return yield* new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
+                  driver: CLAUDE_PROVIDER,
+                  requestId: requestInput.requestId,
+                  cause: new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CLAUDE_PROVIDER,
+                    detail: `Claude ${pending.requestKind} request ${requestInput.requestId}: ${resolved.reason}`,
+                  }),
+                });
+              }
+              yield* Deferred.succeed(pending.answer, resolved.answer);
+              return yield* awaitSdkHandover(pending, requestInput.requestId);
             },
             (effect, requestInput) =>
               effect.pipe(

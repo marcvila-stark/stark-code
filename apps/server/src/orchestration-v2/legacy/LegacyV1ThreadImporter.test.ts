@@ -533,4 +533,47 @@ it.layer(layerTest)("LegacyV1ThreadImporter", (it) => {
       assert.deepStrictEqual(eventsAfterRestart, eventsBeforeRetry);
     }),
   );
+
+  it.effect("imports an unknown V1 mode as Supervised and every import as an explicit preset", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const unknownMode = ThreadId.make("thread:legacy-unknown-mode");
+      const autoMode = ThreadId.make("thread:legacy-auto-mode");
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, scripts_json, created_at, updated_at
+        ) VALUES (
+          'project:legacy-modes', 'Legacy project', '/tmp/legacy-modes', '[]',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      for (const [threadId, runtimeMode] of [
+        [unknownMode, "yolo"],
+        [autoMode, "auto"],
+      ] as const) {
+        yield* sql`
+          INSERT INTO projection_threads (
+            thread_id, project_id, title, model_selection_json, runtime_mode,
+            interaction_mode, created_at, updated_at
+          ) VALUES (
+            ${threadId}, 'project:legacy-modes', 'Legacy chat',
+            '{"instanceId":"claudeAgent","model":"claude-sonnet-4-6"}', ${runtimeMode}, 'default',
+            '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+          )
+        `;
+      }
+      yield* importer.reconcileShells;
+      // A mode this build does not know used to import as full access.
+      assert.deepInclude(yield* projections.getThread(unknownMode), {
+        runtimeMode: "approval-required",
+        permissionSource: "override",
+      });
+      assert.deepInclude(yield* projections.getThread(autoMode), {
+        runtimeMode: "auto",
+        permissionSource: "override",
+      });
+    }),
+  );
 });

@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
       live: true,
       canReload: true as boolean | undefined,
     } as McpServersListResult | null,
+    dataUpdatedAt: 0,
     error: null as string | null,
     isPending: false,
     refresh: vi.fn(),
@@ -98,6 +99,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.stubGlobal("window", { setInterval, clearInterval, setTimeout, clearTimeout });
   state.query.data = { servers: [server()], live: true, canReload: true, reconnectScope: "server" };
+  state.query.dataUpdatedAt = 0;
   state.query.error = null;
   state.query.isPending = false;
   state.canOperate = true;
@@ -549,4 +551,33 @@ it("offers a status-only retry after a slow inspection and accepts the eventual 
   await act(() => renderer!.update(panel()));
   expect(paragraphs()).not.toContain("Checking connected tools");
   expect(paragraphs()).toContain("Connected");
+});
+
+it("shows the last known tools at once on reopen while a new check runs", async () => {
+  const target = "reopened-thread";
+  state.query.data = { servers: [server({ status: "connected" })], live: true };
+  state.query.dataUpdatedAt = Date.now();
+  await act(() => {
+    renderer = create(panel(target));
+  });
+  await act(() => renderer!.unmount());
+  state.query.data = null;
+  state.query.dataUpdatedAt = 0;
+  state.query.isPending = true;
+  await act(() => {
+    renderer = create(panel(target));
+  });
+
+  expect(paragraphs()).not.toContain("Checking connected tools");
+  expect(paragraphs()).toContain("Refreshing…");
+  expect(paragraphs()).toContain("Connected");
+  // Last known rows are for reading; actions wait for the new answer.
+  expect(button("Disable for this project").props.disabled).toBe(true);
+
+  state.query.data = { servers: [server({ status: "failed" })], live: true };
+  state.query.dataUpdatedAt = Date.now() + 1;
+  state.query.isPending = false;
+  await act(() => renderer!.update(panel(target)));
+  expect(paragraphs()).not.toContain("Refreshing…");
+  expect(paragraphs()).toContain("Failed");
 });

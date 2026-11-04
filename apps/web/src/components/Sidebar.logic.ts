@@ -1,4 +1,7 @@
-import { resolveThreadWorkingStartedAt } from "@starkfuture/client-runtime/state/models";
+import {
+  resolveThreadWorkingStartedAt,
+  threadRunEndedUnfinished,
+} from "@starkfuture/client-runtime/state/models";
 import { backgroundWorkHoldsCompletion } from "@starkfuture/shared/orchestrationV2PendingBackgroundWork";
 import { threadPullRequestSearchTerms } from "@starkfuture/shared/threadPullRequests";
 import * as React from "react";
@@ -8,6 +11,7 @@ import {
 } from "@starkfuture/client-runtime/state/runtime";
 import { defaultAnimateLayoutChanges, type AnimateLayoutChanges } from "@dnd-kit/sortable";
 import { threadSearchMatchKey } from "@starkfuture/client-runtime/state/thread-search";
+import { providerKindDisplayName } from "@starkfuture/client-runtime/state/provider-instance-display";
 import type { ContextMenuItem, EnvironmentId, ThreadId } from "@starkfuture/contracts";
 import type {
   SidebarProjectSortOrder,
@@ -29,6 +33,20 @@ import type { SidebarThreadSummary, Thread } from "../types";
 import { cn, normalizeSearchText } from "../lib/utils";
 import { isLatestRunSettled } from "../session-logic";
 import { resolveServerBackedAppStageLabel } from "../branding.logic";
+
+/** Providers a chat was handed off from, named as the picker names them, else by brand. */
+export function threadHandoffProviderNames(
+  history: ReadonlyArray<string>,
+  currentInstanceId: string,
+  entriesByInstanceId: ReadonlyMap<string, { readonly displayName: string }>,
+): string[] {
+  return history
+    .filter((instanceId) => instanceId !== currentInstanceId)
+    .map(
+      (instanceId) =>
+        entriesByInstanceId.get(instanceId)?.displayName ?? providerKindDisplayName(instanceId),
+    );
+}
 
 export function shouldNavigateAfterThreadPark(input: {
   readonly threadKey: string;
@@ -683,6 +701,7 @@ export interface ThreadStatusPill {
     | "Working"
     | "Connecting"
     | "Completed"
+    | "Interrupted"
     | "Pending Approval"
     | "Awaiting Input"
     | "Waiting"
@@ -699,6 +718,7 @@ const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
   Connecting: 3,
   Waiting: 2.5,
   "Plan Ready": 2,
+  Interrupted: 1,
   Completed: 1,
 };
 
@@ -1336,6 +1356,15 @@ export function resolveThreadStatusPill(input: {
       label: "Plan Ready",
       colorClass: "text-violet-600 dark:text-violet-300/90",
       dotClass: "bg-violet-500 dark:bg-violet-300/90",
+      pulse: false,
+    };
+  }
+
+  if (hasUnseenCompletion(thread) && threadRunEndedUnfinished(thread.latestRun)) {
+    return {
+      label: "Interrupted",
+      colorClass: "text-amber-600 dark:text-amber-300/90",
+      dotClass: "bg-amber-500 dark:bg-amber-300/90",
       pulse: false,
     };
   }

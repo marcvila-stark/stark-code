@@ -25,6 +25,7 @@ import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2CreationSource,
   type OrchestrationV2Run,
+  type OrchestrationV2RunPermissionCeiling,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
@@ -52,6 +53,7 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimit.ts";
+import { dispatchLimitModes } from "./PermissionPolicy.ts";
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -131,6 +133,8 @@ export interface ThreadManagementSendInput {
   readonly mode: ThreadManagementSendMode;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
+  /** A scheduled task's policy, recorded on the run so it cannot start under a broader one. */
+  readonly permissionCeiling?: OrchestrationV2RunPermissionCeiling;
 }
 
 export interface ThreadManagementSendResult {
@@ -502,7 +506,7 @@ export function latestRun(
 }
 
 /** The newest run in `run`'s restart continuation chain, or `run` itself. */
-function latestRestartContinuation(
+export function latestRestartContinuation(
   runs: ReadonlyArray<OrchestrationV2Run>,
   run: OrchestrationV2Run,
 ): OrchestrationV2Run {
@@ -685,6 +689,17 @@ const make = Effect.gen(function* () {
             }),
           ),
         );
+      // Ask again starts a turn on the thread's current model.
+      case "runtime-request.ask-again":
+        return orchestrator.getThreadRecords(command.threadId, []).pipe(
+          Effect.flatMap((projection) =>
+            assertProviderInstanceEnabled({
+              projectId: projection.thread.projectId,
+              commandId: command.commandId,
+              instanceId: projection.thread.modelSelection.instanceId,
+            }),
+          ),
+        );
       default:
         return Effect.void;
     }
@@ -822,6 +837,9 @@ const make = Effect.gen(function* () {
         text: input.text,
         attachments: input.attachments,
         ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+        ...(input.permissionCeiling === undefined
+          ? {}
+          : { permissionCeiling: input.permissionCeiling }),
         dispatchMode,
         createdBy: input.createdBy,
         creationSource: input.creationSource,
@@ -1064,7 +1082,9 @@ const make = Effect.gen(function* () {
       // thread's user cannot raise the modes between this read and the stop.
       const limit = yield* DispatchModeLimit;
       const exceeded =
-        limit === undefined ? undefined : exceededDispatchModeLimit(limit, records.thread);
+        limit === undefined
+          ? undefined
+          : exceededDispatchModeLimit(limit, dispatchLimitModes(records.thread));
       if (limit !== undefined && exceeded !== undefined) {
         if (limit.refused !== undefined) {
           yield* Ref.set(limit.refused, {

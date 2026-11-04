@@ -3,7 +3,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { AgentScope } from "@starkfuture/shared/AgentScope";
 import {
+  CommandId,
   EnvironmentId,
+  EventId,
   type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
@@ -15,6 +17,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderSessionId,
+  ProviderTurnId,
   ThreadId,
 } from "@starkfuture/contracts";
 import * as Cause from "effect/Cause";
@@ -33,6 +36,10 @@ import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
 
+import {
+  claimAgentWorkspace,
+  releaseAgentWorkspace,
+} from "../workspace/WorkspaceAgentOwnership.ts";
 import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -42,6 +49,7 @@ import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
@@ -51,6 +59,10 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
+import {
+  makeProviderFailure,
+  makeProviderFailureTurnItem,
+} from "@starkfuture/provider-core/server/failure";
 
 const layerTestDatabase = SqlitePersistence.layerMemory;
 const layerTestStores = Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(
@@ -59,6 +71,7 @@ const layerTestStores = Layer.merge(EventStore.layer, ProjectionStore.layer).pip
 const layerTestEventSink = EventSink.layer.pipe(
   Layer.provide(Layer.mergeAll(layerTestStores, layerTestDatabase)),
 );
+const layerTestOutbox = EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase));
 const layerFailingReleaseEventSink = Layer.effect(
   EventSink.EventSinkV2,
   Effect.gen(function* () {
@@ -119,6 +132,31 @@ const layerFlakyReleaseEventSink = (flaky: FlakyReleaseWrites) =>
             yield* Queue.offer(flaky.failures, undefined);
             return yield* Effect.die(new Error("simulated commit failure"));
           }),
+      });
+    }),
+  ).pipe(Layer.provide(layerTestEventSink));
+
+// Completes `written` once a write that closes a runtime request has committed.
+const layerObservingRequestEventSink = (written: Deferred.Deferred<void>) =>
+  Layer.effect(
+    EventSink.EventSinkV2,
+    Effect.gen(function* () {
+      const delegate = yield* EventSink.EventSinkV2;
+      return EventSink.EventSinkV2.of({
+        ...delegate,
+        write: (input) =>
+          delegate
+            .write(input)
+            .pipe(
+              Effect.tap(() =>
+                input.events.some(
+                  (event) =>
+                    event.type === "runtime-request.updated" && event.payload.status !== "pending",
+                )
+                  ? Deferred.succeed(written, undefined)
+                  : Effect.void,
+              ),
+            ),
       });
     }),
   ).pipe(Layer.provide(layerTestEventSink));
@@ -434,6 +472,20 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           },
           startTurn: () => options.startTurn ?? Effect.void,
           steerTurn: () => Effect.void,
+          compactThread: (turnInput) =>
+            options.observedPolicies
+              ? Ref.update(options.observedPolicies, (policies) => [
+                  ...policies,
+                  turnInput.runtimePolicy,
+                ])
+              : Effect.void,
+          runUserShellCommand: (turnInput) =>
+            options.observedPolicies
+              ? Ref.update(options.observedPolicies, (policies) => [
+                  ...policies,
+                  turnInput.runtimePolicy,
+                ])
+              : Effect.void,
           interruptTurn: () =>
             Ref.update(state, (current) => ({
               ...current,
@@ -479,6 +531,7 @@ function layerTest(input: {
   }) => Effect.Effect<void>;
   readonly failReleaseEventWrites?: boolean;
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
+  readonly requestWritten?: Deferred.Deferred<void>;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
   /** Once armed, holds the next credential lookup until it is interrupted. */
   readonly pauseResolve?: {
@@ -499,11 +552,13 @@ function layerTest(input: {
   const layerConfiguredEventSink =
     input.flakyReleaseWrites !== undefined
       ? layerFlakyReleaseEventSink(input.flakyReleaseWrites)
-      : input.pauseAttachWrite !== undefined
-        ? layerPausingAttachEventSink(input.pauseAttachWrite)
-        : input.failReleaseEventWrites
-          ? layerFailingReleaseEventSink
-          : layerTestEventSink;
+      : input.requestWritten !== undefined
+        ? layerObservingRequestEventSink(input.requestWritten)
+        : input.pauseAttachWrite !== undefined
+          ? layerPausingAttachEventSink(input.pauseAttachWrite)
+          : input.failReleaseEventWrites
+            ? layerFailingReleaseEventSink
+            : layerTestEventSink;
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -546,6 +601,7 @@ function layerTest(input: {
   );
   return Layer.mergeAll(
     layerTestStores,
+    layerTestOutbox,
     layerConfiguredEventSink,
     IdAllocator.layer,
     layerConfiguredMcpRegistry,
@@ -562,6 +618,7 @@ function layerTest(input: {
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,
           layerTestStores,
+          layerTestOutbox,
           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
         ),
@@ -823,7 +880,7 @@ function makePendingRuntimeRequestEvents(input: {
 }
 
 it.effect.each(["claudeAgent", "codex"])(
-  "preserves selected Claude modes through session open and resume (%s)",
+  "keeps provider permissions through open, resume, compaction and user shell (%s)",
   (driverName) =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -869,13 +926,51 @@ it.effect.each(["claudeAgent", "codex"])(
           providerThread,
           runtimePolicy: { ...selected, runtimeMode: "approval-required", interactionMode: "plan" },
         });
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        const broad = {
+          ...runtimePolicy,
+          runtimeMode: "full-access" as const,
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "dangerFullAccess" },
+        };
+        const auxiliaryInput: ProviderAdapter.ProviderAdapterV2TurnInput = {
+          appThread: event.payload,
+          threadId,
+          providerThread,
+          runId,
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          rootNodeId: idAllocator.derive.rootNode({ runId }),
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+            text: "/compact",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy: broad,
+        };
+        yield* runtime.compactThread!(auxiliaryInput);
+        yield* runtime.runUserShellCommand!(auxiliaryInput);
         const policies = yield* Ref.get(observedPolicies);
+        assert.deepEqual(
+          policies.slice(-2),
+          [0, 1].map(() =>
+            driverName === "claudeAgent"
+              ? broad
+              : { ...runtimePolicy, runtimeMode: "approval-required" },
+          ),
+        );
         assert.deepEqual(
           policies.map((policy) => [policy?.runtimeMode, policy?.interactionMode]),
           [
             [driverName === "claudeAgent" ? "auto" : "approval-required", "default"],
             [driverName === "claudeAgent" ? "auto" : "approval-required", "default"],
             ["approval-required", "plan"],
+            [driverName === "claudeAgent" ? "full-access" : "approval-required", "default"],
+            [driverName === "claudeAgent" ? "full-access" : "approval-required", "default"],
           ],
         );
       }).pipe(
@@ -3648,6 +3743,254 @@ it.effect("ProviderSessionManagerV2 marks pending runtime requests non-live on r
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
   }),
 );
+it.effect.each([
+  { name: "the provider process fails", end: "runtime_error", cause: "provider_exit" },
+  { name: "the provider exits cleanly", end: "provider_stop", cause: "provider_exit" },
+  { name: "Stark Code shuts down", end: "server_shutdown", cause: "server_shutdown" },
+  { name: "the user stops the session", end: "user_stop", cause: undefined },
+] as const)(
+  "ProviderSessionManagerV2 records a pending decision as lost when $name",
+  ({ end, cause }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const requestWritten = yield* Deferred.make<void>();
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: `provider-session-manager-lost-${end}`,
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: `provider-session-manager-lost-${end}`,
+          projectId,
+        });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const pendingRequest = yield* makePendingRuntimeRequestEvents({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          providerThread,
+          now,
+        });
+        // Written after the open, so only the release under test settles it.
+        yield* eventSink.write({ events: pendingRequest.events });
+        switch (end) {
+          case "runtime_error":
+          case "server_shutdown":
+            yield* manager.release({ providerSessionId, reason: end, detail: "process exited" });
+            break;
+          case "user_stop":
+            yield* manager.close(providerSessionId);
+            break;
+          case "provider_stop": {
+            const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+            assert.isDefined(adapterQueue);
+            yield* Queue.offer(adapterQueue!, {
+              type: "provider_session.updated",
+              driver: CODEX_DRIVER,
+              providerSession: { ...runtime.providerSession, status: "stopped", updatedAt: now },
+            });
+            yield* Queue.end(adapterQueue!);
+            yield* Deferred.await(requestWritten);
+            break;
+          }
+        }
+
+        const projection = yield* projectionStore.getThreadProjection(threadId);
+        const request = projection.runtimeRequests.find(
+          (candidate) => candidate.id === pendingRequest.requestId,
+        );
+        const item = projection.turnItems.find(
+          (candidate) =>
+            candidate.type === "approval_request" && candidate.requestId === request?.id,
+        );
+        assert.equal(request?.responseCapability.type, "not_resumable");
+        assert.equal(request?.lost?.cause, cause);
+        assert.equal(
+          item?.title,
+          cause === undefined
+            ? null
+            : cause === "provider_exit"
+              ? "Approval lost: the agent process stopped"
+              : "Approval lost: Stark Code shut down",
+        );
+      });
+
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, requestWritten })),
+      );
+    }),
+);
+
+// The answer committed, but its response effect had not run when the session
+// ended. It is kept on the request and marked uncertain, never sent again.
+it.effect.each([
+  { name: "the provider process fails", end: "runtime_error", cause: "provider_exit" },
+  { name: "the provider exits cleanly", end: "provider_stop", cause: "provider_exit" },
+  { name: "Stark Code shuts down", end: "server_shutdown", cause: "server_shutdown" },
+  { name: "the user stops the session", end: "user_stop", cause: undefined },
+] as const)(
+  "ProviderSessionManagerV2 keeps an undelivered answer as an uncertain loss when $name",
+  ({ end, cause }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const requestWritten = yield* Deferred.make<void>();
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: `provider-session-manager-undelivered-${end}`,
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: `provider-session-manager-undelivered-${end}`,
+          projectId,
+        });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const pendingRequest = yield* makePendingRuntimeRequestEvents({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          providerThread,
+          now,
+        });
+        yield* eventSink.write({ events: pendingRequest.events });
+        // The user's answer commits with its response effect. Applied to the
+        // projection directly, so only the release under test completes the
+        // observed request write.
+        for (const event of pendingRequest.events) {
+          const id = EventId.make(`${event.id}:answered`);
+          if (event.type === "runtime-request.updated") {
+            yield* projectionStore.apply({
+              ...event,
+              id,
+              payload: {
+                ...event.payload,
+                status: "resolved",
+                decision: "accept",
+                resolvedAt: now,
+              },
+            });
+          } else if (event.type === "turn-item.updated") {
+            yield* projectionStore.apply({
+              ...event,
+              id,
+              payload: { ...event.payload, status: "completed", completedAt: now },
+            });
+          }
+        }
+        yield* outbox.enqueue([
+          {
+            id: `effect:undelivered-${end}:respond`,
+            commandId: CommandId.make(`command:undelivered-${end}:respond`),
+            threadId,
+            request: {
+              type: "runtime-request.respond",
+              providerSessionId,
+              requestId: pendingRequest.requestId,
+              decision: "accept",
+            },
+          },
+        ]);
+        switch (end) {
+          case "runtime_error":
+          case "server_shutdown":
+            yield* manager.release({ providerSessionId, reason: end, detail: "process exited" });
+            break;
+          case "user_stop":
+            yield* manager.close(providerSessionId);
+            break;
+          case "provider_stop": {
+            const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+            assert.isDefined(adapterQueue);
+            yield* Queue.offer(adapterQueue!, {
+              type: "provider_session.updated",
+              driver: CODEX_DRIVER,
+              providerSession: { ...runtime.providerSession, status: "stopped", updatedAt: now },
+            });
+            yield* Queue.end(adapterQueue!);
+            yield* Deferred.await(requestWritten);
+            break;
+          }
+        }
+
+        const projection = yield* projectionStore.getThreadProjection(threadId);
+        const request = projection.runtimeRequests.find(
+          (candidate) => candidate.id === pendingRequest.requestId,
+        );
+        const item = projection.turnItems.find(
+          (candidate) =>
+            candidate.type === "approval_request" && candidate.requestId === request?.id,
+        );
+        assert.equal(request?.decision, "accept");
+        assert.equal(item?.status, "completed");
+        if (cause === undefined) {
+          // The user's own stop loses nothing they did not choose.
+          assert.equal(request?.status, "resolved");
+          assert.isUndefined(request?.lost);
+          assert.isNull(item?.title);
+          return;
+        }
+        assert.equal(request?.status, end === "runtime_error" ? "expired" : "cancelled");
+        assert.equal(request?.responseCapability.type, "not_resumable");
+        assert.equal(request?.lost?.cause, cause);
+        assert.isTrue(request?.lost?.deliveryUncertain);
+        assert.equal(
+          item?.title,
+          cause === "provider_exit"
+            ? "Answer may not have reached the agent: the agent process stopped"
+            : "Answer may not have reached the agent: Stark Code shut down",
+        );
+      });
+
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, requestWritten })),
+      );
+    }),
+);
+
 it.effect("ProviderSessionManagerV2 retries release records that failed to persist", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
@@ -4993,5 +5336,262 @@ it.effect(
         projectExists: false,
       });
       assert.isFalse(denied?.capabilities?.has("device"));
+    }),
+);
+
+it.effect.each([
+  { waiting: true, reason: "approval" },
+  { waiting: false, reason: "working" },
+] as const)(
+  "refuses a turn while another chat's turn holds the folder and names that chat ($reason)",
+  ({ waiting, reason }) =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped();
+      const folderPolicy = { ...runtimePolicy, cwd };
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const startTurnIn = (threadId: ThreadId, nativeThreadId: string) =>
+          Effect.gen(function* () {
+            const providerSessionId = yield* idAllocator.allocate.providerSession({
+              providerInstanceId: modelSelection.instanceId,
+              threadId,
+            });
+            const providerThread = makeProviderThread({
+              idAllocator,
+              threadId,
+              providerSessionId,
+              now,
+              nativeThreadId,
+            });
+            const runtime = yield* manager.open({
+              threadId,
+              providerSessionId,
+              modelSelection,
+              runtimePolicy: folderPolicy,
+            });
+            yield* runtime.events.pipe(Stream.runDrain, Effect.forkScoped);
+            const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+            const start = runtime.startTurn({
+              appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+              threadId,
+              runId,
+              runOrdinal: 1,
+              providerTurnOrdinal: 1,
+              attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+              rootNodeId: idAllocator.derive.rootNode({ runId }),
+              providerThread,
+              message: {
+                createdBy: "user",
+                creationSource: "web",
+                messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                text: "hello",
+                attachments: [],
+              },
+              modelSelection,
+              runtimePolicy: folderPolicy,
+            });
+            return { providerSessionId, providerThread, start };
+          });
+
+        const waitingThreadId = ThreadId.make(`thread-folder-holder-${reason}`);
+        const blockedThreadId = ThreadId.make(`thread-folder-blocked-${reason}`);
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: waitingThreadId, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: blockedThreadId, now }),
+          ],
+        });
+        const holder = yield* startTurnIn(waitingThreadId, "holder");
+        yield* holder.start;
+        if (waiting) {
+          const pending = yield* makePendingRuntimeRequestEvents({
+            idAllocator,
+            threadId: waitingThreadId,
+            providerSessionId: holder.providerSessionId,
+            providerThread: holder.providerThread,
+            now,
+          });
+          yield* eventSink.write({ events: pending.events });
+        }
+
+        const blocked = yield* startTurnIn(blockedThreadId, "blocked");
+        const error = yield* blocked.start.pipe(Effect.flip);
+        const failure = makeProviderFailure({ cause: error, class: "provider_error" });
+        assert.deepEqual(failure.blockedBy, { threadId: waitingThreadId, reason });
+        assert.include(failure.message, "“Provider session manager”");
+        assert.include(
+          failure.message,
+          waiting ? "is waiting for your approval" : "is still working in this folder",
+        );
+        assert.equal(
+          makeProviderFailureTurnItem({
+            driver: CODEX_DRIVER,
+            threadId: blockedThreadId,
+            runId: null,
+            nodeId: null,
+            providerThreadId: blocked.providerThread.id,
+            providerTurnId: idAllocator.derive.providerTurn({
+              driver: CODEX_DRIVER,
+              nativeTurnId: "blocked",
+            }),
+            itemOrdinal: 1,
+            failure,
+            occurredAt: now,
+          }).title,
+          waiting
+            ? "Another chat in this folder is waiting for approval"
+            : "Another chat in this folder is still working",
+        );
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["release", "cancel", "session-close", "parent-followup"] as const)(
+  "side chat waits visibly for its parent's workspace and handles %s without starting a second writer",
+  (action) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const starts = yield* Ref.make(0);
+      const parentToken = Symbol("busy family owner");
+      const resumes = action === "release" || action === "parent-followup";
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const parentId = ThreadId.make(`side-parent-${action}`);
+        const threadId = ThreadId.make(`side-child-${action}`);
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const created = yield* makeThreadCreatedEvent({ idAllocator, threadId, now });
+        yield* eventSink.write({
+          events: [
+            {
+              ...created,
+              payload: {
+                ...created.payload,
+                lineage: {
+                  rootThreadId: action === "parent-followup" ? threadId : parentId,
+                  parentThreadId: action === "parent-followup" ? null : parentId,
+                  relationshipToParent: action === "parent-followup" ? null : "side_chat",
+                },
+              },
+            },
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const workspace = yield* (yield* FileSystem.FileSystem).realPath(runtimePolicy.cwd);
+        yield* Effect.sync(() =>
+          claimAgentWorkspace(workspace, {
+            token: parentToken,
+            threadId: parentId,
+            kind: "graphical",
+            ...(action === "parent-followup" ? { sideChatParentThreadId: threadId } : {}),
+          }),
+        );
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const afterSequence = yield* eventSink.latestSequence({ threadId });
+        const starting = yield* runtime
+          .startTurn({
+            appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+            threadId,
+            runId,
+            runOrdinal: 1,
+            providerTurnOrdinal: 1,
+            attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+            rootNodeId: idAllocator.derive.rootNode({ runId }),
+            providerThread,
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+              text: "Explain the parent task without making changes",
+              attachments: [],
+            },
+            modelSelection,
+            runtimePolicy,
+          })
+          .pipe(Effect.forkChild);
+        yield* eventSink.stream({ threadId, afterSequence }).pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "turn-item.updated" &&
+              stored.event.payload.toolNonExecutionKind === "workspace_wait" &&
+              stored.event.payload.status === "waiting",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+        );
+        assert.equal(yield* Ref.get(starts), 0);
+        assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+        if (!resumes) {
+          if (action === "session-close") {
+            yield* manager.release({ providerSessionId, reason: "runtime_error" });
+          } else {
+            yield* runtime.interruptTurn({
+              providerThread,
+              providerTurnId: ProviderTurnId.make(`pending-side-${action}`),
+            });
+          }
+          const exit = yield* Fiber.await(starting);
+          assert.isTrue(Exit.isFailure(exit));
+        } else {
+          yield* Effect.sync(() => releaseAgentWorkspace(parentToken));
+          yield* Fiber.join(starting);
+        }
+        yield* Effect.sync(() => releaseAgentWorkspace(parentToken));
+        assert.equal(yield* Ref.get(starts), resumes ? 1 : 0);
+        const projection = yield* projectionStore.getThreadProjection(threadId);
+        const waitItem = projection.turnItems.find(
+          (item) => item.toolNonExecutionKind === "workspace_wait",
+        );
+        assert.equal(waitItem?.status, resumes ? "completed" : "cancelled");
+        assert.equal(
+          projection.thread.lineage.parentThreadId,
+          action === "parent-followup" ? null : parentId,
+        );
+        // A normal writer is still excluded while the released side chat owns the folder.
+        if (resumes) {
+          assert.throws(() =>
+            claimAgentWorkspace(workspace, {
+              token: parentToken,
+              threadId: parentId,
+              kind: "graphical",
+            }),
+          );
+        }
+      }).pipe(
+        Effect.ensuring(Effect.sync(() => releaseAgentWorkspace(parentToken))),
+        Effect.provide(
+          Layer.merge(
+            NodeServices.layer,
+            layerTest({
+              state,
+              idleTimeoutMs: 60_000,
+              startTurn: Ref.update(starts, (n) => n + 1),
+            }),
+          ),
+        ),
+      );
     }),
 );

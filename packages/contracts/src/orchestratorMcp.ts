@@ -22,11 +22,13 @@ import {
   ScheduledTaskSchedule,
   ScheduledTaskUpsertSchedule,
 } from "./scheduledTask.ts";
-import { ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
+import { PreviewBrowserStatus } from "./previewBrowser.ts";
+import { PermissionSource, ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
 import { ThreadLinkedPullRequest } from "./threadPullRequest.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2Actor,
+  OrchestrationV2ChildPolicy,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
@@ -221,6 +223,10 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
     description:
       "True only on that mode=wait call when timeoutMs elapsed. The timeout does not cancel the child. Later task_status reads return false and use status for liveness.",
   }),
+  childPolicy: Schema.optional(OrchestrationV2ChildPolicy).annotate({
+    description:
+      "The explicit policy the child runs with. containment=cross-provider-floor means another provider at its narrowest preset, not limited by this thread's rules.",
+  }),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
 
@@ -324,6 +330,8 @@ export const OrchestratorMcpThreadListItem = Schema.Struct({
   model: Schema.String,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  /** Missing means `override`: the thread runs its stored preset. */
+  permissionSource: Schema.optional(PermissionSource),
   linkedPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
   settled: Schema.Boolean,
   settledAt: Schema.NullOr(IsoDateTime),
@@ -373,6 +381,8 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   model: Schema.String,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  /** Missing means `override`: the thread runs its stored preset. */
+  permissionSource: Schema.optional(PermissionSource),
   linkedPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
   titleRegeneration: Schema.NullOr(ThreadTitleRegeneration),
   branch: Schema.NullOr(Schema.String),
@@ -501,6 +511,8 @@ export const OrchestratorMcpProviderCapability = Schema.Struct({
   ),
   /** Runtime modes the provider offers; omitted when it offers all of them. */
   runtimeModes: Schema.optional(Schema.Array(RuntimeMode)),
+  /** The provider can run chats on its own permission settings. */
+  nativePermissionInherit: Schema.optional(Schema.Boolean),
   canRunChildTask: Schema.Boolean,
   canRunCrossProviderChildTask: Schema.Boolean,
   constraints: Schema.Array(Schema.String),
@@ -526,6 +538,11 @@ export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
     scheduledTasks: Schema.Boolean,
     maxBatchThreads: Schema.Number,
   }),
+  /**
+   * Whether `html_preview` can run: it needs Stark's preview browser, which the
+   * user installs. Absent on servers from before it was reported.
+   */
+  previewBrowser: Schema.optionalKey(PreviewBrowserStatus),
 });
 export type OrchestratorMcpCapabilitiesResult = typeof OrchestratorMcpCapabilitiesResult.Type;
 

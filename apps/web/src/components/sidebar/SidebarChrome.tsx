@@ -1,15 +1,17 @@
 import {
   ArrowLeftIcon,
   ChartNoAxesColumnIcon,
+  HistoryIcon,
   MoreHorizontalIcon,
   PaletteIcon,
   SettingsIcon,
   UserRoundIcon,
 } from "lucide-react";
-import { memo, useCallback } from "react";
+import { cloneElement, memo, useCallback, type ReactElement, type ComponentProps } from "react";
 import { Link, useLocation, useNavigate, useParams } from "@tanstack/react-router";
 
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
+import { APP_BASE_NAME } from "../../branding";
 import { cn } from "../../lib/utils";
 import {
   useEnvironment,
@@ -68,6 +70,7 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
     <div
       className={cn("stark-sidebar-brandrow", isElectron && "drag-region")}
       data-has-pill={pillLabel ? true : undefined}
+      data-has-backdrop={backdropVariant ? true : undefined}
     >
       {backdropVariant ? <SidebarStageBackdrop variant={backdropVariant} /> : null}
       <SidebarBrand onBackdrop={backdropVariant !== null} />
@@ -86,11 +89,7 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
 });
 
 // Match the header's visible content, including native window-control clearance.
-export function SidebarBrandWidthProbe({
-  onWidthChange,
-}: {
-  onWidthChange: (width: number) => void;
-}) {
+function SidebarBrandWidthProbe({ onWidthChange }: { onWidthChange: (width: number) => void }) {
   const observeWidth = useCallback(
     (probe: HTMLDivElement) => {
       return observeResize(probe, ([entry]) => {
@@ -109,6 +108,7 @@ export function SidebarBrandWidthProbe({
       <div className="stark-sidebar-brand-probe">
         <span className="stark-sidebar-brand">
           <span className="stark-sidebar-brandmark" />
+          <span>{APP_BASE_NAME}</span>
         </span>
         <span className="w-(--workspace-titlebar-control-size)" />
       </div>
@@ -128,11 +128,12 @@ function SidebarBrand({ onBackdrop }: { onBackdrop: boolean }) {
       }}
     >
       <span className="stark-sidebar-brandmark" aria-hidden="true" />
+      <span>{APP_BASE_NAME}</span>
     </Link>
   );
 }
 
-export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
+const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   const navigate = useNavigate();
   const navigateToMainApp = useNavigateToMainApp();
   const { isMobile, setOpenMobile } = useSidebar();
@@ -173,6 +174,11 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
     closeMobileSidebar();
     void navigateToMainApp();
   }, [closeMobileSidebar, navigateToMainApp]);
+
+  const handleHistoryClick = useCallback(() => {
+    closeMobileSidebar();
+    void navigate({ to: "/history" });
+  }, [closeMobileSidebar, navigate]);
 
   return (
     <SidebarMenu className="flex-row items-center">
@@ -226,6 +232,10 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
                   <ChartNoAxesColumnIcon />
                   Usage
                 </MenuItem>
+                <MenuItem onClick={handleHistoryClick}>
+                  <HistoryIcon />
+                  History
+                </MenuItem>
               </MenuPopup>
             </Menu>
           </SidebarMenuItem>
@@ -236,7 +246,13 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   );
 });
 
-function SidebarAccounts() {
+export function SidebarAccounts({
+  trigger,
+  popupSide,
+}: {
+  trigger?: ReactElement<ComponentProps<"button">>;
+  popupSide?: "top" | "right";
+} = {}) {
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
@@ -278,7 +294,9 @@ function SidebarAccounts() {
     void navigate({ to: "/usage" });
   };
   if (!environment || !context || !selected) {
-    return (
+    return trigger ? (
+      cloneElement(trigger, { onClick: onManage })
+    ) : (
       <SidebarMenuButton onClick={onManage}>
         <UserRoundIcon />
         <span>Agents &amp; accounts</span>
@@ -292,6 +310,8 @@ function SidebarAccounts() {
       isConnected={environment.connection.phase === "connected"}
       onManage={onManage}
       onUsage={onUsage}
+      trigger={trigger}
+      popupSide={popupSide}
     />
   ) : (
     <ProviderAccountSwitcher
@@ -302,6 +322,8 @@ function SidebarAccounts() {
       connected={environment.connection.phase === "connected"}
       onManage={onManage}
       onUsage={onUsage}
+      trigger={trigger}
+      popupSide={popupSide}
     />
   );
 }
@@ -314,7 +336,9 @@ export const SidebarChromeFooter = memo(function SidebarChromeFooter() {
         <SidebarProviderUpdatePill />
         <SidebarUpdateArchitectureWarning />
         <SidebarAccounts />
-        <SidebarUtilityMenu />
+        <div data-stark-sidebar-utility-menu>
+          <SidebarUtilityMenu />
+        </div>
       </SidebarFooter>
     </div>
   );

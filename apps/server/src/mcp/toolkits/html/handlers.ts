@@ -25,16 +25,25 @@ const handlers = {
   html_preview: McpToolAccess.readsAsCaller((input) =>
     Effect.gen(function* () {
       const htmlRender = yield* HtmlRender.HtmlRender;
-      const { png, ...preview } = yield* htmlRender.preview(input).pipe(Effect.mapError(toFailure));
-      return {
-        ...preview,
-        screenshot: {
-          mimeType: "image/png" as const,
-          data: png,
-          width: preview.width,
-          height: preview.capturedHeight,
-        },
-      };
+      return yield* htmlRender.preview(input).pipe(
+        Effect.map(({ png, ...preview }) => ({
+          ...preview,
+          screenshot: {
+            mimeType: "image/png" as const,
+            data: png,
+            width: preview.width,
+            height: preview.capturedHeight,
+          },
+        })),
+        Effect.catchTags({
+          PreviewBrowserNotReadyError: (error) =>
+            Effect.succeed({
+              previewBrowser: error.status,
+              message: `This page was not previewed. ${error.message}`,
+            }),
+        }),
+        Effect.mapError(toFailure),
+      );
     }),
   ),
   // The page is stored in the calling thread, so it needs that thread's live run.

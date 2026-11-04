@@ -39,7 +39,7 @@ const BOOT_SERVICE_LAUNCHD_LABEL = "com.starkfuture.starkcode.service";
 const BOOT_SERVICE_PLIST_FILE = `${BOOT_SERVICE_LAUNCHD_LABEL}.plist`;
 const BOOT_SERVICE_UNIT_ENV = "STARK_BOOT_SERVICE_UNIT";
 /** File in the logs dir that receives the service's stdout and stderr. `stark-code triage` points agents at it. */
-export const BOOT_SERVICE_LOG_FILE = "boot-service.log";
+const BOOT_SERVICE_LOG_FILE = "boot-service.log";
 
 /** systemd expands `%` specifiers, including in unquoted append-log paths. */
 function escapeSystemdSpecifiers(value: string): string {

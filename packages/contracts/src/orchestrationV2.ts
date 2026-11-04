@@ -54,8 +54,13 @@ import {
   ThreadPullRequestWatch,
 } from "./threadPullRequest.ts";
 import {
+  PermissionSource,
+  ProviderActivePermissionSettings,
+  ProviderApprovalChoice,
   ProviderApprovalDecision,
+  ProviderApprovalFeedback,
   ProviderApprovalOption,
+  ProviderApprovalOptionId,
   ProviderInteractionMode,
   ProviderRequestKind,
   ProviderUserInputAnswers,
@@ -368,6 +373,38 @@ export const OrchestrationV2LocalSession = Schema.Struct({
   historyTruncated: Schema.optional(Schema.Boolean),
 });
 export type OrchestrationV2LocalSession = typeof OrchestrationV2LocalSession.Type;
+/** Why the startup permission freeze narrowed a saved chat's stored mode. */
+export const OrchestrationV2PermissionMigrationReason = Schema.Literals([
+  /** Claude full-access while Bypass was not allowed: it already ran as Manual. */
+  "claude-bypass-not-allowed",
+  /** A provider Stark clamps to Supervised: it already ran as Supervised. */
+  "provider-clamped",
+  /** A mode the provider does not offer: it already ran as Supervised. */
+  "mode-not-offered",
+]);
+export type OrchestrationV2PermissionMigrationReason =
+  typeof OrchestrationV2PermissionMigrationReason.Type;
+
+/**
+ * One narrowing the startup freeze applied to a saved chat so its stored mode
+ * matches what it actually ran with. Kept on the thread as an audit trail, and
+ * as the idempotency key: a migration id is applied to a thread at most once.
+ */
+/** The permission settings a provider session keeps running until a pending change applies. */
+export const OrchestrationV2RunningPermissions = Schema.Struct({
+  permissionSource: PermissionSource,
+  runtimeMode: RuntimeMode,
+});
+export type OrchestrationV2RunningPermissions = typeof OrchestrationV2RunningPermissions.Type;
+
+export const OrchestrationV2PermissionMigration = Schema.Struct({
+  migrationId: TrimmedNonEmptyString,
+  from: RuntimeMode,
+  to: RuntimeMode,
+  reason: OrchestrationV2PermissionMigrationReason,
+  migratedAt: Schema.DateTimeUtc,
+});
+export type OrchestrationV2PermissionMigration = typeof OrchestrationV2PermissionMigration.Type;
 
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
@@ -378,6 +415,23 @@ export const OrchestrationV2AppThread = Schema.Struct({
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  /** Missing means `override`; read it with `permissionSourceOf`. */
+  permissionSource: Schema.optional(PermissionSource),
+  /** Startup narrowings applied to this chat, oldest first. */
+  permissionMigrations: Schema.optional(Schema.Array(OrchestrationV2PermissionMigration)),
+  /**
+   * A narrowing chosen while a run was active, applied when that run stops.
+   * Until then the provider session still runs with the earlier settings,
+   * which `running` records (absent on changes recorded before it existed).
+   */
+  permissionChangePending: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        requestedAt: Schema.DateTimeUtc,
+        running: Schema.optional(OrchestrationV2RunningPermissions),
+      }),
+    ),
+  ),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   localSession: Schema.optional(OrchestrationV2LocalSession),
@@ -557,6 +611,18 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 /** Failure code on the error item a failed workspace preparation leaves. */
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+/**
+ * The broadest policy a bound scheduled run may start under, captured when the
+ * run was queued. A thread that no longer fits refuses the run visibly instead
+ * of running it under broader or temporarily changed settings.
+ */
+export const OrchestrationV2RunPermissionCeiling = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+});
+export type OrchestrationV2RunPermissionCeiling = typeof OrchestrationV2RunPermissionCeiling.Type;
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
@@ -602,6 +668,8 @@ export const OrchestrationV2Run = Schema.Struct({
   delegatedCompletion: Schema.optional(OrchestrationV2DelegatedCompletionCohort),
   /** How a launch prepares this run's workspace; prepared-run.retry repeats it. */
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+  /** Set on runs a scheduled task queued on a bound thread. */
+  permissionCeiling: Schema.optional(OrchestrationV2RunPermissionCeiling),
 });
 export type OrchestrationV2Run = typeof OrchestrationV2Run.Type;
 
@@ -761,6 +829,22 @@ export const OrchestrationV2SubagentWorkflow = Schema.Struct({
 });
 export type OrchestrationV2SubagentWorkflow = typeof OrchestrationV2SubagentWorkflow.Type;
 
+/**
+ * The policy a Stark worker (delegated chat) runs with. Always an explicit
+ * override, recorded on the request so the worker's authority is auditable:
+ * - same-instance: the parent's provider instance, at or below the parent's
+ *   effective preset;
+ * - cross-provider-floor: another provider or instance, at that provider's
+ *   narrowest preset only, labelled "Not limited by the parent's rules".
+ */
+export const OrchestrationV2ChildPolicy = Schema.Struct({
+  source: Schema.Literal("override"),
+  preset: RuntimeMode,
+  providerInstanceId: ProviderInstanceId,
+  containment: Schema.Literals(["same-instance", "cross-provider-floor"]),
+});
+export type OrchestrationV2ChildPolicy = typeof OrchestrationV2ChildPolicy.Type;
+
 export const OrchestrationV2Subagent = Schema.Struct({
   id: NodeId,
   threadId: ThreadId,
@@ -773,6 +857,8 @@ export const OrchestrationV2Subagent = Schema.Struct({
   providerThreadId: Schema.NullOr(ProviderThreadId),
   childThreadId: Schema.NullOr(ThreadId),
   nativeTaskRef: Schema.NullOr(OrchestrationV2ProviderRef),
+  /** A Stark worker's recorded policy; native subagents inherit their parent natively. */
+  childPolicy: Schema.optional(OrchestrationV2ChildPolicy),
   prompt: Schema.String,
   title: Schema.NullOr(Schema.String),
   model: Schema.NullOr(Schema.String),
@@ -837,6 +923,8 @@ export const OrchestrationV2ProviderSession = Schema.Struct({
   createdAt: Schema.DateTimeUtc,
   updatedAt: Schema.DateTimeUtc,
   lastError: Schema.NullOr(Schema.String),
+  /** Permission settings the provider last reported for this live session. */
+  activePermissions: Schema.optional(ProviderActivePermissionSettings),
 });
 export type OrchestrationV2ProviderSession = typeof OrchestrationV2ProviderSession.Type;
 
@@ -1137,6 +1225,53 @@ export function latestProviderTurnForAttempt<
   return latest;
 }
 
+/**
+ * Why an approval or question that waited on the user closed without an
+ * answer: Stark Code restarted or shut down, or the agent process stopped.
+ * The decision stays open for the user until they ask again or dismiss it.
+ * `deliveryUncertain` marks an answer the user gave whose delivery to the
+ * provider the loss interrupted; the request keeps that answer.
+ */
+export const OrchestrationV2RuntimeRequestLoss = Schema.Struct({
+  /** `delivery_failed`: the answer could not be handed to the provider. */
+  cause: Schema.Literals(["server_restart", "server_shutdown", "provider_exit", "delivery_failed"]),
+  lostAt: Schema.DateTimeUtc,
+  deliveryUncertain: Schema.optional(Schema.Boolean),
+  askedAgainAt: Schema.optional(Schema.DateTimeUtc),
+  dismissedAt: Schema.optional(Schema.DateTimeUtc),
+});
+export type OrchestrationV2RuntimeRequestLoss = typeof OrchestrationV2RuntimeRequestLoss.Type;
+/** Most lost requests one Ask again or Dismiss can name. */
+export const LOST_RUNTIME_REQUEST_BATCH_LIMIT = 50;
+
+/**
+ * Whether the user's answer reached the provider, tracked apart from the
+ * choice (the request's status) and from execution (the tool item).
+ * - pending: answered, not yet handed to the provider;
+ * - delivered: the provider accepted the answer;
+ * - not_delivered: the adapter proved nothing was waiting, so nothing ran;
+ * - uncertain: the answer may or may not have reached the provider;
+ * - not_needed: the provider closed the request before the answer arrived.
+ */
+export const OrchestrationV2RuntimeRequestDeliveryState = Schema.Literals([
+  "pending",
+  "delivered",
+  "not_delivered",
+  "uncertain",
+  "not_needed",
+]);
+export type OrchestrationV2RuntimeRequestDeliveryState =
+  typeof OrchestrationV2RuntimeRequestDeliveryState.Type;
+
+export const OrchestrationV2RuntimeRequestDelivery = Schema.Struct({
+  state: OrchestrationV2RuntimeRequestDeliveryState,
+  attempts: NonNegativeInt,
+  updatedAt: Schema.DateTimeUtc,
+  reason: Schema.optional(TrimmedNonEmptyString),
+});
+export type OrchestrationV2RuntimeRequestDelivery =
+  typeof OrchestrationV2RuntimeRequestDelivery.Type;
+
 export const OrchestrationV2RuntimeRequest = Schema.Struct({
   id: RuntimeRequestId,
   nodeId: NodeId,
@@ -1156,6 +1291,12 @@ export const OrchestrationV2RuntimeRequest = Schema.Struct({
   resolvedAt: Schema.NullOr(Schema.DateTimeUtc),
   decision: Schema.optional(ProviderApprovalDecision),
   answers: Schema.optional(ProviderUserInputAnswers),
+  /** Omitted unless a restart, shutdown or provider exit closed the request. */
+  lost: Schema.optional(OrchestrationV2RuntimeRequestLoss),
+  /** The option the user chose and the exact native response it maps to. */
+  chosen: Schema.optional(ProviderApprovalChoice),
+  /** Omitted on requests answered before delivery was tracked. */
+  delivery: Schema.optional(OrchestrationV2RuntimeRequestDelivery),
 });
 export type OrchestrationV2RuntimeRequest = typeof OrchestrationV2RuntimeRequest.Type;
 
@@ -1227,6 +1368,21 @@ export const OrchestrationV2Notification = Schema.Struct({
 });
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
+/**
+ * Marks a human shell command as a check run after an earlier turn finished. The command
+ * runs in the thread's live folder, so a result says what happened after that turn, not
+ * that the turn's checkpoint was verified.
+ */
+export const OrchestrationV2UserShellCheck = Schema.Struct({
+  subjectRunId: RunId,
+  scriptId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(200))),
+  scriptName: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(200))),
+});
+export type OrchestrationV2UserShellCheck = typeof OrchestrationV2UserShellCheck.Type;
+
+/** Failure code on the error item of a queued check skipped because newer work ran first. */
+export const USER_SHELL_CHECK_SUPERSEDED_CODE = "check_superseded";
+
 /** Only the dedicated, human-origin dispatch command can create this metadata. */
 export const OrchestrationV2UserShellCommand = Schema.Struct({
   commandId: Schema.optional(CommandId),
@@ -1235,6 +1391,7 @@ export const OrchestrationV2UserShellCommand = Schema.Struct({
   timeoutMs: Schema.optional(
     Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 3_600_000 })),
   ),
+  check: Schema.optional(OrchestrationV2UserShellCheck),
 });
 export type OrchestrationV2UserShellCommand = typeof OrchestrationV2UserShellCommand.Type;
 
@@ -1320,11 +1477,21 @@ export const OrchestrationV2PlanArtifact = Schema.Union([
 ]);
 export type OrchestrationV2PlanArtifact = typeof OrchestrationV2PlanArtifact.Type;
 
+/**
+ * Who changed a file during a turn. "agent": the turn's own edit tools wrote it.
+ * "unknown": no edit tool wrote it, but the turn ran commands or other tools that could have.
+ * "outside": nothing the agent ran could have written it, so someone or something else did.
+ */
+export const OrchestrationV2CheckpointFileOrigin = Schema.Literals(["agent", "unknown", "outside"]);
+export type OrchestrationV2CheckpointFileOrigin = typeof OrchestrationV2CheckpointFileOrigin.Type;
+
 export const OrchestrationV2CheckpointFileSummary = Schema.Struct({
   path: TrimmedNonEmptyString,
   kind: TrimmedNonEmptyString,
   additions: NonNegativeInt,
   deletions: NonNegativeInt,
+  /** Absent on checkpoints captured before origins were recorded. */
+  origin: Schema.optional(OrchestrationV2CheckpointFileOrigin),
 });
 export type OrchestrationV2CheckpointFileSummary = typeof OrchestrationV2CheckpointFileSummary.Type;
 
@@ -1398,6 +1565,23 @@ export const OrchestrationV2FileChangeDetail = Schema.Struct({
 });
 export type OrchestrationV2FileChangeDetail = typeof OrchestrationV2FileChangeDetail.Type;
 
+/**
+ * A file a pending file-change approval would write, as the approval card previews it. `path` is
+ * the provider's own (usually absolute) path and `operation` is `add`, `update`, `delete` or
+ * `rename`. `patch` is a unified diff with `---`/`+++` headers, at most 16 KB, and is absent when
+ * no preview could be built. `approximate` marks a patch built from the agent's edit text alone,
+ * whose line numbers do not come from the file. Patches are dropped once the approval is resolved.
+ */
+export const OrchestrationV2ProposedFileChange = Schema.Struct({
+  path: TrimmedNonEmptyString,
+  operation: TrimmedNonEmptyString,
+  oldPath: Schema.optional(TrimmedNonEmptyString),
+  patch: Schema.optional(Schema.String),
+  patchTruncated: Schema.optional(Schema.Literal(true)),
+  approximate: Schema.optional(Schema.Literal(true)),
+});
+export type OrchestrationV2ProposedFileChange = typeof OrchestrationV2ProposedFileChange.Type;
+
 export const OrchestrationV2ProviderFailureClass = Schema.Literals([
   "usage_limit",
   "provider_error",
@@ -1414,6 +1598,18 @@ const OrchestrationV2ProviderFailureMessage = TrimmedNonEmptyString.check(
 const OrchestrationV2ProviderFailureCode = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 
 /**
+ * Why another chat holds the folder a turn needed: it waits on an approval or
+ * a question, it is still working, or an agent runs in its terminal.
+ */
+export const OrchestrationV2WorkspaceBusyReason = Schema.Literals([
+  "approval",
+  "user_input",
+  "working",
+  "terminal_agent",
+]);
+export type OrchestrationV2WorkspaceBusyReason = typeof OrchestrationV2WorkspaceBusyReason.Type;
+
+/**
  * Transport-safe failure information suitable for persistence and display.
  * Producers must redact credentials before constructing this value. The
  * schema bounds every provider-controlled string as a second line of defense.
@@ -1425,6 +1621,13 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   retryable: Schema.NullOr(Schema.Boolean),
   /** Reported reset time; absent when the provider cannot name one. */
   resetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  /**
+   * The chat whose turn held this folder when this turn tried to start.
+   * Clients link to it so the user can answer or stop it, then retry.
+   */
+  blockedBy: Schema.optional(
+    Schema.Struct({ threadId: ThreadId, reason: OrchestrationV2WorkspaceBusyReason }),
+  ),
 });
 export type OrchestrationV2ProviderFailure = typeof OrchestrationV2ProviderFailure.Type;
 
@@ -1509,6 +1712,45 @@ const OrchestrationV2SecretRequestFields = {
   secretStatus: OrchestrationV2SecretRequestStatus,
 } as const;
 
+/**
+ * What an approval would let the agent do beyond the action itself, as the
+ * provider reported it. Shown on the approval card before the choices.
+ */
+export const OrchestrationV2ApprovalRequestScopeFields = {
+  /** The native subagent that asked, when not the main agent. */
+  agentId: Schema.optional(TrimmedNonEmptyString),
+  /** That subagent's display name, never its raw id; "Subagent" when the provider names none. */
+  agentName: Schema.optional(TrimmedNonEmptyString),
+  /** The path outside the allowed directories that triggered the request. */
+  blockedPath: Schema.optional(TrimmedNonEmptyString),
+  /** The MCP server behind an MCP tool request, and where it was configured. */
+  mcpServerSource: Schema.optional(
+    Schema.Struct({
+      name: TrimmedNonEmptyString,
+      source: Schema.optional(TrimmedNonEmptyString),
+    }),
+  ),
+  /** The provider asks clients to focus Decline rather than Allow. */
+  defaultToNo: Schema.optional(Schema.Boolean),
+  /** A network host the action would reach. */
+  network: Schema.optional(
+    Schema.Struct({
+      host: TrimmedNonEmptyString,
+      protocol: Schema.optional(TrimmedNonEmptyString),
+    }),
+  ),
+  /** Extra access requested for the rest of the turn or session. */
+  requestedPermissions: Schema.optional(
+    Schema.Struct({
+      readPaths: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+      writePaths: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+      network: Schema.optional(Schema.Boolean),
+    }),
+  ),
+  /** A directory a file-change approval would grant writes under. */
+  grantRoot: Schema.optional(TrimmedNonEmptyString),
+} as const;
+
 export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -1574,12 +1816,21 @@ export const OrchestrationV2TurnItem = Schema.Union([
     oldStr: Schema.optional(Schema.String),
     newStr: Schema.optional(Schema.String),
     changes: Schema.optional(Schema.Array(OrchestrationV2FileChangeDetail)),
+    /**
+     * Every file the edit wrote. Absent when `changes` or `fileName` names them; empty when the
+     * provider did not say which files it wrote, and `fileName` is then only a label.
+     */
     agentWrittenPaths: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("command_execution"),
     source: Schema.optional(Schema.Literals(["agent", "user_shell"])),
+    /**
+     * Set when the server recorded this step itself, so neither the agent nor the user ran it.
+     * Kept apart from `source` because older clients reject `source` values they do not know.
+     */
+    internalOperation: Schema.optional(Schema.Literal("workspace_preparation")),
     durationMs: Schema.optional(NonNegativeInt),
     timedOut: Schema.optional(Schema.Boolean),
     interrupted: Schema.optional(Schema.Boolean),
@@ -1611,8 +1862,19 @@ export const OrchestrationV2TurnItem = Schema.Union([
     prompt: Schema.optional(Schema.String),
     /** App requesting access, for mcp-elicitation approvals (#8058). */
     appName: Schema.optional(Schema.String),
+    /**
+     * The exact shell command the request would run, when the provider names
+     * one. Clients prefer a linked command item and fall back to this, which a
+     * native subagent's request may be the only source of.
+     */
+    command: Schema.optional(Schema.String),
     /** Approval choices advertised by the provider (#8058). */
     options: Schema.optional(Schema.Array(ProviderApprovalOption)),
+    /** Files a file-change approval would write, at most 20, for the approval card. */
+    proposedChanges: Schema.optional(Schema.Array(OrchestrationV2ProposedFileChange)),
+    /** Files the provider named beyond `proposedChanges`. */
+    proposedChangesOmitted: Schema.optional(PositiveInt),
+    ...OrchestrationV2ApprovalRequestScopeFields,
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -1833,6 +2095,8 @@ export const OrchestrationV2DomainEvent = Schema.Union([
       "thread.interaction-mode-updated",
       "thread.model-selection-updated",
       "thread.provider-switched",
+      "thread.permission-updated",
+      "thread.permission-migrated",
     ]),
     payload: OrchestrationV2AppThread,
   }),
@@ -1946,6 +2210,13 @@ export const OrchestrationV2DomainEvent = Schema.Union([
     type: Schema.Literal("context-transfer.updated"),
     payload: OrchestrationV2ContextTransfer,
   }),
+  // The user asked again for, or dismissed, a lost request. The payload is the
+  // whole request, so projections fold it like `runtime-request.updated`.
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
+    type: Schema.Literals(["runtime-request.asked-again", "runtime-request.lost-dismissed"]),
+    payload: OrchestrationV2RuntimeRequest,
+  }),
 ]);
 export type OrchestrationV2DomainEvent = typeof OrchestrationV2DomainEvent.Type;
 
@@ -1991,6 +2262,17 @@ export const OrchestrationV2PendingRuntimeRequestSummary = Schema.Struct({
 export type OrchestrationV2PendingRuntimeRequestSummary =
   typeof OrchestrationV2PendingRuntimeRequestSummary.Type;
 
+/** A thread's newest lost request that the user has neither asked again for nor dismissed. */
+export const OrchestrationV2LostRuntimeRequestSummary = Schema.Struct({
+  id: RuntimeRequestId,
+  kind: OrchestrationV2RuntimeRequest.fields.kind,
+  cause: OrchestrationV2RuntimeRequestLoss.fields.cause,
+  lostAt: Schema.DateTimeUtc,
+  deliveryUncertain: Schema.optional(Schema.Boolean),
+});
+export type OrchestrationV2LostRuntimeRequestSummary =
+  typeof OrchestrationV2LostRuntimeRequestSummary.Type;
+
 export const OrchestrationV2LatestVisibleMessageSummary = Schema.Struct({
   id: MessageId,
   role: OrchestrationV2ConversationMessage.fields.role,
@@ -2009,6 +2291,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  /** Missing means `override`; read it with `permissionSourceOf`. */
+  permissionSource: Schema.optional(PermissionSource),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   localSession: Schema.optional(OrchestrationV2LocalSession),
@@ -2093,6 +2377,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
     ),
   ),
   deletedAt: Schema.NullOr(Schema.DateTimeUtc),
+  /** Omitted by servers that predate lost-request tracking. */
+  lostRuntimeRequest: Schema.optional(Schema.NullOr(OrchestrationV2LostRuntimeRequestSummary)),
 });
 export type OrchestrationV2ThreadShell = typeof OrchestrationV2ThreadShell.Type;
 
@@ -2156,8 +2442,24 @@ export const OrchestrationV2StoredEvent = Schema.Struct({
 });
 export type OrchestrationV2StoredEvent = typeof OrchestrationV2StoredEvent.Type;
 
+export const OrchestrationV2PermissionMigrationJson = OrchestrationV2PermissionMigration.mapFields(
+  (fields) => ({
+    ...fields,
+    migratedAt: Schema.DateTimeUtcFromString,
+  }),
+);
+
 export const OrchestrationV2AppThreadJson = OrchestrationV2AppThread.mapFields((fields) => ({
   ...fields,
+  permissionMigrations: Schema.optional(Schema.Array(OrchestrationV2PermissionMigrationJson)),
+  permissionChangePending: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        requestedAt: Schema.DateTimeUtcFromString,
+        running: Schema.optional(OrchestrationV2RunningPermissions),
+      }),
+    ),
+  ),
   createdAt: Schema.DateTimeUtcFromString,
   updatedAt: Schema.DateTimeUtcFromString,
   archivedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
@@ -2278,11 +2580,28 @@ export const OrchestrationV2ProviderTurnJson = OrchestrationV2ProviderTurn.mapFi
 }));
 export type OrchestrationV2ProviderTurnJson = typeof OrchestrationV2ProviderTurnJson.Type;
 
+export const OrchestrationV2RuntimeRequestLossJson = OrchestrationV2RuntimeRequestLoss.mapFields(
+  (fields) => ({
+    ...fields,
+    lostAt: Schema.DateTimeUtcFromString,
+    askedAgainAt: Schema.optional(Schema.DateTimeUtcFromString),
+    dismissedAt: Schema.optional(Schema.DateTimeUtcFromString),
+  }),
+);
+
+export const OrchestrationV2RuntimeRequestDeliveryJson =
+  OrchestrationV2RuntimeRequestDelivery.mapFields((fields) => ({
+    ...fields,
+    updatedAt: Schema.DateTimeUtcFromString,
+  }));
+
 export const OrchestrationV2RuntimeRequestJson = OrchestrationV2RuntimeRequest.mapFields(
   (fields) => ({
     ...fields,
     createdAt: Schema.DateTimeUtcFromString,
     resolvedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+    lost: Schema.optional(OrchestrationV2RuntimeRequestLossJson),
+    delivery: Schema.optional(OrchestrationV2RuntimeRequestDeliveryJson),
   }),
 );
 export type OrchestrationV2RuntimeRequestJson = typeof OrchestrationV2RuntimeRequestJson.Type;
@@ -2387,6 +2706,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("command_execution"),
     source: Schema.optional(Schema.Literals(["agent", "user_shell"])),
+    internalOperation: Schema.optional(Schema.Literal("workspace_preparation")),
     durationMs: Schema.optional(NonNegativeInt),
     timedOut: Schema.optional(Schema.Boolean),
     interrupted: Schema.optional(Schema.Boolean),
@@ -2418,8 +2738,19 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     prompt: Schema.optional(Schema.String),
     /** App requesting access, for mcp-elicitation approvals (#8058). */
     appName: Schema.optional(Schema.String),
+    /**
+     * The exact shell command the request would run, when the provider names
+     * one. Clients prefer a linked command item and fall back to this, which a
+     * native subagent's request may be the only source of.
+     */
+    command: Schema.optional(Schema.String),
     /** Approval choices advertised by the provider (#8058). */
     options: Schema.optional(Schema.Array(ProviderApprovalOption)),
+    /** Files a file-change approval would write, at most 20, for the approval card. */
+    proposedChanges: Schema.optional(Schema.Array(OrchestrationV2ProposedFileChange)),
+    /** Files the provider named beyond `proposedChanges`. */
+    proposedChangesOmitted: Schema.optional(PositiveInt),
+    ...OrchestrationV2ApprovalRequestScopeFields,
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
@@ -2590,6 +2921,12 @@ export const OrchestrationV2PendingRuntimeRequestSummaryJson =
 export type OrchestrationV2PendingRuntimeRequestSummaryJson =
   typeof OrchestrationV2PendingRuntimeRequestSummaryJson.Type;
 
+export const OrchestrationV2LostRuntimeRequestSummaryJson =
+  OrchestrationV2LostRuntimeRequestSummary.mapFields((fields) => ({
+    ...fields,
+    lostAt: Schema.DateTimeUtcFromString,
+  }));
+
 export const OrchestrationV2LatestVisibleMessageSummaryJson =
   OrchestrationV2LatestVisibleMessageSummary.mapFields((fields) => ({
     ...fields,
@@ -2627,6 +2964,7 @@ export const OrchestrationV2ThreadShellJson = OrchestrationV2ThreadShell.mapFiel
     ),
   ),
   deletedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  lostRuntimeRequest: Schema.optional(Schema.NullOr(OrchestrationV2LostRuntimeRequestSummaryJson)),
 }));
 export type OrchestrationV2ThreadShellJson = typeof OrchestrationV2ThreadShellJson.Type;
 
@@ -2681,6 +3019,8 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
       "thread.interaction-mode-updated",
       "thread.model-selection-updated",
       "thread.provider-switched",
+      "thread.permission-updated",
+      "thread.permission-migrated",
     ]),
     payload: OrchestrationV2AppThreadJson,
   }),
@@ -2794,6 +3134,11 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
     type: Schema.Literal("context-transfer.updated"),
     payload: OrchestrationV2ContextTransferJson,
   }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literals(["runtime-request.asked-again", "runtime-request.lost-dismissed"]),
+    payload: OrchestrationV2RuntimeRequestJson,
+  }),
 ]);
 export type OrchestrationV2DomainEventJson = typeof OrchestrationV2DomainEventJson.Type;
 
@@ -2815,6 +3160,8 @@ export const OrchestrationV2Command = Schema.Union([
     modelSelection: ModelSelection,
     runtimeMode: RuntimeMode,
     interactionMode: ProviderInteractionMode,
+    /** Missing means `override`. `inherit` is stored only for an instance that supports it. */
+    permissionSource: Schema.optional(PermissionSource),
     branch: Schema.NullOr(TrimmedNonEmptyString),
     worktreePath: Schema.NullOr(TrimmedNonEmptyString),
     localSession: Schema.optional(OrchestrationV2LocalSession),
@@ -3015,6 +3362,20 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     runtimeMode: RuntimeMode,
   }),
+  /**
+   * Sets where a chat's permissions come from and its Stark preset. Widening
+   * needs the settings-write scope; choosing the provider's narrowest preset
+   * does not. A narrowing while a run is active needs `whileRunning`: stop the
+   * run and apply now, or apply when the run stops.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread.permission.set"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    permissionSource: PermissionSource,
+    runtimeMode: RuntimeMode,
+    whileRunning: Schema.optional(Schema.Literals(["stop-and-apply", "apply-after-run"])),
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.interaction-mode.set"),
     commandId: CommandId,
@@ -3047,6 +3408,8 @@ export const OrchestrationV2Command = Schema.Union([
       Schema.Struct({ type: Schema.Literal("queue_after_active") }),
       Schema.Struct({ type: Schema.Literal("start_immediately") }),
     ]),
+    /** Servers without the `userShellChecks` capability drop this and run a plain command. */
+    check: OrchestrationV2UserShellCommand.fields.check,
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
@@ -3077,6 +3440,8 @@ export const OrchestrationV2Command = Schema.Union([
         taskIds: Schema.Array(NodeId),
       }),
     ),
+    /** The scheduled task's policy, recorded on the queued run it creates. */
+    permissionCeiling: Schema.optional(OrchestrationV2RunPermissionCeiling),
     dispatchMode: Schema.Union([
       Schema.Struct({
         type: Schema.Literal("defer_start"),
@@ -3183,6 +3548,14 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     requestId: RuntimeRequestId,
+    /**
+     * The offered option the user chose. Clients from before option ids send
+     * `decision` alone, which is accepted only when exactly one offered option
+     * has that decision.
+     */
+    optionId: Schema.optional(ProviderApprovalOptionId),
+    /** A reason for the agent, accepted only by an option with `acceptsFeedback`. */
+    feedback: Schema.optional(ProviderApprovalFeedback),
     decision: Schema.optional(ProviderApprovalDecision),
     answers: Schema.optional(ProviderUserInputAnswers),
     attachmentsByQuestionId: Schema.optional(UserInputAttachments),
@@ -3234,6 +3607,8 @@ export const OrchestrationV2Command = Schema.Union([
     modelSelection: ModelSelection,
     runtimeMode: RuntimeMode,
     interactionMode: ProviderInteractionMode,
+    /** The worker's explicit policy and how it is contained by the parent's. */
+    childPolicy: Schema.optional(OrchestrationV2ChildPolicy),
     workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
     // Omitted behaves as "settled_only" (no wake while the parent has a live
     // run); producers that want fire-and-forget wakes must set "always".
@@ -3275,6 +3650,30 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+  }),
+  /**
+   * Starts one user turn that tells the agent the named lost requests were
+   * lost, so it retries the step and asks again. Only the named requests are
+   * marked asked again.
+   */
+  Schema.Struct({
+    type: Schema.Literal("runtime-request.ask-again"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    requestIds: Schema.Array(RuntimeRequestId).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(LOST_RUNTIME_REQUEST_BATCH_LIMIT),
+    ),
+  }),
+  /** Clears the named lost requests without starting a turn. */
+  Schema.Struct({
+    type: Schema.Literal("runtime-request.lost.dismiss"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    requestIds: Schema.Array(RuntimeRequestId).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(LOST_RUNTIME_REQUEST_BATCH_LIMIT),
+    ),
   }),
 ]);
 export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
@@ -3360,6 +3759,38 @@ const OrchestrationV2InternalCommand = Schema.Union([
    * Records or updates a secret an agent asked the user for. Internal so no
    * client can mark a request saved without the value being stored.
    */
+  /**
+   * The startup permission freeze: narrows a saved chat's stored mode to what
+   * it already ran with. A migration id already on the thread is a no-op.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread.permission.migrate"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    migrationId: TrimmedNonEmptyString,
+    from: RuntimeMode,
+    to: RuntimeMode,
+    reason: OrchestrationV2PermissionMigrationReason,
+  }),
+  /** Records how delivering an answered request to its provider went. */
+  Schema.Struct({
+    type: Schema.Literal("runtime-request.delivery.update"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    requestId: RuntimeRequestId,
+    state: Schema.Literals(["delivered", "not_delivered", "uncertain"]),
+    reason: Schema.optional(TrimmedNonEmptyString),
+  }),
+  /**
+   * The provider closed a request on its own (Codex `serverRequest/resolved`).
+   * An unanswered request expires; an answered one is marked `not_needed`.
+   */
+  Schema.Struct({
+    type: Schema.Literal("runtime-request.provider-closed"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    requestId: RuntimeRequestId,
+  }),
   Schema.Struct({
     type: Schema.Literal("secret_request.record"),
     commandId: CommandId,
@@ -3395,6 +3826,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   subscribeArchivedShell: "orchestration.subscribeArchivedShell",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
+  searchThreadHistory: "orchestration.searchThreadHistory",
 } as const;
 
 export const OrchestrationV2ArchivedShellSnapshot = Schema.Struct({
@@ -3437,6 +3869,8 @@ export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   localSession: Schema.optional(OrchestrationV2LocalSession),
+  /** Missing means `override`; applies only when the launch creates the thread. */
+  permissionSource: Schema.optional(PermissionSource),
   workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
   initialMessage: Schema.optional(
     Schema.Struct({

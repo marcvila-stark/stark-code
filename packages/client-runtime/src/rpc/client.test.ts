@@ -1,10 +1,20 @@
 import {
+  AuthOrchestrationOperateScope,
+  AuthSettingsWriteScope,
+  type AuthEnvironmentScope,
+  clientRpcRequiredScopes,
+  CommandId,
   DEFAULT_SERVER_SETTINGS,
   EnvironmentAuthorizationError,
   EnvironmentId,
+  ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2DispatchCommandError,
+  type OrchestrationV2Command,
   type RelayClientInstallProgressEvent,
+  RuntimeRequestId,
   type ServerConfigStreamEvent,
   type ServerLifecycleStreamEvent,
+  ThreadId,
   WS_METHODS,
 } from "@starkfuture/contracts";
 import { describe, expect, it } from "@effect/vitest";
@@ -20,6 +30,7 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
 import { RpcClientError } from "effect/rpc";
+import * as Socket from "effect/socket/Socket";
 
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -33,6 +44,8 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   EnvironmentRpcRequestObserver,
   request,
+  requestGuardedAcrossReconnect,
+  RpcPermissionGuard,
   runStream,
   subscribe,
   subscribeDynamicWithSession,
@@ -680,6 +693,336 @@ describe("environment RPC", () => {
       }
       expect(observations).toEqual(["input 1", "stream", "expected failure", "input 2", "defect"]);
       expect(observedDefects).toEqual([defect]);
+    }),
+  );
+});
+
+describe("requests across reconnect", () => {
+  const CONNECTED_STATE: SupervisorConnectionState = {
+    ...AVAILABLE_CONNECTION_STATE,
+    desired: true,
+    phase: "connected",
+  };
+  const DISPATCH = ORCHESTRATION_V2_WS_METHODS.dispatchCommand;
+  const respond = (
+    decision: "accept" | "acceptAlways" = "accept",
+  ): Extract<OrchestrationV2Command, { readonly type: "runtime-request.respond" }> => ({
+    type: "runtime-request.respond",
+    commandId: CommandId.make("command-respond-1"),
+    threadId: ThreadId.make("thread-1"),
+    requestId: RuntimeRequestId.make("request-1"),
+    decision,
+  });
+  const socketClosed = () =>
+    new RpcClientError.RpcClientError({ reason: new Socket.SocketCloseError({ code: 1006 }) });
+  type DispatchAnswer = Effect.Effect<
+    { readonly sequence: number },
+    RpcClientError.RpcClientError | OrchestrationV2DispatchCommandError
+  >;
+  const dispatchSession = (
+    calls: Array<{ readonly session: string; readonly command: unknown }>,
+    name: string,
+    answer: () => DispatchAnswer,
+  ) =>
+    session({
+      [DISPATCH]: (command: unknown) => {
+        calls.push({ session: name, command });
+        return answer();
+      },
+    } as unknown as WsRpcProtocolClient);
+  const grants = (scopes: ReadonlyArray<AuthEnvironmentScope>) => ({
+    authorize: (_environmentId: EnvironmentId, method: string, input: unknown) => {
+      const missing = clientRpcRequiredScopes(method, input).find(
+        (scope) => !scopes.includes(scope),
+      );
+      return missing === undefined
+        ? Effect.void
+        : Effect.fail(
+            new EnvironmentAuthorizationError({
+              requiredScope: missing,
+              message: `This connection requires ${missing}.`,
+            }),
+          );
+    },
+  });
+  const OPERATE = [AuthOrchestrationOperateScope];
+  const awaitCalls = Effect.fn("TestEnvironmentRpc.awaitCalls")(function* (
+    calls: ReadonlyArray<unknown>,
+    count: number,
+  ) {
+    for (let attempt = 0; attempt < 100 && calls.length < count; attempt += 1) {
+      yield* Effect.yieldNow;
+    }
+    if (calls.length < count) return yield* Effect.die(new Error(`Expected ${count} calls.`));
+  });
+
+  it.effect("re-sends the same command on the next session after the socket drops", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+      let awaiting = 0;
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+      const first = dispatchSession(calls, "first", () => Effect.fail(socketClosed()));
+      const second = dispatchSession(calls, "second", () => Effect.succeed({ sequence: 7 }));
+      yield* SubscriptionRef.set(activeSession, Option.some(first));
+
+      const fiber = yield* requestGuardedAcrossReconnect(DISPATCH, respond(), {
+        onAwaitingReconnect: Effect.sync(() => {
+          awaiting += 1;
+        }),
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+        Effect.forkChild,
+      );
+      yield* awaitCalls(calls, 1);
+      yield* SubscriptionRef.set(activeSession, Option.none());
+      yield* SubscriptionRef.set(activeSession, Option.some(second));
+
+      expect(yield* Fiber.join(fiber)).toEqual({ sequence: 7 });
+      expect(calls).toEqual([
+        { session: "first", command: respond() },
+        { session: "second", command: respond() },
+      ]);
+      expect(awaiting).toBe(1);
+    }),
+  );
+
+  it.effect("re-sends when the session closes under the open call", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+      // A closing session ends open calls with an interrupt from its own fiber.
+      const first = dispatchSession(calls, "first", () => Effect.failCause(Cause.interrupt(-42)));
+      const second = dispatchSession(calls, "second", () => Effect.succeed({ sequence: 3 }));
+      yield* SubscriptionRef.set(activeSession, Option.some(first));
+
+      const fiber = yield* requestGuardedAcrossReconnect(DISPATCH, respond()).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+        Effect.forkChild,
+      );
+      yield* awaitCalls(calls, 1);
+      yield* SubscriptionRef.set(activeSession, Option.some(second));
+
+      expect(yield* Fiber.join(fiber)).toEqual({ sequence: 3 });
+      expect(calls.map((call) => call.session)).toEqual(["first", "second"]);
+    }),
+  );
+
+  it.effect("uses a replacement session published before the wait begins", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+      const second = dispatchSession(calls, "second", () => Effect.succeed({ sequence: 9 }));
+      const first = dispatchSession(calls, "first", () =>
+        SubscriptionRef.set(activeSession, Option.some(second)).pipe(
+          Effect.andThen(Effect.fail(socketClosed())),
+        ),
+      );
+      yield* SubscriptionRef.set(activeSession, Option.some(first));
+
+      const result = yield* requestGuardedAcrossReconnect(DISPATCH, respond()).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+      );
+
+      expect(result).toEqual({ sequence: 9 });
+      expect(calls.map((call) => call.session)).toEqual(["first", "second"]);
+    }),
+  );
+
+  it.effect("fails without sending when no session exists", () =>
+    Effect.gen(function* () {
+      const { supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+
+      const error = yield* requestGuardedAcrossReconnect(DISPATCH, respond()).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+        Effect.flip,
+      );
+
+      expect(error._tag).toBe("EnvironmentRpcUnavailableError");
+    }),
+  );
+
+  it.effect("passes server rejections and client defects through without re-sending", () =>
+    Effect.gen(function* () {
+      const rejection = new OrchestrationV2DispatchCommandError({
+        commandId: respond().commandId,
+        commandType: "runtime-request.respond",
+        message: "Runtime request request-1 is resolved.",
+      });
+      const defect = new RpcClientError.RpcClientError({
+        reason: new RpcClientError.RpcClientDefect({
+          message: "Error decoding message",
+          cause: new Error("bad frame"),
+        }),
+      });
+      for (const failure of [rejection, defect]) {
+        const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+        const { activeSession, supervisor } = yield* makeHarness();
+        yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+        yield* SubscriptionRef.set(
+          activeSession,
+          Option.some(dispatchSession(calls, "only", () => Effect.fail(failure))),
+        );
+
+        const error = yield* requestGuardedAcrossReconnect(DISPATCH, respond()).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+          Effect.flip,
+        );
+
+        expect(error).toBe(failure);
+        expect(calls).toHaveLength(1);
+      }
+    }),
+  );
+
+  it.effect("checks grants on every attempt, including settings:write for Always allow", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+      const second = dispatchSession(calls, "second", () => Effect.succeed({ sequence: 1 }));
+      const first = dispatchSession(calls, "first", () =>
+        SubscriptionRef.set(activeSession, Option.some(second)).pipe(
+          Effect.andThen(Effect.fail(socketClosed())),
+        ),
+      );
+      yield* SubscriptionRef.set(activeSession, Option.some(first));
+
+      const withoutSettings = yield* requestGuardedAcrossReconnect(
+        DISPATCH,
+        respond("acceptAlways"),
+      ).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+        Effect.flip,
+      );
+      expect(withoutSettings).toMatchObject({
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: AuthSettingsWriteScope,
+      });
+      expect(calls).toHaveLength(0);
+
+      // The grant is revoked while the request waits to be sent again.
+      let granted: ReadonlyArray<AuthEnvironmentScope> = [
+        AuthOrchestrationOperateScope,
+        AuthSettingsWriteScope,
+      ];
+      const revoking = {
+        authorize: (environmentId: EnvironmentId, method: string, input: unknown) =>
+          Effect.suspend(() => grants(granted).authorize(environmentId, method, input)).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                granted = OPERATE;
+              }),
+            ),
+          ),
+      };
+      const revoked = yield* requestGuardedAcrossReconnect(DISPATCH, respond("acceptAlways")).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, revoking),
+        Effect.flip,
+      );
+      expect(revoked).toMatchObject({
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: AuthSettingsWriteScope,
+      });
+      expect(calls.map((call) => call.session)).toEqual(["first"]);
+    }),
+  );
+
+  it.effect("reports an unknown outcome when no replacement session arrives in time", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+      yield* SubscriptionRef.set(
+        activeSession,
+        Option.some(dispatchSession(calls, "first", () => Effect.fail(socketClosed()))),
+      );
+
+      const fiber = yield* requestGuardedAcrossReconnect(DISPATCH, respond(), {
+        maxWait: "5 minutes",
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+        Effect.flip,
+        Effect.forkChild,
+      );
+      yield* awaitCalls(calls, 1);
+      yield* SubscriptionRef.set(activeSession, Option.none());
+      yield* TestClock.adjust("4 minutes");
+      expect(fiber.pollUnsafe()).toBeUndefined();
+      yield* TestClock.adjust("1 minute");
+
+      expect((yield* Fiber.join(fiber))._tag).toBe("EnvironmentRpcOutcomeUnknownError");
+      expect(calls).toHaveLength(1);
+    }),
+  );
+
+  it.effect("stops waiting once the environment is removed or switched off", () =>
+    Effect.gen(function* () {
+      for (const stop of ["removed", "switched off"] as const) {
+        const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+        const removed = yield* Deferred.make<void>();
+        const { activeSession, supervisor } = yield* makeHarness();
+        yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+        yield* SubscriptionRef.set(
+          activeSession,
+          Option.some(dispatchSession(calls, "first", () => Effect.fail(socketClosed()))),
+        );
+
+        const fiber = yield* requestGuardedAcrossReconnect(DISPATCH, respond(), {
+          abandonWhen: Deferred.await(removed),
+        }).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+          Effect.flip,
+          Effect.forkChild,
+        );
+        yield* awaitCalls(calls, 1);
+        yield* stop === "removed"
+          ? Deferred.succeed(removed, undefined)
+          : SubscriptionRef.set(supervisor.state, AVAILABLE_CONNECTION_STATE);
+
+        expect((yield* Fiber.join(fiber))._tag).toBe("EnvironmentRpcOutcomeUnknownError");
+        expect(calls).toHaveLength(1);
+      }
+    }),
+  );
+
+  it.effect("does not re-send after the caller interrupts the request", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly session: string; readonly command: unknown }> = [];
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(supervisor.state, CONNECTED_STATE);
+      yield* SubscriptionRef.set(
+        activeSession,
+        Option.some(dispatchSession(calls, "first", () => Effect.never)),
+      );
+
+      const fiber = yield* requestGuardedAcrossReconnect(DISPATCH, respond()).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(RpcPermissionGuard, grants(OPERATE)),
+        Effect.forkChild,
+      );
+      yield* awaitCalls(calls, 1);
+      yield* Fiber.interrupt(fiber);
+      yield* SubscriptionRef.set(
+        activeSession,
+        Option.some(dispatchSession(calls, "second", () => Effect.succeed({ sequence: 1 }))),
+      );
+      yield* Effect.yieldNow;
+
+      expect(Exit.hasInterrupts(yield* Fiber.await(fiber))).toBe(true);
+      expect(calls).toHaveLength(1);
     }),
   );
 });

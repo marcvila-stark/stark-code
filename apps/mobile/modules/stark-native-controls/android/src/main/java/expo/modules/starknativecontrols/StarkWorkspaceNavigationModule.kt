@@ -41,7 +41,9 @@ class StarkWorkspaceNavigationModule : Module() {
       }
       Prop("rail") { view: StarkWorkspaceNavigationView, value: Boolean -> view.rail = value }
       Prop("dark") { view: StarkWorkspaceNavigationView, value: Boolean -> view.dark = value }
-      Prop("textScale") { view: StarkWorkspaceNavigationView, value: Float -> view.textScale = value }
+      Prop("textScale") { view: StarkWorkspaceNavigationView, value: Float ->
+        view.textScale = value
+      }
       Prop("containerColor") { view: StarkWorkspaceNavigationView, value: Int ->
         view.containerColor = value
       }

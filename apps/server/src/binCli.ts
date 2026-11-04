@@ -9,6 +9,7 @@ import * as NetService from "@starkfuture/shared/Net";
 import packageJson from "../package.json" with { type: "json" };
 import { acpMcpBridgeCommand, acpMcpCallCommand } from "./cli/acpMcpBridge.ts";
 import { authCommand } from "./cli/auth.ts";
+import { backupCommand } from "./cli/backup.ts";
 import { appCommand } from "./cli/app.ts";
 import { browserCommand } from "./cli/browser.ts";
 import { pairCommand } from "./cli/pair.ts";
@@ -44,6 +45,7 @@ export const makeCli = (_options: { cloudEnabled?: boolean } = {}) =>
       appCommand,
       pairCommand,
       authCommand,
+      backupCommand,
       browserCommand,
       projectCommand,
       serviceCommand,

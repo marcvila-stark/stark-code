@@ -507,6 +507,38 @@ export const MuseOrchestratorReplayHarness: OrchestratorV2ProviderReplayHarness<
   driver: ProviderDriverKind.make(MUSE_PROVIDER_KIND),
   decodeTranscript: (transcript: ProviderReplayTranscript) =>
     decodeMuseReplayTranscript(transcript).pipe(
+      // Derive the old Full-access lifecycle recordings to today's Supervised
+      // launch. Keep every frame strict after applying these exact settings.
+      Effect.map((decoded) => {
+        if (!["1.4.3-R5018.1", "1.4.4-R5419.1", "1.4.6-R6000.1"].includes(decoded.version))
+          return decoded;
+        const supervised = (value: unknown): unknown => {
+          if (Array.isArray(value)) return value.map(supervised);
+          if (!isRecord(value)) return value;
+          return Object.fromEntries(
+            Object.entries(value).map(([key, child]) => [
+              key,
+              (key === "approvalMode" || key === "mode") && child === "allowAll"
+                ? "promptUnmatched"
+                : supervised(child),
+            ]),
+          );
+        };
+        return {
+          ...decoded,
+          entries: decoded.entries.map((entry) => {
+            if (!("frame" in entry)) return entry;
+            const frame = supervised(entry.frame);
+            if (isRecord(frame) && frame.type === "host_start" && Array.isArray(frame.args)) {
+              return {
+                ...entry,
+                frame: { ...frame, args: frame.args.filter((arg) => arg !== "--disable-sandbox") },
+              };
+            }
+            return { ...entry, frame };
+          }),
+        };
+      }),
       Effect.mapError(
         (cause) => new MuseReplayTranscriptDecodeError({ scenario: transcript.scenario, cause }),
       ),

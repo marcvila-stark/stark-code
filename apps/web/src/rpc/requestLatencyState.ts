@@ -16,6 +16,8 @@ let slowRpcAckThresholdMs = SLOW_RPC_ACK_THRESHOLD_MS;
 
 export interface SlowRpcAckRequest {
   readonly requestId: string;
+  /** The bare WS method, which decides how the toast names the request. */
+  readonly method: string;
   readonly startedAt: string;
   readonly startedAtMs: number;
   readonly tag: string;
@@ -28,7 +30,11 @@ interface PendingRpcAckRequest {
 }
 
 const pendingRpcAckRequests = new Map<string, PendingRpcAckRequest>();
-const untrackedRpcAckMethods = new Set<string>([WS_METHODS.serverGetUsageSummary]);
+const untrackedRpcAckMethods = new Set<string>([
+  WS_METHODS.serverGetUsageSummary,
+  // Answers only once the user finishes signing in, which can open a browser.
+  WS_METHODS.mcpServerSignIn,
+]);
 const longRunningRpcAckMethods = new Set<string>([
   WS_METHODS.serverUpdateProvider,
   WS_METHODS.serverRefreshProviders,
@@ -83,6 +89,7 @@ export function trackRpcRequestSent(requestId: string, method: string, tag = met
   const thresholdMs = rpcAckThresholdMs(method);
   const request: SlowRpcAckRequest = {
     requestId,
+    method,
     startedAt: new Date(startedAtMs).toISOString(),
     startedAtMs,
     tag,

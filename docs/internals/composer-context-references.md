@@ -147,6 +147,11 @@ status tone from that snapshot. Hover shows the snapshot details; activation res
 against the current environment and opens the pull request in the thread's right panel. Records
 written before the metadata was added retain their legacy details and neutral pull-request tone.
 
+A review comment made in a turn's diff carries that turn's `runId`, which is how clients link a
+correction to the turn it reviews (`packages/client-runtime/src/state/reviewChain.ts`). `sectionId`
+only groups comments for display, and its format differs between web (`turn:<runId>`) and mobile
+(`turn:<ordinal>`), so readers fall back to it only when it names a run loaded in the thread.
+
 ## Attachments
 
 Image and file records use the draft attachment's local id as `contextId` and carry an

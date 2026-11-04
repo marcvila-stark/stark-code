@@ -4,6 +4,8 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert, expect } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Cache from "effect/Cache";
+import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
@@ -596,6 +598,27 @@ it.layer(
       }),
     );
 
+    it.effect(
+      "keeps a signed-in Codex available when startup discovery takes longer than ten seconds",
+      () =>
+        Effect.gen(function* () {
+          const started = yield* Deferred.make<void>();
+          const reply = yield* Deferred.make<CodexAppServerProviderSnapshot>();
+          const statusFiber = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
+            Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(reply))),
+          ).pipe(Effect.forkChild);
+
+          yield* Deferred.await(started);
+          yield* TestClock.adjust("15 seconds");
+          yield* Deferred.succeed(reply, makeCodexProbeSnapshot());
+
+          const status = yield* Fiber.join(statusFiber);
+          assert.strictEqual(status.status, "ready");
+          assert.strictEqual(status.auth.status, "authenticated");
+          assert.strictEqual(status.models[0]?.slug, "gpt-live-codex");
+        }),
+    );
+
     it.effect("closes the app-server probe scope when provider status times out", () =>
       Effect.gen(function* () {
         const killCalls = yield* Ref.make(0);
@@ -605,7 +628,7 @@ it.layer(
         );
 
         yield* Effect.yieldNow;
-        yield* TestClock.adjust("11 seconds");
+        yield* TestClock.adjust("31 seconds");
         yield* Effect.yieldNow;
 
         const status = yield* Fiber.join(statusFiber);
@@ -1206,6 +1229,7 @@ it.layer(
           });
           yield* writeProviderStatusCache({ filePath, provider: cachedProvider });
           const nextProvider = yield* Ref.make<ServerProvider>(refreshedProvider);
+          const currentProvider = yield* Ref.make<ServerProvider>(pendingProvider);
           const instance = {
             instanceId: cachedProvider.instanceId,
             driverKind: cachedProvider.driver,
@@ -1223,8 +1247,10 @@ it.layer(
                     packageName: null,
                   }),
                 ),
-              getSnapshot: Effect.succeed(pendingProvider),
-              refresh: Ref.get(nextProvider),
+              getSnapshot: Ref.get(currentProvider),
+              refresh: Ref.get(nextProvider).pipe(
+                Effect.tap((value) => Ref.set(currentProvider, value)),
+              ),
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
@@ -1954,6 +1980,7 @@ it.layer(
           ],
         } as const satisfies ServerProvider;
         const catalogSnapshot = yield* Ref.make<ServerProvider>(recoveredOpenCodeProvider);
+        const currentOpenCodeSnapshot = yield* Ref.make<ServerProvider>(failedOpenCodeProvider);
         const instances = [
           {
             instanceId: codexInstanceId,
@@ -1999,9 +2026,10 @@ it.layer(
                     packageName: null,
                   }),
                 ),
-              getSnapshot: Effect.succeed(failedOpenCodeProvider),
+              getSnapshot: Ref.get(currentOpenCodeSnapshot),
               refresh: Ref.update(openCodeRefreshCalls, (count) => count + 1).pipe(
                 Effect.andThen(Ref.get(catalogSnapshot)),
+                Effect.tap((value) => Ref.set(currentOpenCodeSnapshot, value)),
               ),
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
@@ -2229,6 +2257,149 @@ it.layer(
       }),
     );
 
+    it.effect(
+      "never republishes a stale account after invalidation or a delayed source event",
+      () =>
+        Effect.gen(function* () {
+          const instanceId = ProviderInstanceId.make("claude-race");
+          const driverKind = ProviderDriverKind.make("claudeAgent");
+          const original: ServerProvider = {
+            instanceId,
+            driver: driverKind,
+            version: "test",
+            enabled: true,
+            installed: true,
+            status: "ready",
+            auth: { status: "authenticated", workspaceId: "org-a" },
+            models: [],
+            slashCommands: [],
+            skills: [],
+            checkedAt: "2026-10-27T10:00:00.000Z",
+          };
+          const invalidated: ServerProvider = {
+            ...original,
+            auth: { status: "unknown" },
+            status: "warning",
+            checkedAt: "2026-10-27T10:00:01.000Z",
+          };
+          const switched: ServerProvider = {
+            ...original,
+            auth: { status: "authenticated", workspaceId: "org-b" },
+            checkedAt: "2026-10-27T10:00:02.000Z",
+          };
+          const current = yield* Ref.make(original);
+          const changes = yield* PubSub.unbounded<ServerProvider>();
+          const refreshStarted = yield* Deferred.make<void>();
+          const releaseRefresh = yield* Deferred.make<void>();
+          const sawInvalidation = yield* Deferred.make<void>();
+          const sawSwitch = yield* Deferred.make<void>();
+          const delayedEventRead = yield* Deferred.make<void>();
+          const watchDelayedEvent = yield* Ref.make(false);
+          const observed = yield* Ref.make<ReadonlyArray<ServerProvider>>([]);
+          const instance: ProviderInstance = {
+            instanceId,
+            driverKind,
+            enabled: true,
+            displayName: undefined,
+            continuationIdentity: { driverKind, continuationKey: "claude:test:race" },
+            snapshot: {
+              resolveMaintenance: () =>
+                Effect.succeed(
+                  makeManualOnlyProviderMaintenanceCapabilities({
+                    provider: driverKind,
+                    packageName: null,
+                  }),
+                ),
+              getSnapshot: Ref.get(current).pipe(
+                Effect.tap(() =>
+                  Ref.get(watchDelayedEvent).pipe(
+                    Effect.flatMap((watch) =>
+                      watch ? Deferred.succeed(delayedEventRead, undefined) : Effect.void,
+                    ),
+                  ),
+                ),
+              ),
+              refresh: Deferred.succeed(refreshStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseRefresh)),
+                Effect.as(original),
+              ),
+              streamChanges: Stream.fromPubSub(changes),
+              applyUsageLimits: () => Effect.void,
+            },
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            textGeneration: {} as ProviderInstance["textGeneration"],
+          };
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistry.layer.pipe(
+              Layer.provideMerge(
+                Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+                  getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
+                  listInstances: Effect.succeed([instance]),
+                  listUnavailable: Effect.succeed([]),
+                  streamChanges: Stream.empty,
+                  subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+                }),
+              ),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "stark-account-publication-race-",
+                }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ).pipe(Scope.provide(scope));
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            const initialDelivered = yield* Deferred.make<void>();
+            const releaseInitial = yield* Deferred.make<void>();
+            yield* registry.streamSnapshots.pipe(
+              Stream.runForEach((providers) =>
+                Effect.gen(function* () {
+                  const value = providers[0]!;
+                  yield* Ref.update(observed, (values) => [...values, value]);
+                  if (value.auth.workspaceId === "org-a") {
+                    yield* Deferred.succeed(initialDelivered, undefined);
+                    yield* Deferred.await(releaseInitial);
+                  }
+                  if (value.auth.status === "unknown")
+                    yield* Deferred.succeed(sawInvalidation, undefined);
+                  if (value.auth.workspaceId === "org-b")
+                    yield* Deferred.succeed(sawSwitch, undefined);
+                }),
+              ),
+              Effect.forkScoped,
+            );
+            yield* Deferred.await(initialDelivered);
+            const refresh = yield* registry.refreshInstance(instanceId).pipe(Effect.forkChild);
+            yield* Deferred.await(refreshStarted);
+            yield* Ref.set(current, invalidated);
+            yield* PubSub.publish(changes, invalidated);
+            // Replay is intentionally paused while invalidation is published. The
+            // subscription must already exist, so this update cannot fall in a gap.
+            yield* Deferred.succeed(releaseInitial, undefined);
+            yield* Deferred.await(sawInvalidation);
+            yield* Deferred.succeed(releaseRefresh, undefined);
+            const returned = yield* Fiber.join(refresh);
+            expect(returned[0]?.auth).toEqual({ status: "unknown" });
+            yield* Ref.set(current, switched);
+            yield* PubSub.publish(changes, switched);
+            yield* Deferred.await(sawSwitch);
+            yield* Ref.set(watchDelayedEvent, true);
+            yield* PubSub.publish(changes, original);
+            yield* Deferred.await(delayedEventRead);
+            yield* Effect.yieldNow;
+            expect((yield* registry.getProviders)[0]?.auth.workspaceId).toBe("org-b");
+            expect(
+              (yield* Ref.get(observed))
+                .slice(1)
+                .every((value) => value.auth.workspaceId !== "org-a"),
+            ).toBe(true);
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+    );
+
     it.effect("persists the merged snapshot when a live update has empty models", () =>
       Effect.gen(function* () {
         const cursorDriver = ProviderDriverKind.make("cursor");
@@ -2265,6 +2436,7 @@ it.layer(
           models: [],
         } satisfies ServerProvider;
         const changes = yield* PubSub.unbounded<ServerProvider>();
+        const currentSnapshot = yield* Ref.make<ServerProvider>(initialProvider);
         const instance = {
           instanceId: cursorInstanceId,
           driverKind: cursorDriver,
@@ -2282,8 +2454,8 @@ it.layer(
                   packageName: null,
                 }),
               ),
-            getSnapshot: Effect.succeed(initialProvider),
-            refresh: Effect.succeed(refreshedProvider),
+            getSnapshot: Ref.get(currentSnapshot),
+            refresh: Ref.set(currentSnapshot, refreshedProvider).pipe(Effect.as(refreshedProvider)),
             streamChanges: Stream.fromPubSub(changes),
             applyUsageLimits: () => Effect.void,
           },
@@ -2330,6 +2502,7 @@ it.layer(
             ...initialProvider.models,
           ]);
           const persisted = yield* awaitPersistedProvider(registry, refreshedProvider.checkedAt);
+          yield* Ref.set(currentSnapshot, refreshedProvider);
           yield* PubSub.publish(changes, refreshedProvider);
           yield* Fiber.join(persisted);
           const cachedProvider = yield* readProviderStatusCache(filePath);
@@ -2393,6 +2566,7 @@ it.layer(
             message: "Failed to refresh OpenCode models.",
           } satisfies ServerProvider;
           const changes = yield* PubSub.unbounded<ServerProvider>();
+          const currentSnapshot = yield* Ref.make<ServerProvider>(initialProvider);
           const instance = {
             instanceId: openCodeInstanceId,
             driverKind: openCodeDriver,
@@ -2410,8 +2584,10 @@ it.layer(
                     packageName: null,
                   }),
                 ),
-              getSnapshot: Effect.succeed(initialProvider),
-              refresh: Effect.succeed(authoritativeProvider),
+              getSnapshot: Ref.get(currentSnapshot),
+              refresh: Ref.set(currentSnapshot, authoritativeProvider).pipe(
+                Effect.as(authoritativeProvider),
+              ),
               streamChanges: Stream.fromPubSub(changes),
               applyUsageLimits: () => Effect.void,
             },
@@ -2457,6 +2633,7 @@ it.layer(
               registry,
               authoritativeProvider.checkedAt,
             );
+            yield* Ref.set(currentSnapshot, authoritativeProvider);
             yield* PubSub.publish(changes, authoritativeProvider);
             yield* Fiber.join(authoritativePersisted);
             let cachedProvider = yield* readProviderStatusCache(filePath);
@@ -2467,6 +2644,7 @@ it.layer(
               registry,
               failedProvider.checkedAt,
             );
+            yield* Ref.set(currentSnapshot, failedProvider);
             yield* PubSub.publish(changes, failedProvider);
             yield* Fiber.join(failedPersisted);
             cachedProvider = yield* readProviderStatusCache(filePath);
@@ -2475,6 +2653,123 @@ it.layer(
             assert.deepStrictEqual((yield* registry.getProviders)[0]?.models, [
               authoritativeProvider.models[0]!,
             ]);
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+    );
+
+    it.effect(
+      "bypasses only the selected provider's probe cache for an explicit fresh refresh",
+      () =>
+        Effect.gen(function* () {
+          const driver = ProviderDriverKind.make("claudeAgent");
+          const makeInstance = Effect.fn(function* (id: string) {
+            const instanceId = ProviderInstanceId.make(id);
+            const initial: ServerProvider = {
+              instanceId,
+              driver,
+              status: "ready",
+              enabled: true,
+              installed: true,
+              auth: { status: "authenticated" },
+              checkedAt: "2026-10-27T10:00:00.000Z",
+              version: "2.1.310",
+              models: [],
+              slashCommands: [],
+              skills: [],
+            };
+            const source = yield* Ref.make(initial);
+            const probes = yield* Ref.make(0);
+            const invalidations = yield* Ref.make(0);
+            const cache = yield* Cache.make({
+              capacity: 1,
+              timeToLive: Duration.minutes(5),
+              lookup: (_key: string) =>
+                Ref.update(probes, (count) => count + 1).pipe(Effect.andThen(Ref.get(source))),
+            });
+            const instance: ProviderInstance = {
+              instanceId,
+              driverKind: driver,
+              continuationIdentity: { driverKind: driver, continuationKey: `claude:${id}` },
+              displayName: undefined,
+              enabled: true,
+              snapshot: {
+                resolveMaintenance: () =>
+                  Effect.succeed(
+                    makeManualOnlyProviderMaintenanceCapabilities({
+                      provider: driver,
+                      packageName: null,
+                    }),
+                  ),
+                getSnapshot: Cache.get(cache, "snapshot"),
+                refresh: Cache.get(cache, "snapshot"),
+                streamChanges: Stream.empty,
+                applyUsageLimits: () => Effect.void,
+              },
+              invalidateCaches: Ref.update(invalidations, (count) => count + 1).pipe(
+                Effect.andThen(Cache.invalidateAll(cache)),
+              ),
+              orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+              textGeneration: {} as ProviderInstance["textGeneration"],
+            };
+            return { instance, source, probes, invalidations };
+          });
+          const selected = yield* makeInstance("claude-work");
+          const other = yield* makeInstance("claude-other");
+          const instances = [selected.instance, other.instance];
+          const layerInstanceRegistry = Layer.succeed(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            {
+              getInstance: (id) =>
+                Effect.succeed(instances.find((entry) => entry.instanceId === id)),
+              listInstances: Effect.succeed(instances),
+              listUnavailable: Effect.succeed([]),
+              streamChanges: Stream.empty,
+              subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
+                PubSub.subscribe(pubsub),
+              ),
+            },
+          );
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistry.layer.pipe(
+              Layer.provideMerge(layerInstanceRegistry),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "stark-provider-registry-fresh-usage-",
+                }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ).pipe(Scope.provide(scope));
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            const updatedAt = "2026-10-27T10:01:00.000Z";
+            yield* Ref.update(selected.source, (provider) => ({
+              ...provider,
+              checkedAt: updatedAt,
+            }));
+            const normal = yield* registry.refreshInstance(selected.instance.instanceId);
+            assert.notEqual(
+              normal.find((entry) => entry.instanceId === selected.instance.instanceId)?.checkedAt,
+              updatedAt,
+            );
+            assert.strictEqual(yield* Ref.get(selected.probes), 1);
+            const fresh = yield* registry.refreshInstance(selected.instance.instanceId, {
+              fresh: true,
+            });
+            assert.strictEqual(
+              fresh.find((entry) => entry.instanceId === selected.instance.instanceId)?.checkedAt,
+              updatedAt,
+            );
+            assert.strictEqual(yield* Ref.get(selected.probes), 2);
+            assert.strictEqual(yield* Ref.get(selected.invalidations), 1);
+            assert.strictEqual(yield* Ref.get(other.probes), 1);
+            assert.strictEqual(yield* Ref.get(other.invalidations), 0);
+            assert.deepStrictEqual(
+              yield* registry.refreshInstance(ProviderInstanceId.make("missing"), { fresh: true }),
+              fresh,
+            );
           }).pipe(Effect.provide(runtimeServices));
         }),
     );
@@ -3148,8 +3443,9 @@ it.layer(
             })),
           );
         yield* TestClock.adjust("2 minutes");
+        const expectedCheckedAt = DateTime.formatIso(yield* DateTime.now);
         const status = yield* checkClaudeProviderStatus(defaultClaudeSettings, cached);
-        assert.equal(status.checkedAt, "1970-01-01T00:02:00.000Z");
+        assert.equal(status.checkedAt, expectedCheckedAt);
         assert.equal(status.usageLimits?.checkedAt, checkedAt);
         assert.equal(status.usageLimits?.windows[0]?.usedPercent, 0);
       }).pipe(

@@ -18,6 +18,7 @@ import * as Keybindings from "./keybindings.ts";
 import * as EffectWorker from "./orchestration-v2/EffectWorker.ts";
 import * as LegacyV1ThreadImporter from "./orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
+import * as PermissionFreeze from "./orchestration-v2/PermissionFreeze.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ProviderRuntimeRecovery from "./orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
@@ -25,6 +26,7 @@ import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectService from "./project/ProjectService.ts";
+import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { ServerActivation } from "./serverActivation.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -115,6 +117,14 @@ it.effect("parks automatic pull until activation without delaying command readin
           reconcile: () => Effect.succeed(recovery),
         }),
         Layer.mock(Orchestrator.OrchestratorV2)({ recoverDelegatedTasks: Effect.void }),
+        Layer.mock(PermissionFreeze.PermissionFreeze)({
+          run: () =>
+            Effect.succeed({
+              migratedThreadCount: 0,
+              migratedScheduledTaskCount: 0,
+              failedThreadCount: 0,
+            }),
+        }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ shutdown: Effect.void }),
         Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({ start: () => Effect.void }),
         Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({ runOnce: Effect.never }),
@@ -148,6 +158,7 @@ it.effect("parks automatic pull until activation without delaying command readin
             }),
         }),
         Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
         Layer.mock(ServiceLauncherClient.ServiceLauncherClient)({
           managed: true,
           prepareTrial: Deferred.succeed(prepared, undefined).pipe(

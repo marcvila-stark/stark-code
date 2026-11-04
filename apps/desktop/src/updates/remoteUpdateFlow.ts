@@ -25,6 +25,8 @@ export type RemoteDesktopUpdateStep =
 export interface RemoteDesktopUpdateAttempts {
   readonly checks: number;
   readonly downloads: number;
+  /** Restart requests this run already made; a blocked restart is not repeated. */
+  readonly installs?: number;
 }
 
 export const MAX_REMOTE_UPDATE_CHECKS = 2;
@@ -71,9 +73,24 @@ export function nextRemoteDesktopUpdateStep(
   // a previous failed install (errorContext "install"); it does not survive
   // a check or download error, which fall through to the error branch.
   if (isInstallableDesktopUpdateState(state)) {
+    // A restart refused because work is running is reported, not retried:
+    // only the people at that machine decide when their tasks may stop.
+    if ((state.installBlockers?.length ?? 0) > 0 && (attempts.installs ?? 0) > 0) {
+      return {
+        action: "done",
+        outcome: "failed",
+        reason: state.message ?? "The desktop app can't restart yet.",
+      };
+    }
     return { action: "install" };
   }
-  if (state.status === "downloading" || state.status === "checking") {
+  if (
+    state.status === "downloading" ||
+    state.status === "checking" ||
+    state.status === "verifying" ||
+    state.status === "preparing" ||
+    state.status === "restarting"
+  ) {
     return { action: "wait" };
   }
   if (state.status === "available") {

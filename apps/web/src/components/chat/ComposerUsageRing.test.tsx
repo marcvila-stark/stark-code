@@ -268,6 +268,7 @@ it("refreshes stale quota on re-entry/focus with a cooldown and no hidden pollin
   const refresh = vi.fn().mockResolvedValue(undefined);
   await render(claude, true, refresh);
   expect(refresh).toHaveBeenCalledTimes(1);
+  expect(refresh).toHaveBeenLastCalledWith({ fresh: false });
   await act(() => window.dispatchEvent(new Event("focus")));
   expect(refresh).toHaveBeenCalledTimes(1);
   vi.mocked(Date.now).mockReturnValue(Date.parse("2026-10-17T12:01:01Z"));
@@ -277,6 +278,7 @@ it("refreshes stale quota on re-entry/focus with a cooldown and no hidden pollin
   visibility.mockReturnValue("visible");
   await act(() => document.dispatchEvent(new Event("visibilitychange")));
   expect(refresh).toHaveBeenCalledTimes(2);
+  expect(refresh).toHaveBeenLastCalledWith({ fresh: false });
 });
 
 it("offers an explicit refresh, prevents duplicate clicks and keeps last-known values on failure", async () => {
@@ -302,11 +304,31 @@ it("offers an explicit refresh, prevents duplicate clicks and keeps last-known v
     button.click();
   });
   expect(refresh).toHaveBeenCalledTimes(1);
+  expect(refresh).toHaveBeenLastCalledWith({ fresh: true });
   expect(button.disabled).toBe(true);
   await act(() => reject(new Error("secret not shown")));
   expect(document.body.textContent).toContain("Could not refresh usage");
   expect(document.body.textContent).not.toContain("secret not shown");
   expect(trigger().textContent).toContain("Session 12% · Weekly 67%");
+});
+
+it("offers a manual retry for an inconclusive account check without asking for sign-in", async () => {
+  const refresh = vi.fn().mockResolvedValue(undefined);
+  await render({ ...claude, auth: { status: "unknown" } }, true, refresh);
+  expect(refresh).not.toHaveBeenCalled();
+  await act(() => trigger().click());
+  expect(document.body.textContent).toContain("Could not check your account.");
+  expect(document.body.textContent).not.toContain("Sign in");
+  const button = [...document.querySelectorAll("button")].find(
+    (entry) => entry.textContent === "Refresh usage",
+  )!;
+  await act(() => button.click());
+  expect(refresh).toHaveBeenCalledExactlyOnceWith({ fresh: true });
+  await render({ ...claude, auth: { status: "unauthenticated" } }, true, refresh);
+  expect(document.body.textContent).toContain("Sign in to see subscription usage.");
+  expect(
+    [...document.querySelectorAll("button")].some((entry) => entry.textContent === "Refresh usage"),
+  ).toBe(false);
 });
 
 it("does not leak a prior organization's pending refresh error into a newly selected organization", async () => {

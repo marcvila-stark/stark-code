@@ -1,17 +1,14 @@
 import { useEffect, useRef } from "react";
 
 import { type SlowRpcAckRequest, useSlowRpcAckRequests } from "../rpc/requestLatencyState";
+import {
+  INITIAL_SLOW_REQUEST_TOAST_STATE,
+  describeSlowRequests,
+  dismissSlowRequestToast,
+  slowRequestName,
+  stepSlowRequestToast,
+} from "../rpc/slowRequestToast";
 import { toastManager } from "./ui/toast";
-
-function describeSlowRequests(requests: ReadonlyArray<SlowRpcAckRequest>): string {
-  const count = requests.length;
-  // Thresholds vary per method, so report the smallest one the batch has passed.
-  const thresholdSeconds = Math.round(
-    Math.min(...requests.map((request) => request.thresholdMs)) / 1000,
-  );
-
-  return `${count} request${count === 1 ? "" : "s"} waiting longer than ${thresholdSeconds}s.`;
-}
 
 function SlowRequestDetails({ requests }: { requests: ReadonlyArray<SlowRpcAckRequest> }) {
   return (
@@ -21,9 +18,11 @@ function SlowRequestDetails({ requests }: { requests: ReadonlyArray<SlowRpcAckRe
           className="min-w-0 border-border/50 border-b pb-2 last:border-b-0 last:pb-0"
           key={request.requestId}
         >
-          <div className="wrap-break-word font-medium text-foreground">{request.tag}</div>
-          <div className="mt-0.5 text-3xs opacity-75">
-            Started {new Date(request.startedAt).toLocaleTimeString()}
+          <div className="wrap-break-word font-medium text-foreground">
+            {slowRequestName(request.method)}
+          </div>
+          <div className="wrap-break-word mt-0.5 text-3xs opacity-75">
+            {request.tag} · started {new Date(request.startedAt).toLocaleTimeString()}
           </div>
         </li>
       ))}
@@ -31,12 +30,19 @@ function SlowRequestDetails({ requests }: { requests: ReadonlyArray<SlowRpcAckRe
   );
 }
 
+/**
+ * Shows one toast per slow-request episode, updated in place and closed once
+ * nothing is slow. Closing it keeps it closed for the rest of the episode.
+ */
 export function SlowRpcRequestToastCoordinator() {
   const slowRequests = useSlowRpcAckRequests();
   const toastIdRef = useRef<ReturnType<typeof toastManager.add> | null>(null);
+  const stateRef = useRef(INITIAL_SLOW_REQUEST_TOAST_STATE);
 
   useEffect(() => {
-    if (slowRequests.length === 0) {
+    const step = stepSlowRequestToast(stateRef.current, slowRequests, Date.now());
+    stateRef.current = step.state;
+    if (step.show.length === 0) {
       if (toastIdRef.current !== null) {
         toastManager.close(toastIdRef.current);
         toastIdRef.current = null;
@@ -44,16 +50,21 @@ export function SlowRpcRequestToastCoordinator() {
       return;
     }
 
+    const { title, description, impact } = describeSlowRequests(step.show);
     const nextToast = {
       data: {
-        expandableContent: <SlowRequestDetails requests={slowRequests} />,
+        expandableContent: <SlowRequestDetails requests={step.show} />,
         expandableDescriptionTrigger: true,
         expandableLabels: { collapse: "Hide requests", expand: "Show requests" },
+        onClose: () => {
+          stateRef.current = dismissSlowRequestToast(stateRef.current);
+          toastIdRef.current = null;
+        },
       },
-      description: describeSlowRequests(slowRequests),
+      description,
       timeout: 0,
-      title: "Some requests are slow",
-      type: "warning" as const,
+      title,
+      type: impact === "not-delayed" ? ("info" as const) : ("warning" as const),
     };
 
     if (toastIdRef.current === null) {

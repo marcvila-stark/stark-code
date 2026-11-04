@@ -24,6 +24,11 @@ vi.mock("../settings/ScheduledTasksSettings", () => ({
   relativeLabel: () => "later",
   scheduleLabel: () => "daily",
 }));
+vi.mock("../settings/ScheduledTaskRunsDialog", () => ({ ScheduledTaskRunsDialog: () => null }));
+vi.mock("../../state/scheduledTaskRuns", () => ({
+  scheduledTaskRunNowClickIds: { begin: () => "click", end: () => undefined },
+  useEnvironmentKeepsRunHistory: () => true,
+}));
 vi.mock("../../state/server", () => ({
   serverEnvironment: {
     scheduledTasksLive: () => null,

@@ -103,6 +103,8 @@ import * as DesktopWindow from "../window/DesktopWindow.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
+import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as DesktopTerminalExitNotice from "../recovery/DesktopTerminalExitNotice.ts";
 
 const { logWarning: logBackendPoolWarning } =
   DesktopObservability.makeComponentLogger("desktop-backend-pool");
@@ -218,6 +220,8 @@ export const layer = Layer.effect(
     const electronDialog = yield* ElectronDialog.ElectronDialog;
     const electronApp = yield* ElectronApp.ElectronApp;
     const appSettings = yield* DesktopAppSettings.DesktopAppSettings;
+    // Optional so a pool built for tests needs no environment; the app always has one.
+    const environment = yield* Effect.serviceOption(DesktopEnvironment.DesktopEnvironment);
     // Anchor the pool's lifetime to its layer scope so registered
     // instance scopes can be forked off it. Without this, instance
     // scopes are orphaned: they only close via explicit unregister()
@@ -312,6 +316,23 @@ export const layer = Layer.effect(
             "Another Stark Code server, such as the background service, is using this data directory. Stop that server and reopen Stark Code, or set a separate STARK_CODE_HOME and pair with the running server.",
           )
           .pipe(Effect.andThen(electronApp.quit)),
+      // 79–83: the data is newer, divergent, failed its backup or migration,
+      // or is held by an update. Restarting cannot change that; say why and quit.
+      onTerminalExit: (exitCode) =>
+        Effect.gen(function* () {
+          const metadata = Option.isSome(environment)
+            ? { appVersion: environment.value.appVersion, stateDir: environment.value.stateDir }
+            : { appVersion: (yield* electronApp.metadata).appVersion, stateDir: null };
+          yield* DesktopTerminalExitNotice.showTerminalExitNotice({
+            exitCode,
+            runningVersion: metadata.appVersion,
+            stateDir: metadata.stateDir,
+          });
+        }).pipe(
+          Effect.provideService(ElectronDialog.ElectronDialog, electronDialog),
+          Effect.provideService(ElectronApp.ElectronApp, electronApp),
+          Effect.ignore,
+        ),
     });
 
     const instancesRef = yield* SynchronizedRef.make<

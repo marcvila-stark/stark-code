@@ -36,6 +36,7 @@ vi.mock("electron", async () => {
           this.url = url;
         }),
         reload: vi.fn(),
+        stop: vi.fn(),
         capturePage: vi.fn(async () => ({
           isEmpty: () => false,
           toDataURL: () => "data:image/png;base64,aGVsbG8=",
@@ -77,6 +78,7 @@ type MockView = {
   webContents: NodeEvents.EventEmitter & {
     loadURL: ReturnType<typeof vi.fn>;
     reload: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
     capturePage: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
     setWindowOpenHandler: ReturnType<typeof vi.fn>;
@@ -721,5 +723,110 @@ describe("Pages personal browser session reuse", () => {
     expect(mocks.views).toHaveLength(0);
     await mountImported();
     expect(current().visible).toBe(true);
+  });
+});
+
+describe("bounded Pages loading", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("stops a stalled navigation after 15 seconds, keeps its session, and gives retry a fresh budget", async () => {
+    await mount();
+    const view = current();
+    view.loading = true;
+    expect(controller.getState()).toMatchObject({ loading: true });
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(view.webContents.stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(view.webContents.stop).toHaveBeenCalledOnce();
+    expect(controller.getState()).toMatchObject({
+      loading: false,
+      signInRequired: false,
+      error: expect.stringContaining("15 seconds"),
+    });
+    view.loading = false;
+    view.webContents.emit("did-stop-loading");
+    expect(controller.getState().error).toContain("15 seconds");
+    controller.navigate({ viewId: "lease-a", action: "reload" });
+    expect(controller.getState()).toMatchObject({ loading: true, error: undefined });
+    expect(current()).toBe(view);
+    expect(view.webContents.close).not.toHaveBeenCalled();
+    expect(mocks.openExternal).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(view.webContents.stop).toHaveBeenCalledOnce();
+    view.webContents.emit("did-stop-loading");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(view.webContents.stop).toHaveBeenCalledOnce();
+    expect(controller.getState()).toMatchObject({ loading: false, error: undefined });
+  });
+
+  it.each([
+    [-106, "offline"],
+    [-105, "address could not be found"],
+    [-118, "timed out"],
+    [-21, "network changed"],
+    [-202, "secure connection"],
+    [-2, "could not be reached"],
+  ])("reports network error %s without claiming login expired", async (code, message) => {
+    await mount();
+    const view = current();
+    view.title = "Sign in to Pages";
+    view.webContents.emit(
+      "did-fail-load",
+      {},
+      code,
+      "private raw diagnostic",
+      PAGES_WEBSITE_HOME,
+      true,
+    );
+    view.webContents.emit("page-title-updated");
+    expect(controller.getState()).toMatchObject({ loading: false, signInRequired: false });
+    expect(controller.getState().error).toContain(message);
+    expect(controller.getState().error).not.toContain("private raw diagnostic");
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(view.webContents.stop).not.toHaveBeenCalled();
+    expect(mocks.openExternal).not.toHaveBeenCalled();
+  });
+
+  it("does not treat aborted navigation or a failed subframe as a failed website", async () => {
+    await mount();
+    current().webContents.emit("did-fail-load", {}, -3, "abort", PAGES_WEBSITE_HOME, true);
+    current().webContents.emit("did-fail-load", {}, -106, "offline", PAGES_WEBSITE_HOME, false);
+    expect(controller.getState()).toMatchObject({ loading: true, error: undefined });
+    current().webContents.emit("did-stop-loading");
+    expect(controller.getState()).toMatchObject({ loading: false, error: undefined });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(current().webContents.stop).not.toHaveBeenCalled();
+  });
+
+  it("discards an old load promise rejection after retry", async () => {
+    await mount();
+    let rejectOld!: (error: Error) => void;
+    current().webContents.loadURL.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectOld = reject;
+        }),
+    );
+    controller.navigate({ viewId: "lease-a", action: "home" });
+    controller.navigate({ viewId: "lease-a", action: "reload" });
+    rejectOld(Object.assign(new Error("obsolete private failure"), { errno: -106 }));
+    await Promise.resolve();
+    expect(controller.getState()).toMatchObject({ loading: true, error: undefined });
+  });
+
+  it("keeps the same timeout budget across redirects and cancels it on disposal", async () => {
+    await mount();
+    const view = current();
+    await vi.advanceTimersByTimeAsync(10_000);
+    view.webContents.emit("did-start-loading");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(controller.getState().error).toContain("15 seconds");
+    controller.navigate({ viewId: "lease-a", action: "reload" });
+    controller.dispose();
+    const sends = window.webContents.send.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(window.webContents.send).toHaveBeenCalledTimes(sends);
+    expect(view.webContents.stop).toHaveBeenCalledOnce();
   });
 });

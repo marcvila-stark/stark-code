@@ -3,7 +3,11 @@ import * as NodeAssert from "node:assert/strict";
 import { describe, it } from "vite-plus/test";
 import type * as EffectCodexSchema from "effect-codex-app-server/schema";
 
-import { describeMcpElicitation, toMcpElicitationResponse } from "./CodexMcpElicitation.ts";
+import {
+  describeMcpElicitation,
+  mcpToolApprovalTarget,
+  toMcpElicitationResponse,
+} from "./CodexMcpElicitation.ts";
 
 describe("Codex MCP elicitation approvals", () => {
   const request = {
@@ -32,14 +36,14 @@ describe("Codex MCP elicitation approvals", () => {
     },
   } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
 
-  it("preserves the app name and advertised persistence choices", () => {
+  it("preserves the app name and the session choice, and never offers Always", () => {
+    // Codex does not say what "always" saves, so the card could not show it.
     NodeAssert.deepStrictEqual(describeMcpElicitation(request), {
       appName: "Safari",
       options: [
         { decision: "cancel", label: "Cancel" },
         { decision: "decline", label: "Decline" },
         { decision: "acceptForSession", label: "Allow for this session" },
-        { decision: "acceptAlways", label: "Always allow Safari" },
         { decision: "accept", label: "Approve" },
       ],
     });
@@ -99,7 +103,7 @@ describe("Codex MCP elicitation approvals", () => {
     } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
 
     NodeAssert.ok(
-      describeMcpElicitation(booleanRequest).options.some(
+      !describeMcpElicitation(booleanRequest).options.some(
         (option) => option.decision === "acceptAlways",
       ),
     );
@@ -139,7 +143,7 @@ describe("Codex MCP elicitation approvals", () => {
 
     NodeAssert.equal(describeMcpElicitation(nullableRequest).appName, "Safari");
     NodeAssert.ok(
-      describeMcpElicitation(nullableRequest).options.some(
+      !describeMcpElicitation(nullableRequest).options.some(
         (option) => option.decision === "acceptAlways",
       ),
     );
@@ -204,5 +208,102 @@ describe("Codex MCP elicitation approvals", () => {
       { decision: "decline", label: "Decline" },
       { decision: "accept", label: "Approve" },
     ]);
+  });
+
+  it("never answers a required field with a default the user did not see", () => {
+    const defaultedRequest = {
+      ...request,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          approval: { type: "string", oneOf: [{ const: "once", title: "Allow once" }] },
+          scope: { type: "string", default: "all-repositories" },
+        },
+        required: ["approval", "scope"],
+      },
+    } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+    NodeAssert.deepStrictEqual(toMcpElicitationResponse(defaultedRequest, "accept"), {
+      action: "decline",
+    });
+    // An optional defaulted field is left for the server to fill.
+    NodeAssert.deepStrictEqual(
+      toMcpElicitationResponse(
+        {
+          ...defaultedRequest,
+          requestedSchema: { ...defaultedRequest.requestedSchema, required: ["approval"] },
+        },
+        "accept",
+      ),
+      { action: "accept", content: { approval: "once" } },
+    );
+  });
+
+  const toolApproval = {
+    mode: "form",
+    message: 'Allow the stark-pages MCP server to run tool "publish"?',
+    serverName: "stark-pages",
+    threadId: "provider-thread-1",
+    turnId: "turn-1",
+    _meta: {
+      codex_approval_kind: "mcp_tool_call",
+      persist: ["session", "always"],
+      tool_title: "Publish page",
+      tool_params: { project: "site", path: "index.html" },
+    },
+    requestedSchema: { type: "object", properties: {} },
+  } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+  it("asks afresh for every Stark Pages publish", () => {
+    // The Pages MCP server's write tools are named `pages_…`.
+    NodeAssert.deepStrictEqual(
+      describeMcpElicitation({
+        ...toolApproval,
+        _meta: { ...toolApproval._meta, tool_name: "pages_upload_files" },
+      }).options.map((option) => option.decision),
+      ["cancel", "decline", "accept"],
+    );
+    // A shell tool whose command may publish gets no session approval either.
+    NodeAssert.deepStrictEqual(
+      describeMcpElicitation({
+        ...toolApproval,
+        serverName: "terminal",
+        message: 'Allow the terminal MCP server to run tool "shell"?',
+        _meta: {
+          ...toolApproval._meta,
+          tool_name: "shell",
+          tool_params: { command: "$CMD publish ./site" },
+        },
+      }).options.map((option) => option.decision),
+      ["cancel", "decline", "accept"],
+    );
+    NodeAssert.ok(
+      describeMcpElicitation({
+        ...toolApproval,
+        serverName: "terminal",
+        message: 'Allow the terminal MCP server to run tool "shell"?',
+        _meta: { ...toolApproval._meta, tool_name: "shell", tool_params: { command: "npm test" } },
+      }).options.some((option) => option.decision === "acceptForSession"),
+    );
+    NodeAssert.ok(
+      describeMcpElicitation({
+        ...toolApproval,
+        serverName: "github",
+        message: 'Allow the github MCP server to run tool "create_issue"?',
+        _meta: { ...toolApproval._meta, tool_title: "Create issue", tool_params: { title: "Bug" } },
+      }).options.some((option) => option.decision === "acceptForSession"),
+    );
+  });
+
+  it("reads a tool approval's own call from its metadata, and nothing else", () => {
+    NodeAssert.deepStrictEqual(mcpToolApprovalTarget(toolApproval), {
+      server: "stark-pages",
+      tool: undefined,
+      title: "Publish page",
+      arguments: { project: "site", path: "index.html" },
+    });
+    NodeAssert.equal(mcpToolApprovalTarget(request), undefined);
+    const { tool_params: _params, ...withoutParams } = toolApproval._meta;
+    NodeAssert.equal(mcpToolApprovalTarget({ ...toolApproval, _meta: withoutParams }), undefined);
   });
 });

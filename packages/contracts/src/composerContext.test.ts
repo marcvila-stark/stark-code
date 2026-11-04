@@ -309,4 +309,37 @@ describe("OrchestrationMessageContext", () => {
     });
     expect(command.type === "message.dispatch" && command.context?.records[0]?.kind).toBe("image");
   });
+
+  it("links a review comment to its turn only when the record names one", () => {
+    const linked = decodeRecord({ ...knownRecords["review-comment"], runId: "run-5" });
+    expect(Option.getOrThrow(linked)).toMatchObject({ runId: "run-5" });
+    const unlinked = Option.getOrThrow(decodeRecord(knownRecords["review-comment"]));
+    expect(unlinked).not.toHaveProperty("runId");
+    expect(Option.isNone(decodeRecord({ ...knownRecords["review-comment"], runId: "  " }))).toBe(
+      true,
+    );
+  });
+
+  it("decodes stored human shell messages with and without a check", () => {
+    const message = {
+      createdBy: "user",
+      creationSource: "web",
+      id: "m1",
+      threadId: "t1",
+      runId: "run-6",
+      nodeId: null,
+      role: "user",
+      text: "vp test",
+      attachments: [],
+      streaming: false,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      userShell: { command: "vp test", respond: false },
+    };
+    expect(decodeMessage(message).userShell).toEqual({ command: "vp test", respond: false });
+    const check = { subjectRunId: "run-5", scriptId: "test", scriptName: "Test" };
+    expect(
+      decodeMessage({ ...message, userShell: { ...message.userShell, check } }).userShell,
+    ).toEqual({ command: "vp test", respond: false, check });
+  });
 });

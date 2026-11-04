@@ -25,6 +25,7 @@ import {
   type ServerSettings,
   type ServerProviderState,
 } from "@starkfuture/contracts";
+import { orderByAutomaticProviderPreference } from "@starkfuture/shared/model";
 import {
   normalizeProviderAccentColor,
   resolveProviderInstanceDisplayName,
@@ -299,9 +300,9 @@ const isSelectableProviderInstanceEntry = (entry: ProviderInstanceEntry): boolea
 /**
  * Resolve an exact stored instance when it remains enabled and available.
  * Otherwise choose a deterministic fallback that can plausibly start now:
- * ready first, then a non-error probe result. An errored provider is retained
- * only when it was explicitly requested; it is never invented as a new-user
- * default.
+ * ready first, then a non-error probe result, Claude ahead of other drivers
+ * within each tier. An errored provider is retained only when it was
+ * explicitly requested; it is never invented as a new-user default.
  */
 export function resolveSelectableProviderInstanceEntry(
   entries: ReadonlyArray<ProviderInstanceEntry>,
@@ -313,9 +314,10 @@ export function resolveSelectableProviderInstanceEntry(
       return requested;
     }
   }
+  const automatic = orderByAutomaticProviderPreference(entries, (entry) => entry.driverKind);
   return (
-    entries.find(isProviderInstancePickerReady) ??
-    entries.find((entry) => isSelectableProviderInstanceEntry(entry) && entry.status !== "error")
+    automatic.find(isProviderInstancePickerReady) ??
+    automatic.find((entry) => isSelectableProviderInstanceEntry(entry) && entry.status !== "error")
   );
 }
 

@@ -3,6 +3,11 @@ import type { DesktopUpdateActionResult, DesktopUpdateState } from "@starkfuture
 
 import {
   canCheckForUpdate,
+  describeDesktopUpdateActionOutcome,
+  describeDesktopUpdatePaletteAction,
+  describeDesktopUpdateState,
+  formatDesktopUpdateProgress,
+  getDesktopUpdateReadyPromptVersion,
   getArm64IntelBuildWarningDescription,
   getDesktopUpdateActionError,
   getDesktopUpdateButtonTooltip,
@@ -54,7 +59,6 @@ describe("desktop update button state", () => {
       canRetry: true,
     };
     expect(resolveDesktopUpdateButtonAction(state)).toBe("download");
-    expect(getDesktopUpdateButtonTooltip(state)).toContain("Click to retry");
   });
 
   it("says when the same version did not apply before", () => {
@@ -66,7 +70,7 @@ describe("desktop update button state", () => {
       notAppliedVersion: "1.1.0",
     };
     expect(getDesktopUpdateButtonTooltip(state)).toBe(
-      "Update 1.1.0 did not apply. Click to retry.",
+      "Stark Code 1.1.0 is ready\n1.1.0 didn't install last time. Try again.",
     );
     expect(
       getDesktopUpdateButtonTooltip({
@@ -74,7 +78,7 @@ describe("desktop update button state", () => {
         availableVersion: "1.2.0",
         downloadedVersion: "1.2.0",
       }),
-    ).toContain("1.2.0 downloaded");
+    ).toContain("Stark Code 1.2.0 is ready");
   });
 
   it("keeps install action available after an install error", () => {
@@ -88,7 +92,6 @@ describe("desktop update button state", () => {
       canRetry: true,
     };
     expect(resolveDesktopUpdateButtonAction(state)).toBe("install");
-    expect(getDesktopUpdateButtonTooltip(state)).toContain("Click to retry");
   });
 
   it("keeps install action available after a background updater error", () => {
@@ -102,7 +105,6 @@ describe("desktop update button state", () => {
       canRetry: true,
     };
     expect(resolveDesktopUpdateButtonAction(state)).toBe("install");
-    expect(getDesktopUpdateButtonTooltip(state)).toContain("Click to restart and install");
   });
 
   it("prefers a newly available release over a stale downloaded version", () => {
@@ -273,7 +275,7 @@ describe("desktop update UI helpers", () => {
         availableVersion: "1.1.0",
         downloadedVersion: "1.1.1",
       }),
-    ).toContain("Install update 1.1.1 and restart Stark Code?");
+    ).toContain("Restart Stark Code to install 1.1.1?");
   });
 
   it("falls back to generic install confirmation copy when no version is available", () => {
@@ -282,17 +284,17 @@ describe("desktop update UI helpers", () => {
         availableVersion: null,
         downloadedVersion: null,
       }),
-    ).toContain("Install update and restart Stark Code?");
+    ).toContain("Restart Stark Code to install the update?");
   });
 
-  it("keeps the same install confirmation copy across desktop platforms", () => {
+  it("promises nothing is interrupted, because a busy app refuses to restart", () => {
     expect(
       getDesktopUpdateInstallConfirmationMessage({
         availableVersion: "1.1.0",
         downloadedVersion: "1.1.0",
       }),
     ).toBe(
-      "Install update 1.1.0 and restart Stark Code?\n\nAny running tasks will be interrupted. Make sure you're ready before continuing.",
+      "Restart Stark Code to install 1.1.0?\n\nYour drafts are saved first. Stark Code won't restart while a task is running or waiting for your approval.",
     );
   });
 });
@@ -354,10 +356,299 @@ describe("canCheckForUpdate", () => {
 });
 
 describe("getDesktopUpdateButtonTooltip", () => {
-  it("returns 'Up to date' for non-actionable states", () => {
-    expect(getDesktopUpdateButtonTooltip({ ...baseState, status: "idle" })).toBe("Up to date");
-    expect(getDesktopUpdateButtonTooltip({ ...baseState, status: "up-to-date" })).toBe(
-      "Up to date",
+  it("says 'Up to date' only after a successful check", () => {
+    expect(getDesktopUpdateButtonTooltip({ ...baseState, status: "idle" })).toBe("Not checked yet");
+    expect(
+      getDesktopUpdateButtonTooltip(
+        { ...baseState, status: "up-to-date", checkedAt: "2026-10-30T14:02:00.000Z" },
+        { formatTime: () => "14:02" },
+      ),
+    ).toBe("Up to date\nChecked at 14:02.");
+    expect(
+      getDesktopUpdateButtonTooltip({
+        ...baseState,
+        enabled: false,
+        status: "disabled",
+        disabledReason: {
+          code: "development-build",
+          message: "Automatic updates are off: this is a development build.",
+        },
+      }),
+    ).toBe("Updates are off\nAutomatic updates are off: this is a development build.");
+  });
+});
+
+const formatTime = (iso: string) => iso.slice(11, 16);
+
+describe("describeDesktopUpdateState", () => {
+  it.each([
+    [
+      "disabled without a reason",
+      { enabled: false, status: "disabled" },
+      "Updates are off",
+      "This build can't update itself.",
+      null,
+    ],
+    ["idle", { status: "idle" }, "Not checked yet", null, "Check for updates"],
+    ["checking", { status: "checking" }, "Checking for updates…", null, null],
+    [
+      "a failed check",
+      {
+        status: "error",
+        errorContext: "check",
+        errorKind: "unreachable",
+        message: "Couldn't reach the update server.",
+      },
+      "Couldn't check for updates",
+      "Couldn't reach the update server.",
+      "Try again",
+    ],
+    [
+      "verifying",
+      { status: "verifying", availableVersion: "1.1.0" },
+      "Checking the download…",
+      "Making sure 1.1.0 is signed by Stark Future.",
+      null,
+    ],
+    [
+      "preparing",
+      { status: "preparing", downloadedVersion: "1.1.0" },
+      "Saving your work…",
+      "Checking that no task or approval would be interrupted.",
+      null,
+    ],
+    ["restarting", { status: "restarting" }, "Restarting to update…", null, null],
+  ] as const)("%s", (_name, overrides, headline, detail, primary) => {
+    const presentation = describeDesktopUpdateState({ ...baseState, ...overrides }, { formatTime });
+    expect(presentation.headline).toBe(headline);
+    expect(presentation.detail).toBe(detail);
+    expect(presentation.primary?.label ?? null).toBe(primary);
+  });
+
+  it("shows byte progress and offers Cancel while downloading", () => {
+    const state: DesktopUpdateState = {
+      ...baseState,
+      status: "downloading",
+      availableVersion: "1.1.0",
+      downloadPercent: 45.4,
+      downloadProgress: {
+        transferredBytes: 38_000_000,
+        totalBytes: 84_000_000,
+        bytesPerSecond: 5_000_000,
+      },
+    };
+    expect(formatDesktopUpdateProgress(state)).toBe("45% · 38 of 84 MB");
+    const presentation = describeDesktopUpdateState(state);
+    expect(presentation.headline).toBe("Downloading 1.1.0");
+    expect(presentation.primary).toEqual({ intent: "cancel", label: "Cancel" });
+  });
+
+  it("names a failed download and when it retries", () => {
+    const presentation = describeDesktopUpdateState(
+      {
+        ...baseState,
+        status: "available",
+        availableVersion: "1.1.0",
+        errorContext: "download",
+        errorKind: "unreachable",
+        message: "Couldn't reach the update server to download 1.1.0.",
+        downloadRetry: { attempt: 1, nextAttemptAt: "2026-10-30T14:05:00.000Z" },
+      },
+      { formatTime },
     );
+    expect(presentation.detail).toBe(
+      "Couldn't reach the update server to download 1.1.0. Trying again at 14:05.",
+    );
+    expect(presentation.primary).toEqual({ intent: "download", label: "Try again" });
+    expect(presentation.secondary).toEqual({ intent: "cancel", label: "Cancel" });
+  });
+
+  it("offers Restart and Later when ready, and the way back from Later", () => {
+    const ready: DesktopUpdateState = {
+      ...baseState,
+      status: "downloaded",
+      availableVersion: "1.1.0",
+      downloadedVersion: "1.1.0",
+    };
+    const presentation = describeDesktopUpdateState(ready);
+    expect(presentation.headline).toBe("Stark Code 1.1.0 is ready");
+    expect(presentation.primary).toEqual({ intent: "install", label: "Restart to update" });
+    expect(presentation.secondary).toEqual({ intent: "postpone", label: "Later" });
+
+    const postponed = describeDesktopUpdateState(
+      { ...ready, postponedUntil: "2026-10-31T14:00:00.000Z" },
+      { now: Date.parse("2026-10-30T14:00:00.000Z"), formatTime },
+    );
+    expect(postponed.detail).toBe("Reminders are paused until 14:00.");
+    expect(postponed.primary?.intent).toBe("install");
+    expect(postponed.secondary).toEqual({ intent: "resume-reminders", label: "Remind me" });
+  });
+
+  it("explains a blocked restart without offering to restart anyway", () => {
+    const presentation = describeDesktopUpdateState({
+      ...baseState,
+      status: "downloaded",
+      downloadedVersion: "1.1.0",
+      installBlockers: [{ kind: "active-task", message: "A task is running.", count: 1 }],
+      message: "Stark Code can't restart yet: 1 task is running.",
+    });
+    expect(presentation.tone).toBe("warning");
+    expect(presentation.detail).toBe("Stark Code can't restart yet: 1 task is running.");
+    expect(presentation.primary).toEqual({ intent: "install", label: "Restart to update" });
+    expect(JSON.stringify(presentation)).not.toMatch(/anyway/i);
+  });
+
+  it("says when a late-staged update installs", () => {
+    expect(
+      describeDesktopUpdateState({
+        ...baseState,
+        status: "downloaded",
+        downloadedVersion: "1.1.0",
+        stagedVersion: "1.1.0",
+      }).detail,
+    ).toBe("1.1.0 installs the next time you quit Stark Code.");
+  });
+});
+
+describe("describeDesktopUpdateActionOutcome", () => {
+  it("reports every manual check result, including updates being off", () => {
+    expect(
+      describeDesktopUpdateActionOutcome("check", {
+        checked: false,
+        state: {
+          ...baseState,
+          enabled: false,
+          status: "disabled",
+          disabledReason: { code: "feed-not-configured", message: "No feed." },
+        },
+      }),
+    ).toEqual({ type: "info", title: "Updates are off", description: "No feed." });
+    expect(
+      describeDesktopUpdateActionOutcome("check", {
+        checked: true,
+        state: { ...baseState, status: "up-to-date" },
+      }),
+    ).toEqual({
+      type: "success",
+      title: "You're up to date",
+      description: "Stark Code 1.0.0 is the newest version.",
+    });
+    expect(
+      describeDesktopUpdateActionOutcome("check", {
+        checked: true,
+        state: { ...baseState, status: "error", message: "Couldn't reach the update server." },
+      })?.type,
+    ).toBe("error");
+    // A failed check that kept a known update still says it failed.
+    expect(
+      describeDesktopUpdateActionOutcome("check", {
+        checked: true,
+        state: {
+          ...baseState,
+          status: "available",
+          availableVersion: "1.1.0",
+          checkedAt: "2026-10-30T14:00:00.000Z",
+          lastCheckError: {
+            kind: "unreachable",
+            message: "Couldn't reach the update server.",
+            at: "2026-10-30T14:00:00.000Z",
+          },
+        },
+      }),
+    ).toEqual({
+      type: "error",
+      title: "Couldn't check for updates",
+      description: "Couldn't reach the update server.",
+    });
+  });
+
+  it("reports a blocked restart as a warning and a failed install as an error", () => {
+    const blocked = {
+      ...baseState,
+      status: "downloaded" as const,
+      downloadedVersion: "1.1.0",
+      installBlockers: [{ kind: "pending-approval" as const, message: "", count: 1 }],
+      message: "Stark Code can't restart yet: 1 task is waiting for your approval.",
+    };
+    expect(
+      describeDesktopUpdateActionOutcome("install", {
+        accepted: false,
+        completed: false,
+        state: blocked,
+      }),
+    ).toEqual({
+      type: "warning",
+      title: "Stark Code can't restart yet",
+      description: "Stark Code can't restart yet: 1 task is waiting for your approval.",
+    });
+    expect(
+      describeDesktopUpdateActionOutcome("install", {
+        accepted: true,
+        completed: false,
+        state: {
+          ...baseState,
+          status: "downloaded",
+          downloadedVersion: "1.1.0",
+          errorContext: "install",
+          message: "Couldn't install 1.1.0. Stark Code kept running.",
+        },
+      })?.type,
+    ).toBe("error");
+  });
+});
+
+describe("getDesktopUpdateReadyPromptVersion", () => {
+  const ready: DesktopUpdateState = {
+    ...baseState,
+    status: "downloaded",
+    availableVersion: "1.1.0",
+    downloadedVersion: "1.1.0",
+  };
+  const now = Date.parse("2026-10-30T14:00:00.000Z");
+
+  it("prompts for a ready update unless postponed, blocked or failed", () => {
+    expect(getDesktopUpdateReadyPromptVersion(ready, now)).toBe("1.1.0");
+    expect(
+      getDesktopUpdateReadyPromptVersion(
+        { ...ready, postponedUntil: "2026-10-31T14:00:00.000Z" },
+        now,
+      ),
+    ).toBeNull();
+    expect(
+      getDesktopUpdateReadyPromptVersion(
+        { ...ready, postponedUntil: "2026-10-29T14:00:00.000Z" },
+        now,
+      ),
+    ).toBe("1.1.0");
+    expect(
+      getDesktopUpdateReadyPromptVersion(
+        { ...ready, installBlockers: [{ kind: "active-task", message: "" }] },
+        now,
+      ),
+    ).toBeNull();
+    expect(getDesktopUpdateReadyPromptVersion({ ...baseState, status: "available" }, now)).toBe(
+      null,
+    );
+  });
+});
+
+describe("describeDesktopUpdatePaletteAction", () => {
+  it("offers the next step for the state, and a check that explains when updates are off", () => {
+    expect(describeDesktopUpdatePaletteAction(null)).toBeNull();
+    expect(
+      describeDesktopUpdatePaletteAction({
+        ...baseState,
+        status: "downloaded",
+        downloadedVersion: "1.1.0",
+      })?.title,
+    ).toBe("Restart to update to 1.1.0");
+    expect(
+      describeDesktopUpdatePaletteAction({
+        ...baseState,
+        enabled: false,
+        status: "disabled",
+        disabledReason: { code: "turned-off", message: "Turned off." },
+      }),
+    ).toEqual({ intent: "check", title: "Check for updates", description: "Turned off." });
   });
 });

@@ -2,6 +2,7 @@ import type { ProjectionRecordField } from "../orchestration-v2/ProjectionStore.
 import {
   CommandId,
   OrchestratorMcpFailure,
+  permissionSourceOf,
   type ProjectId,
   type ProviderInteractionMode,
   type RuntimeMode,
@@ -12,8 +13,8 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 
 import type { OrchestratorV2Error } from "../orchestration-v2/Orchestrator.ts";
+import * as PermissionContainment from "../orchestration-v2/PermissionContainment.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
-import * as OrchestrationMcp from "./OrchestratorMcpService.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
 export const unavailable = () =>
@@ -39,21 +40,18 @@ export const dispatchFailure = (
       : unavailable();
 
 /**
- * The most a caller may hand to the threads it targets. A thread caller is
- * capped by its own thread's modes; an OAuth client by the ceiling chosen
- * when it was approved.
+ * The most a caller may hand to the threads it targets, and whether it may
+ * change the environment itself. A thread caller is capped by the preset its
+ * provider really runs, not the one stored on the thread; an OAuth client by
+ * the ceiling chosen when it was approved.
  */
-export interface CallerLimits {
-  readonly runtimeMode: RuntimeMode;
-  readonly interactionMode: ProviderInteractionMode;
-}
+export type CallerLimits = PermissionContainment.StarkLimits;
 
 export interface Caller {
   readonly scope: McpInvocationContext.McpInvocationScope;
   readonly threads: ThreadManagement.ThreadManagementService["Service"];
   /** The calling thread, absent for a client signed in from outside Stark. */
   readonly caller: OrchestrationV2ThreadShell | undefined;
-  readonly limits: CallerLimits;
 }
 
 export const readCaller = Effect.fn("mcp.readCaller")(function* () {
@@ -68,22 +66,14 @@ export const readCaller = Effect.fn("mcp.readCaller")(function* () {
 });
 
 /**
- * The caller and its limits, whichever tools its credential grants. Tools
- * check their own capability; `McpToolAccess` uses this for every tool.
+ * The caller, whichever tools its credential grants. Tools check their own
+ * capability; `McpToolAccess` uses this for every tool.
  */
 export const loadCaller = Effect.fn("mcp.loadCaller")(function* () {
   const scope = yield* McpInvocationContext.McpInvocationContext;
   const threads = yield* ThreadManagement.ThreadManagementService;
   if (scope.thread === undefined) {
-    return {
-      scope,
-      threads,
-      caller: undefined,
-      limits: {
-        runtimeMode: McpInvocationContext.clientRuntimeModeCeiling(scope.client),
-        interactionMode: "default",
-      },
-    } satisfies Caller;
+    return { scope, threads, caller: undefined } satisfies Caller;
   }
   const caller = yield* threads
     .getThreadShell(scope.thread.threadId)
@@ -94,28 +84,66 @@ export const loadCaller = Effect.fn("mcp.loadCaller")(function* () {
       message: "The calling thread was not found.",
     });
   }
-  return {
-    scope,
-    threads,
+  return { scope, threads, caller } satisfies Caller;
+});
+
+/**
+ * The caller's limits. A thread caller's come from the provider its MCP
+ * credential belongs to, since the brand runs every non-Claude session
+ * Supervised whatever the thread stored; nothing is read for a thread that
+ * stored Supervised or inherits, which grants Supervised either way.
+ */
+export const loadLimits = Effect.fn("mcp.loadLimits")(function* ({
+  scope,
+  threads,
+  caller,
+}: Caller) {
+  if (caller === undefined) {
+    return PermissionContainment.clientLimits(
+      McpInvocationContext.clientRuntimeModeCeiling(scope.client),
+    );
+  }
+  if (caller.runtimeMode === "approval-required" || permissionSourceOf(caller) === "inherit") {
+    return PermissionContainment.threadLimits(caller, undefined);
+  }
+  const records = yield* threads
+    .getThreadRecords(caller.id, ["providerSessions", "providerThreads"])
+    .pipe(Effect.mapError(unavailable));
+  return PermissionContainment.threadLimits(
     caller,
-    limits: { runtimeMode: caller.runtimeMode, interactionMode: caller.interactionMode },
-  } satisfies Caller;
+    PermissionContainment.providerFactsFromRecords({
+      providerInstanceId: caller.providerInstanceId,
+      providerSessionId: scope.thread?.providerSessionId,
+      providerSessions: records.providerSessions,
+      providerThreads: records.providerThreads,
+    }),
+  );
 });
 
 /**
  * A caller may change another thread only if that thread runs within the
- * caller's own modes. Its own thread is always within them.
+ * caller's own modes. Its own thread is always within them. A target that
+ * follows its provider's own settings counts as the broadest preset.
  */
 export const assertTargetWithinLimits = (
   limits: CallerLimits,
   target: { readonly runtimeMode: RuntimeMode; readonly interactionMode: ProviderInteractionMode },
-) =>
-  OrchestrationMcp.resolveRuntimeMode(limits.runtimeMode, target.runtimeMode).pipe(
-    Effect.andThen(
-      OrchestrationMcp.resolveInteractionMode(limits.interactionMode, target.interactionMode),
-    ),
-    Effect.asVoid,
-  );
+) => {
+  const exceeded = PermissionContainment.exceededLimit(limits, target);
+  return exceeded === undefined
+    ? Effect.void
+    : Effect.fail(
+        exceeded === "runtime"
+          ? new OrchestratorMcpFailure({
+              code: "runtime_mode_escalation_denied",
+              message: `Thread runtime mode ${PermissionContainment.targetPreset(target)} is broader than this caller's ${limits.runtimeMode}.`,
+            })
+          : new OrchestratorMcpFailure({
+              code: "interaction_mode_escalation_denied",
+              message: `Thread interaction mode ${target.interactionMode} is broader than this caller's ${limits.interactionMode}.`,
+            }),
+      );
+};
 
 /**
  * A thread caller acts only while it owns a live run of a thread that is not
@@ -137,14 +165,19 @@ export function assertLiveCaller({ caller, scope }: Caller) {
 }
 
 /**
- * Actions that change the environment itself (projects, preferences) need full
- * access: a thread caller in full-access/default mode, or a client approved
- * with a full-access ceiling.
+ * Actions that change the environment itself (projects, preferences) need
+ * Stark's environment authority: a thread whose provider really runs Bypass
+ * outside Plan, or a client approved with a full-access ceiling. A clamped
+ * thread that only stored full-access does not hold it.
  */
 export const assertFullAccess = (context: Caller, message: string) =>
-  context.limits.runtimeMode === "full-access" && context.limits.interactionMode === "default"
-    ? Effect.void
-    : Effect.fail(new OrchestratorMcpFailure({ code: "capability_denied", message }));
+  loadLimits(context).pipe(
+    Effect.flatMap((limits) =>
+      limits.authority === "environment"
+        ? Effect.void
+        : Effect.fail(new OrchestratorMcpFailure({ code: "capability_denied", message })),
+    ),
+  );
 
 /** A target project: the one passed, else the calling thread's. */
 export const resolveProjectId = (context: Caller, projectId: ProjectId | undefined) =>

@@ -4,6 +4,8 @@ import {
   CloudPublicConfigMissingError,
   hasCloudPublicConfig,
   resolveRelayClerkTokenOptions,
+  resolveCloudPublicConfig,
+  resolveRelayTracingConfig,
 } from "./publicConfig.ts";
 
 afterEach(() => {
@@ -11,7 +13,7 @@ afterEach(() => {
 });
 
 describe("hasCloudPublicConfig", () => {
-  it("requires both public cloud values", () => {
+  it("keeps the local build offline despite ambient cloud values", () => {
     vi.stubEnv("VITE_CLERK_PUBLISHABLE_KEY", "");
     vi.stubEnv("VITE_CLERK_JWT_TEMPLATE", "");
     vi.stubEnv("VITE_STARK_CODE_RELAY_URL", "");
@@ -24,7 +26,9 @@ describe("hasCloudPublicConfig", () => {
     expect(hasCloudPublicConfig()).toBe(false);
 
     vi.stubEnv("VITE_STARK_CODE_RELAY_URL", "https://relay.example.test");
-    expect(hasCloudPublicConfig()).toBe(true);
+    expect(hasCloudPublicConfig()).toBe(false);
+    expect(resolveCloudPublicConfig().relayUrl).toBeNull();
+    expect(resolveRelayTracingConfig()).toBeNull();
   });
 
   it("rejects an insecure relay URL", () => {

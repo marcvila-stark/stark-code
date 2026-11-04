@@ -81,7 +81,7 @@ export async function loadMcpBridge(
       "async function",
     ),
   );
-  await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
+  await NodeVM.runInNewContext(`${source}\nstarkMcpExtension(pi)`, {
     process: {
       env: {
         STARK_MCP_URL: "http://fixture.invalid/mcp",

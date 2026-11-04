@@ -1,3 +1,4 @@
+import * as DesktopBrowserCapture from "../browserCapture/DesktopBrowserCapture.ts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -31,6 +32,7 @@ import * as DesktopServerExposure from "../backend/DesktopServerExposure.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopShellEnvironment from "../shell/DesktopShellEnvironment.ts";
 import * as DesktopState from "./DesktopState.ts";
+import * as DesktopRecoveryStartup from "../recovery/DesktopRecoveryStartup.ts";
 import * as DesktopRemoteUpdates from "../updates/DesktopRemoteUpdates.ts";
 import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
 import * as DesktopSnapShot from "../snapShot/DesktopSnapShot.ts";
@@ -171,6 +173,9 @@ const bootstrap = Effect.gen(function* () {
   const appActivation = yield* DesktopAppActivation.DesktopAppActivation;
   yield* logBootstrapInfo("bootstrap start");
 
+  // A restore the user chose runs before any backend opens the data; it may
+  // replace the desktop settings, so they are read after it.
+  yield* DesktopRecoveryStartup.runPendingRestore();
   const settings = yield* desktopSettings.get;
   // The renderer is served from the bundled client (or Vite in development)
   // rather than through the local backend, so the window can open without one.
@@ -190,6 +195,9 @@ const bootstrap = Effect.gen(function* () {
   );
 
   yield* snapShot.initialize;
+  yield* (yield* DesktopBrowserCapture.DesktopBrowserCapture).initialize.pipe(
+    Effect.catch((error) => Effect.logError(error)),
+  );
 
   if (!settings.localEnvironmentEnabled) {
     yield* logBootstrapInfo("bootstrap skipping local environment (disabled in settings)");
@@ -254,6 +262,15 @@ const bootstrap = Effect.gen(function* () {
     }
     yield* primaryBackend.start;
     yield* logBootstrapInfo("bootstrap backend start requested");
+    // Once it is ready: record this good boot's data locations, and offer
+    // Resume while a restore's recovery hold pauses background work.
+    yield* Effect.forkScoped(
+      DesktopRecoveryStartup.afterPrimaryReady(primaryBackend).pipe(
+        Effect.catchCause((cause) =>
+          logStartupError("recovery check after startup failed", { cause: Cause.pretty(cause) }),
+        ),
+      ),
+    );
     yield* appActivation.start.pipe(
       Effect.tap(() => logBootstrapInfo("desktop app control socket ready")),
       Effect.catch((error) => logStartupError("desktop app control socket unavailable", { error })),

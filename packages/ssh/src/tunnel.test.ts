@@ -92,7 +92,10 @@ function commandArgs(command: ChildProcess.Command): ReadonlyArray<string> {
   return command._tag === "StandardCommand" ? command.args : [];
 }
 
-const ARCHIVE = { archiveVersion: "1.2.3-preview.20260911.4" } as const;
+const ARCHIVE = {
+  archiveVersion: "1.2.3-preview.20260911.4",
+  releaseBaseUrl: "https://releases.example.test/stark-code",
+} as const;
 const NODE_SCRIPT = {
   nodeScriptPath: "/Users/julius/Development/Work/codething-mvp/apps/server/dist/bin.mjs",
 } as const;
@@ -103,10 +106,7 @@ describe("ssh tunnel scripts", () => {
 
     assert.include(script, "STARK_ARCHIVE_VERSION='1.2.3-preview.20260911.4'");
     assert.include(script, "STARK_NODE_SCRIPT_PATH=''");
-    assert.include(
-      script,
-      "STARK_RELEASE_BASE_URL='https://github.com/example/stark-code/releases/download'",
-    );
+    assert.include(script, "STARK_RELEASE_BASE_URL='https://releases.example.test/stark-code'");
     assert.include(
       script,
       'STARK_RUNTIME_DIR="$HOME/.stark-code/runtime/versions/$STARK_ARCHIVE_VERSION"',

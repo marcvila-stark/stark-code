@@ -1,10 +1,7 @@
 import type { DesktopBridge, DesktopUpdateState } from "@starkfuture/contracts";
-import { ArrowRightIcon } from "lucide-react";
 
-import {
-  getDesktopUpdateDownloadedVersion,
-  getDesktopUpdateReleaseUrl,
-} from "./desktopUpdate.logic";
+import { getDesktopUpdateDownloadedVersion } from "./desktopUpdate.logic";
+import { type RunDesktopUpdateIntentOptions, runDesktopUpdateIntent } from "./desktopUpdateActions";
 import { toastManager } from "./ui/toast";
 
 type DesktopUpdateShell = Pick<DesktopBridge, "openExternal">;
@@ -21,44 +18,46 @@ export async function openDesktopUpdateReleaseNotes(
   toastManager.add({ type: "error", title: "Unable to open release notes" });
 }
 
-function ReleaseNotesLink({
-  shell,
-  releaseUrl,
-}: {
-  shell: DesktopUpdateShell;
-  releaseUrl: string;
-}) {
-  return (
-    <button
-      className="ml-2 inline cursor-pointer text-muted-foreground underline decoration-dotted underline-offset-4 transition-colors hover:text-foreground"
-      onClick={() => {
-        void openDesktopUpdateReleaseNotes(shell, releaseUrl);
-      }}
-      type="button"
-    >
-      Read more
-      <ArrowRightIcon
-        aria-hidden
-        className="ml-1 inline size-3 -rotate-45 align-[-0.125em]"
-        strokeWidth={2.25}
-      />
-    </button>
-  );
-}
-
-export function showDesktopUpdateDownloadedToast(
-  shell: DesktopUpdateShell,
+/**
+ * The once-per-version prompt when an update is ready. "Restart to update"
+ * runs the same checked restart as every other entry point; "Later" keeps the
+ * update and mutes the prompt for a day.
+ */
+export function showDesktopUpdateReadyToast(
   state: DesktopUpdateState,
+  run: (
+    intent: "install" | "postpone",
+    options: RunDesktopUpdateIntentOptions,
+  ) => Promise<boolean> = runDesktopUpdateIntent,
 ): void {
-  const releaseUrl = getDesktopUpdateReleaseUrl(getDesktopUpdateDownloadedVersion(state));
-  toastManager.add({
+  const version = getDesktopUpdateDownloadedVersion(state);
+  const later = () => {
+    toastManager.close(id);
+    void run("postpone", {});
+  };
+  const id = toastManager.add({
     type: "success",
-    title: "Update downloaded",
+    title: version ? `Stark Code ${version} is ready` : "An update is ready",
     description: (
       <>
-        Restart the app from the update button to install it.
-        {releaseUrl ? <ReleaseNotesLink releaseUrl={releaseUrl} shell={shell} /> : null}
+        Restart to update. Your drafts are saved first, and Stark Code won't restart while a task is
+        running.
+        <button
+          className="ml-2 inline cursor-pointer text-muted-foreground underline decoration-dotted underline-offset-4 transition-colors hover:text-foreground"
+          onClick={later}
+          type="button"
+        >
+          Later
+        </button>
       </>
     ),
+    timeout: 0,
+    actionProps: {
+      children: "Restart to update",
+      onClick: () => {
+        toastManager.close(id);
+        void run("install", { state });
+      },
+    },
   });
 }

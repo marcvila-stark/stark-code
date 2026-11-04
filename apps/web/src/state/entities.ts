@@ -11,6 +11,7 @@ import {
 } from "@starkfuture/client-runtime/state/threads";
 import type { ScopedProjectRef, ScopedThreadRef, ServerConfig } from "@starkfuture/contracts";
 import type { EnvironmentId, OrchestrationV2ProjectedTurnItem } from "@starkfuture/contracts";
+import type { ThreadLostRequest } from "@starkfuture/client-runtime/state/thread-requests";
 import { Atom } from "effect/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentProjects } from "./projects";
@@ -49,6 +50,9 @@ const EMPTY_VISIBLE_TURN_ITEMS_ATOM = Atom.make(EMPTY_VISIBLE_TURN_ITEMS).pipe(
 const EMPTY_THREAD_HISTORY_ATOM = Atom.make<ThreadHistoryMeta>(EMPTY_THREAD_HISTORY_META).pipe(
   Atom.withLabel("web-thread-history:empty"),
 );
+const EMPTY_LOST_REQUESTS_ATOM = Atom.make<ReadonlyArray<ThreadLostRequest>>(
+  Object.freeze([]),
+).pipe(Atom.withLabel("web-thread-lost-requests:empty"));
 
 const activeEnvironmentIdAtom = Atom.make<EnvironmentId | null>(null).pipe(
   Atom.keepAlive,
@@ -158,6 +162,15 @@ export function useThreadVisibleTurnItems(
     ref === null
       ? EMPTY_VISIBLE_TURN_ITEMS_ATOM
       : environmentThreadDetails.visibleTurnItemsAtom(ref),
+  );
+}
+
+/** Decisions lost to a restart, shutdown or provider exit that the user still owes. */
+export function useThreadLostRequests(
+  ref: ScopedThreadRef | null,
+): ReadonlyArray<ThreadLostRequest> {
+  return useAtomValue(
+    ref === null ? EMPTY_LOST_REQUESTS_ATOM : environmentThreadDetails.lostRequestsAtom(ref),
   );
 }
 

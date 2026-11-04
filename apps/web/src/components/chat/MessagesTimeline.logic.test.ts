@@ -149,6 +149,224 @@ describe("hook activity visibility", () => {
     expect(verbose).toHaveLength(1);
     expect(verbose[0]?.kind === "work" && verbose[0].entry.label).toBe("Hooks: 2 ran, 1 blocked");
   });
+
+  // A settled or live turn where the user's own PostToolUse/Stop hooks keep failing.
+  const runId = RunId.make("hook-run");
+  const at = (second: number) => DateTime.makeUnsafe(fixture.time(second));
+  const turnItem = (id: string, second: number, run = runId) => ({
+    id: TurnItemId.make(id),
+    threadId: fixture.threadId,
+    runId: run,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: ProviderTurnId.make(`${run}-native`),
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: second,
+    status: "completed" as const,
+    title: null,
+    startedAt: at(second),
+    completedAt: at(second),
+    updatedAt: at(second),
+  });
+  const hook = (
+    id: string,
+    second: number,
+    eventName: string,
+    outcome: "ran" | "failed" | "blocked",
+    run = runId,
+  ): OrchestrationV2TurnItem => ({
+    ...turnItem(id, second, run),
+    type: "hook_run",
+    provider: ProviderDriverKind.make("claudeAgent"),
+    eventName,
+    hookName: "claude-hook.sh",
+    outcome,
+    level: outcome === "failed" ? "warning" : outcome === "blocked" ? "notice" : "info",
+    summary:
+      outcome === "failed"
+        ? `${eventName} hook failed (exit 1)`
+        : outcome === "blocked"
+          ? `Blocked by ${eventName} hook: no rm`
+          : `${eventName} hook ran`,
+    detail: outcome === "failed" ? "settings missing" : "",
+  });
+  const command = (
+    id: string,
+    second: number,
+    status: "completed" | "running" = "completed",
+  ): OrchestrationV2TurnItem => ({
+    ...turnItem(id, second),
+    type: "command_execution",
+    status,
+    input: `ls ${id}`,
+    output: "ok",
+    ...(status === "completed" ? { exitCode: 0 } : { completedAt: null }),
+  });
+  const prompt: OrchestrationV2TurnItem = {
+    ...turnItem("prompt", 0),
+    type: "user_message",
+    messageId: MessageId.make("hook-prompt"),
+    text: "Read the docs",
+    attachments: [],
+    inputIntent: "turn_start",
+    createdBy: "user",
+    creationSource: "web",
+  };
+  const reply: OrchestrationV2TurnItem = {
+    ...turnItem("reply", 20),
+    type: "assistant_message",
+    messageId: MessageId.make("hook-reply"),
+    text: "Done",
+    streaming: false,
+  };
+  const entriesOf = (items: readonly OrchestrationV2TurnItem[], verbose = false) =>
+    filterHookActivity(
+      deriveTimelineEntriesFromVisibleTurnItems({
+        visibleTurnItems: items.map((item, position) => ({
+          position,
+          visibility: "local" as const,
+          sourceThreadId: fixture.threadId,
+          sourceItemId: item.id,
+          item,
+        })),
+        optimisticMessages: [],
+      }),
+      verbose,
+    );
+  const hookItemOf = (entry: TimelineEntry | undefined) => {
+    const item = entry?.kind === "work" ? entry.entry.projectedItem?.item : undefined;
+    return item?.type === "hook_run" ? item : undefined;
+  };
+  const settledRun = {
+    runId,
+    status: "completed" as const,
+    startedAt: fixture.time(0),
+    completedAt: fixture.time(21),
+  };
+  const rowsOf = (
+    timelineEntries: readonly TimelineEntry[],
+    input: Partial<Parameters<typeof deriveMessagesTimelineRows>[0]> = {},
+  ) =>
+    deriveMessagesTimelineRows({
+      timelineEntries,
+      latestRun: settledRun,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+      ...input,
+    });
+
+  it("folds a turn's failed hooks into one quiet row that names their events", () => {
+    const visible = entriesOf([
+      hook("ran", 1, "PreToolUse", "ran"),
+      hook("post-1", 2, "PostToolUse", "failed"),
+      hook("post-2", 3, "PostToolUse", "failed"),
+      hook("stop", 4, "Stop", "failed"),
+    ]);
+    expect(visible).toHaveLength(1);
+    const item = hookItemOf(visible[0]);
+    expect(item?.summary).toBe("3 hooks failed · PostToolUse, Stop");
+    // Quiet: the user's broken hook is not a warning about this reply.
+    expect(item?.level).toBe("info");
+    expect(item?.detail).toContain("PostToolUse · claude-hook.sh");
+    expect(item?.detail).toContain("Stop · claude-hook.sh");
+    expect(item?.detail).toContain("settings missing");
+
+    const single = hookItemOf(entriesOf([hook("post-1", 2, "PostToolUse", "failed")])[0]);
+    expect(single?.summary).toBe("PostToolUse hook failed (exit 1)");
+    expect(single?.level).toBe("info");
+  });
+
+  it("keeps a block's notice level and words when failures fold in with it", () => {
+    const visible = entriesOf([
+      hook("post", 2, "PostToolUse", "failed"),
+      hook("pre", 3, "PreToolUse", "blocked"),
+    ]);
+    expect(visible).toHaveLength(1);
+    const item = hookItemOf(visible[0]);
+    expect(item?.summary).toBe(
+      "Blocked by PreToolUse hook: no rm; PostToolUse hook failed (exit 1)",
+    );
+    expect(item?.level).toBe("notice");
+    expect(item?.outcome).toBe("blocked");
+  });
+
+  it("keeps one hook row per turn", () => {
+    const otherRun = RunId.make("other-run");
+    const visible = entriesOf([
+      hook("first", 2, "PostToolUse", "failed"),
+      hook("second", 3, "PostToolUse", "failed", otherRun),
+    ]);
+    expect(visible.map((entry) => hookItemOf(entry)?.summary)).toEqual([
+      "PostToolUse hook failed (exit 1)",
+      "PostToolUse hook failed (exit 1)",
+    ]);
+  });
+
+  it("puts the hook row inside the settled turn's fold, after its tools", () => {
+    const entries = entriesOf([
+      prompt,
+      command("one", 1),
+      hook("post-1", 2, "PostToolUse", "failed"),
+      command("two", 3),
+      hook("post-2", 4, "PostToolUse", "failed"),
+      reply,
+      hook("stop", 21, "Stop", "failed"),
+    ]);
+    const hookEntryId = entries.find((entry) => hookItemOf(entry) !== undefined)?.id;
+    const collapsed = rowsOf(entries);
+    expect(collapsed.map((row) => row.kind)).toEqual(["message", "turn-fold", "message"]);
+
+    const expanded = rowsOf(entries, { expandedRunIds: new Set([runId]) });
+    const hookRowIndex = expanded.findIndex((row) => row.id === hookEntryId);
+    expect(
+      expanded.filter((row) => row.kind === "work" || row.kind === "work-toggle"),
+    ).toHaveLength(2);
+    // The two commands stay one group; the hook row follows it instead of splitting it.
+    expect(expanded[hookRowIndex - 1]?.kind).toBe("work-toggle");
+    const toggle = expanded[hookRowIndex - 1];
+    expect(toggle?.kind === "work-toggle" && toggle.hiddenCount).toBe(2);
+  });
+
+  it("leaves a lone hook row visible without inventing a fold", () => {
+    const rows = rowsOf(entriesOf([prompt, hook("post", 2, "PostToolUse", "failed"), reply]));
+    expect(rows.map((row) => row.kind)).toEqual(["message", "work", "message"]);
+  });
+
+  it("keeps the live tools in one row while hooks fail between them", () => {
+    const entries = entriesOf([
+      prompt,
+      command("one", 1),
+      hook("post-1", 2, "PostToolUse", "failed"),
+      command("two", 3),
+      hook("post-2", 4, "PostToolUse", "failed"),
+      command("three", 5, "running"),
+    ]);
+    const rows = rowsOf(entries, {
+      latestRun: { runId, status: "running", startedAt: fixture.time(0), completedAt: null },
+      runningRunId: runId,
+      isWorking: true,
+      activeTurnStartedAt: fixture.time(0),
+    });
+    const hookRows = rows.filter((row) => row.kind === "work");
+    expect(hookRows).toHaveLength(1);
+    const live = rows.find((row) => row.kind === "work-live");
+    expect(live?.kind === "work-live" && live.groupedEntries).toHaveLength(3);
+    expect(rows.indexOf(hookRows[0]!)).toBeLessThan(rows.indexOf(live!));
+  });
+
+  it("keeps verbose hook activity as its own row per provider turn", () => {
+    const entries = entriesOf(
+      [prompt, command("one", 1), hook("post-1", 2, "PostToolUse", "failed"), reply],
+      true,
+    );
+    const rows = rowsOf(entries);
+    expect(rows.map((row) => row.kind)).toEqual(["message", "turn-fold", "work", "message"]);
+    const hookRow = rows.find((row) => row.kind === "work");
+    expect(hookRow?.kind === "work" && hookRow.groupedEntries[0]?.label).toBe("Hooks: 1 ran");
+  });
 });
 
 describe("work entry labels", () => {
@@ -5050,7 +5268,7 @@ it("keeps the working header in place across worktree setup handoff", () => {
     worktreeSetup: snapshot,
   });
   expect(withoutMessages).toEqual([
-    { kind: "working", id: "working-indicator-row", createdAt: snapshot.startedAt },
+    { kind: "working", id: "working-indicator-row", createdAt: snapshot.startedAt, waits: [] },
     {
       kind: "worktree-setup",
       id: "worktree-setup-row",
@@ -5504,5 +5722,84 @@ describe("shouldCollapseUserMessage", () => {
 
     expect(text.length).toBeGreaterThan(600);
     expect(shouldCollapseUserMessage(text)).toBe(false);
+  });
+});
+
+describe("approval wait time", () => {
+  const runId = "turn-wait" as never;
+  const approvalEntry = (status: "waiting" | "completed") => ({
+    id: "approval-entry",
+    kind: "work" as const,
+    createdAt: "2026-01-01T00:00:06Z",
+    entry: {
+      id: "approval-1",
+      createdAt: "2026-01-01T00:00:06Z",
+      runId,
+      label: "Approval requested",
+      tone: "tool" as const,
+      projectedItem: {
+        item: {
+          type: "approval_request",
+          runId,
+          status,
+          startedAt: DateTime.makeUnsafe("2026-01-01T00:00:06Z"),
+          completedAt: status === "completed" ? DateTime.makeUnsafe("2026-01-01T00:00:16Z") : null,
+          updatedAt: DateTime.makeUnsafe(
+            status === "completed" ? "2026-01-01T00:00:16Z" : "2026-01-01T00:00:06Z",
+          ),
+        },
+      } as never,
+    },
+  });
+  const message = (id: string, role: "user" | "assistant", at: string, until = at) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at,
+    message: {
+      id: id as never,
+      role,
+      text: role === "user" ? "Read the brief" : "I'll check the brief.",
+      runId: role === "user" ? null : runId,
+      createdAt: at,
+      updatedAt: until,
+      streaming: false,
+    },
+  });
+
+  it("keeps the approval wait out of the settled turn's work time", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        message("user-1", "user", "2026-01-01T00:00:00Z"),
+        message("assistant-1", "assistant", "2026-01-01T00:00:02Z"),
+        approvalEntry("completed"),
+        message("assistant-2", "assistant", "2026-01-01T00:00:20Z", "2026-01-01T00:00:22Z"),
+      ],
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+    const fold = rows.find((row) => row.kind === "turn-fold");
+    // 22s from the prompt to the final reply, 10s of it waiting for approval.
+    expect(fold).toMatchObject({ label: "Worked for 12s · waited 10s for you" });
+  });
+
+  it("hands the live header the open approval so it can say it is waiting", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        message("user-1", "user", "2026-01-01T00:00:00Z"),
+        message("assistant-1", "assistant", "2026-01-01T00:00:02Z"),
+        approvalEntry("waiting"),
+      ],
+      latestRun: { runId, status: "running", startedAt: "2026-01-01T00:00:00Z", completedAt: null },
+      isWorking: true,
+      activeTurnStartedAt: "2026-01-01T00:00:00Z",
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+    const working = rows.find((row) => row.kind === "working");
+    expect(working?.kind === "working" ? working.waits : null).toEqual([
+      { kind: "approval", startedAtMs: Date.parse("2026-01-01T00:00:06Z"), endedAtMs: null },
+    ]);
   });
 });

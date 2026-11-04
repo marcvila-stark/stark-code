@@ -7,9 +7,13 @@ import * as FileSystem from "effect/FileSystem";
 import * as ServerConfig from "../config.ts";
 import { createPendingAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ThreadMessageIntake from "./ThreadMessageIntake.ts";
+import { launchThreadForSession } from "../ws.ts";
+import { resolveWorkerRetry } from "@starkfuture/shared/workerRetry";
 import { assert, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
+  AuthOrchestrationOperateScope,
+  AuthSettingsWriteScope,
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   ChatAttachmentId,
   ComposerContextId,
@@ -56,6 +60,7 @@ import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -67,6 +72,7 @@ import type * as ProviderAdapter from "@starkfuture/provider-core/server/Provide
 const projectId = ProjectId.make("project:launch-test");
 const otherProjectId = ProjectId.make("project:launch-other");
 const encodeThreadProjection = Schema.encodeEffect(OrchestrationV2ThreadProjectionJson);
+const isOrchestratorDispatchError = Schema.is(Orchestrator.OrchestratorDispatchError);
 const modelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5.1-codex",
@@ -1166,7 +1172,7 @@ it.effect("names the worktree itself when the client provides no branch", () =>
       yield* waitUntil(() => Effect.sync(() => harness.createWorktree.mock.calls.length === 1));
       assert.match(
         harness.createWorktree.mock.calls[0]?.[0]?.newRefName ?? "",
-        /^stark\/[0-9a-f]{8}$/u,
+        /^stark-code\/[0-9a-f]{8}$/u,
       );
       yield* waitUntil(() =>
         threads
@@ -1229,35 +1235,37 @@ it.effect("renames a temporary stark-code/<hash> branch off the provisioning cri
   }),
 );
 
-it.effect("provisions under stark-<hash> when a plain stark branch blocks stark-code/*", () =>
-  Effect.gen(function* () {
-    const harness = makeHarness({
-      hasCommit: (input) => Effect.succeed(input.refName === "refs/heads/stark-code"),
-      createWorktree: (input) =>
-        Effect.succeed({
-          worktree: { path: "/repo-worktrees/temp", refName: input.newRefName, headSha: "abc" },
-        } as never),
-    });
-    yield* Effect.gen(function* () {
-      const launches = yield* ThreadLaunch.ThreadLaunchService;
-      const threads = yield* ThreadManagement.ThreadManagementService;
-      const launched = yield* launches.launch(
-        launchInput({
-          command: "command:launch:blocked-namespace",
-          thread: "thread:launch:blocked-namespace",
-          message: "Build the feature",
-          workspace: { type: "worktree", baseRef: "main", branch: "stark-code/abcd1234" },
-        }),
-      );
-      yield* waitUntil(() =>
-        threads
-          .getThreadProjection(launched.threadId)
-          .pipe(Effect.map((projection) => projection.thread.branch === "generated-branch")),
-      );
-      assert.equal(harness.createWorktree.mock.calls[0]?.[0]?.newRefName, "stark-abcd1234");
-      assert.equal(harness.renameBranch.mock.calls[0]?.[0]?.oldBranch, "stark-abcd1234");
-    }).pipe(Effect.provide(harness.layer));
-  }),
+it.effect(
+  "provisions under stark-code-<hash> when a plain stark-code branch blocks stark-code/*",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeHarness({
+        hasCommit: (input) => Effect.succeed(input.refName === "refs/heads/stark-code"),
+        createWorktree: (input) =>
+          Effect.succeed({
+            worktree: { path: "/repo-worktrees/temp", refName: input.newRefName, headSha: "abc" },
+          } as never),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const launched = yield* launches.launch(
+          launchInput({
+            command: "command:launch:blocked-namespace",
+            thread: "thread:launch:blocked-namespace",
+            message: "Build the feature",
+            workspace: { type: "worktree", baseRef: "main", branch: "stark-code/abcd1234" },
+          }),
+        );
+        yield* waitUntil(() =>
+          threads
+            .getThreadProjection(launched.threadId)
+            .pipe(Effect.map((projection) => projection.thread.branch === "generated-branch")),
+        );
+        assert.equal(harness.createWorktree.mock.calls[0]?.[0]?.newRefName, "stark-code-abcd1234");
+        assert.equal(harness.renameBranch.mock.calls[0]?.[0]?.oldBranch, "stark-code-abcd1234");
+      }).pipe(Effect.provide(harness.layer));
+    }),
 );
 
 it.effect("keeps an explicit branch name instead of generating one", () =>
@@ -2237,6 +2245,51 @@ it.effect("creates a strong provider-thread mapping for an imported native sessi
   }).pipe(Effect.provide(harness.layer));
 });
 
+it.effect("a ws thread launch creates a chat only within the session's settings grant", () => {
+  const harness = makeHarness();
+  const layerFiles = ServerConfig.layerTest(process.cwd(), {
+    prefix: "stark-ws-launch-grant-",
+  }).pipe(Layer.provideMerge(NodeServices.layer));
+  const operator = { scopes: [AuthOrchestrationOperateScope] };
+  const settingsWriter = { scopes: [AuthOrchestrationOperateScope, AuthSettingsWriteScope] };
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const launch = (
+      session: typeof operator | typeof settingsWriter,
+      name: string,
+      runtimeMode: "approval-required" | "auto" | "full-access",
+    ) =>
+      launchThreadForSession(session, {
+        ...launchInput({ command: `command:ws-grant:${name}`, thread: `thread:ws-grant:${name}` }),
+        runtimeMode,
+      });
+    const projectThreadIds = threads
+      .listProjectThreads({ projectId, includeSubagents: false })
+      .pipe(Effect.map((projectThreads) => projectThreads.map((thread) => thread.id)));
+
+    // New chats get Supervised here, so an operator without settings-write
+    // cannot start one any broader.
+    for (const runtimeMode of ["full-access", "auto"] as const) {
+      const refused = yield* launch(operator, `operator-${runtimeMode}`, runtimeMode).pipe(
+        Effect.flip,
+      );
+      if (refused._tag !== "ThreadLaunchError") {
+        assert.fail(`expected ThreadLaunchError, got ${refused._tag}`);
+      }
+      assert.equal(refused.operation, "create-thread");
+      assert.ok(isOrchestratorDispatchError(refused.cause));
+      assert.include(String(refused.cause.cause), "needs permission to change settings");
+    }
+    assert.deepEqual(yield* projectThreadIds, []);
+
+    const supervised = yield* launch(operator, "operator-supervised", "approval-required");
+    assert.equal(supervised.projection.thread.runtimeMode, "approval-required");
+    const fullAccess = yield* launch(settingsWriter, "writer-full-access", "full-access");
+    assert.equal(fullAccess.projection.thread.runtimeMode, "full-access");
+    assert.sameMembers(yield* projectThreadIds, [supervised.threadId, fullAccess.threadId]);
+  }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
+});
+
 it.effect("shared intake preserves durable attachment bytes after a lost launch result", () => {
   const harness = makeHarness();
   const layerFiles = ServerConfig.layerTest(process.cwd(), {
@@ -2885,6 +2938,8 @@ it.effect.each(
         const input = {
           task: "Implement the child task",
           target: { providerInstanceId: childInstanceId, model: "child-model" },
+          // A child on another provider instance starts only at its narrowest mode.
+          runtimeMode: "approval-required" as const,
           isolation: "worktree" as const,
           clientRequestId: "isolated-child",
         };
@@ -2961,6 +3016,51 @@ it.effect.each(
       }).pipe(Effect.provide(Layer.merge(harness.layer, layerService)));
     }),
 );
+
+it.effect("classifies a setup that failed after its worktree existed as a setup retry", () => {
+  let setupFailures = 1;
+  const harness = makeHarness({
+    runSetup: () =>
+      setupFailures-- > 0
+        ? Effect.fail(new Error("setup failed") as never)
+        : Effect.succeed({ status: "no-script" as const }),
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:worker-retry",
+        thread: "thread:launch:worker-retry",
+        message: "Set up the worker",
+        workspace: { type: "worktree", baseRef: "main" },
+      }),
+    );
+    const waited = yield* threads.waitForThread({
+      projectId,
+      threadId: launched.threadId,
+      timeoutMs: 60_000,
+    });
+    assert.equal(waited.run?.status, "failed");
+    const failed = yield* threads.getThreadProjection(launched.threadId);
+    // The setup script ran in the new worktree, so the thread records its path.
+    assert.equal(failed.thread.worktreePath, "/repo-worktrees/feature");
+    const retry = resolveWorkerRetry(failed);
+    assert.deepEqual(retry, { type: "prepare", runId: failed.runs[0]!.id });
+    if (retry.type !== "prepare") return;
+
+    yield* launches.retryPreparation({
+      commandId: CommandId.make("command:launch:worker-retry:retry"),
+      threadId: launched.threadId,
+      runId: retry.runId,
+    });
+    // Preparing again, so a second click is refused rather than sending the brief.
+    assert.deepEqual(resolveWorkerRetry(yield* threads.getThreadProjection(launched.threadId)), {
+      type: "unavailable",
+      reason: "active",
+    });
+  }).pipe(Effect.provide(harness.layer));
+});
 
 it.effect(
   "prepares a child of local CLI history in its original folder with a fresh provider session",

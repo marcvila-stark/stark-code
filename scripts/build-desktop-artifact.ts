@@ -16,6 +16,7 @@ import {
   type DirectoryRecord,
 } from "@electron/asar";
 
+import { fromJsonStringPretty } from "@starkfuture/shared/schemaJson";
 import { fromYaml } from "@starkfuture/shared/schemaYaml";
 import * as HostProcess from "@starkfuture/shared/HostProcess";
 import { clerkFrontendApiHostnameFromPublishableKey } from "@starkfuture/shared/relayAuth";
@@ -42,10 +43,31 @@ import {
 import { loadRepoEnv } from "./lib/public-config.ts";
 import { selectDesktopRuntimeExternalDependencies } from "./lib/desktop-external-packages.ts";
 import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
+import { replaceUpdateManifestFileDigest, withMockFeedKind } from "./lib/update-manifest.ts";
+import {
+  BAKED_UPDATE_POLICY_KEY,
+  DESKTOP_REHEARSAL_FAULTS,
+  FEED_URL_PROBLEMS,
+  STARK_UPDATE_FEED_PROBLEMS,
+  STARK_UPDATE_OWNERSHIP,
+  checkFeedUrl,
+  isValidRehearsalProfile,
+  parseDesignatedRequirement,
+  requirementPinsIdentity,
+  validateStarkUpdateFeed,
+  type BakedRehearsalPolicy,
+  type BakedUpdatePolicy,
+  type DesktopRehearsalFault,
+  type UpdateOwnership,
+} from "./lib/update-feed-ownership.ts";
+
+const isDesktopRehearsalFault = (value: string): value is DesktopRehearsalFault =>
+  (DESKTOP_REHEARSAL_FAULTS as ReadonlyArray<string>).includes(value);
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Config from "effect/Config";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -959,8 +981,7 @@ interface ResolvedBuildOptions {
   readonly keepStage: boolean;
   readonly signed: boolean;
   readonly verbose: boolean;
-  readonly mockUpdates: boolean;
-  readonly mockUpdateServerPort: number | undefined;
+  readonly updateFeed: DesktopUpdateFeedPlan;
   readonly wslRuntime: string | undefined;
 }
 
@@ -970,6 +991,8 @@ interface StagePackageJson {
   readonly buildVersion: string;
   readonly starkcodeCommitHash: string;
   readonly starkcodeWebAuthn?: MacWebAuthnEntitlements;
+  /** Read by apps/desktop/src/updates/updateFeedPolicy.ts; see createBakedUpdatePolicy. */
+  readonly [BAKED_UPDATE_POLICY_KEY]: BakedUpdatePolicy;
   readonly private: true;
   readonly packageManager: string;
   readonly description: string;
@@ -1010,6 +1033,8 @@ export const DESKTOP_FILE_EXCLUSIONS = [
   "!apps/desktop/prod-resources/browser-secret/**/*",
   "!apps/desktop/prod-resources/dictation",
   "!apps/desktop/prod-resources/dictation/**/*",
+  "!apps/desktop/prod-resources/resource-monitor",
+  "!apps/desktop/prod-resources/resource-monitor/**/*",
   // Windows stages the server sidecar below prod-resources so electron-builder
   // can copy it using project-relative extraResources matchers. Keep those
   // staging inputs out of app.asar; they are emitted once at resources/.
@@ -1132,6 +1157,7 @@ export const WSL_RUNTIME_EXTRA_RESOURCES = [
   WSL_RUNTIME_ARCHIVE_HASH_EXTRA_RESOURCE,
 ] as const;
 export const DESKTOP_EXTRA_RESOURCES = [
+  { from: "apps/desktop/resources/browser-capture-host.cjs", to: "browser-capture-host.cjs" },
   {
     // electron-builder drops node_modules directly under a resource's `from`.
     // Copy from the parent so the kit's materialized runtime dependencies stay nested.
@@ -1493,6 +1519,649 @@ ${associatedDomains}
 `;
 }
 
+/**
+ * Hardened-runtime entitlements for signed macOS builds that carry no passkey
+ * provisioning profile. Staged with the rest of `apps/desktop/resources`.
+ */
+export const MAC_ENTITLEMENTS_FILE_NAME = "entitlements.mac.plist";
+
+/**
+ * How a macOS build is signed. `unsigned` is the local default. `development`
+ * signs with an Apple Development certificate and is never notarized, so two
+ * local builds can rehearse an update. `developer-id` signs with Developer ID,
+ * notarizes and staples, which is the only mode another Mac opens without an
+ * override.
+ */
+const MacSigningMode = Schema.Literals(["unsigned", "development", "developer-id"]);
+export type MacSigningMode = typeof MacSigningMode.Type;
+const MacSignedMode = Schema.Literals(["development", "developer-id"]);
+export type MacSignedMode = typeof MacSignedMode.Type;
+const isMacSignedMode = Schema.is(MacSignedMode);
+
+const MacSigningCredentialSet = Schema.Literals([
+  "certificate-file",
+  "keychain",
+  "api-key",
+  "apple-id",
+  "keychain-profile",
+]);
+export type MacSigningCredentialSet = typeof MacSigningCredentialSet.Type;
+export type MacSigningIdentitySource = Extract<
+  MacSigningCredentialSet,
+  "certificate-file" | "keychain"
+>;
+export type MacNotarizationCredential = Extract<
+  MacSigningCredentialSet,
+  "api-key" | "apple-id" | "keychain-profile"
+>;
+
+// `triggers` are the variables whose presence selects a set; every `required`
+// variable must then be present too. electron-builder picks the first set it
+// finds in its own order, so the build insists on exactly one.
+const MAC_SIGNING_CREDENTIAL_SETS: Record<
+  MacSigningCredentialSet,
+  {
+    readonly label: string;
+    readonly required: ReadonlyArray<string>;
+    readonly triggers: ReadonlyArray<string>;
+  }
+> = {
+  "certificate-file": {
+    label: "certificate file",
+    required: ["CSC_LINK", "CSC_KEY_PASSWORD"],
+    triggers: ["CSC_LINK", "CSC_KEY_PASSWORD"],
+  },
+  keychain: { label: "keychain certificate", required: ["CSC_NAME"], triggers: ["CSC_NAME"] },
+  "api-key": {
+    label: "App Store Connect API key",
+    required: ["APPLE_API_KEY", "APPLE_API_KEY_ID", "APPLE_API_ISSUER"],
+    triggers: ["APPLE_API_KEY", "APPLE_API_KEY_ID", "APPLE_API_ISSUER"],
+  },
+  // APPLE_TEAM_ID alone does not select this set: it also names the team a
+  // Developer ID signature must carry.
+  "apple-id": {
+    label: "Apple ID",
+    required: ["APPLE_ID", "APPLE_APP_SPECIFIC_PASSWORD", "APPLE_TEAM_ID"],
+    triggers: ["APPLE_ID", "APPLE_APP_SPECIFIC_PASSWORD"],
+  },
+  "keychain-profile": {
+    label: "notarytool keychain profile",
+    required: ["APPLE_KEYCHAIN_PROFILE"],
+    triggers: ["APPLE_KEYCHAIN_PROFILE", "APPLE_KEYCHAIN"],
+  },
+};
+
+const describeMacSigningCredentialSet = (set: MacSigningCredentialSet) =>
+  `the ${MAC_SIGNING_CREDENTIAL_SETS[set].label} (${MAC_SIGNING_CREDENTIAL_SETS[set].required.join(", ")})`;
+
+export class InvalidMacSigningModeError extends Schema.TaggedError<InvalidMacSigningModeError>()(
+  "InvalidMacSigningModeError",
+  {
+    inputLength: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  },
+) {
+  override get message(): string {
+    return "STARK_CODE_MACOS_SIGNING_MODE must be `development` or `developer-id`.";
+  }
+}
+
+export class MacSigningModeRequiresSignedBuildError extends Schema.TaggedError<MacSigningModeRequiresSignedBuildError>()(
+  "MacSigningModeRequiresSignedBuildError",
+  {},
+) {
+  override get message(): string {
+    return "STARK_CODE_MACOS_SIGNING_MODE only applies to --signed builds. Add --signed, or unset it for an unsigned build.";
+  }
+}
+
+export class MissingMacSigningIdentityError extends Schema.TaggedError<MissingMacSigningIdentityError>()(
+  "MissingMacSigningIdentityError",
+  {},
+) {
+  override get message(): string {
+    return "A signed macOS build needs CSC_LINK and CSC_KEY_PASSWORD (a .p12 export of the certificate with its private key), or CSC_NAME (a certificate in the login keychain).";
+  }
+}
+
+export class MissingMacNotarizationCredentialsError extends Schema.TaggedError<MissingMacNotarizationCredentialsError>()(
+  "MissingMacNotarizationCredentialsError",
+  {},
+) {
+  override get message(): string {
+    return "A developer-id build is notarized and needs one credential set: APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER; or APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD and APPLE_TEAM_ID; or APPLE_KEYCHAIN_PROFILE. For a local rehearsal that is never notarized, set STARK_CODE_MACOS_SIGNING_MODE=development.";
+  }
+}
+
+export class IncompleteMacSigningCredentialsError extends Schema.TaggedError<IncompleteMacSigningCredentialsError>()(
+  "IncompleteMacSigningCredentialsError",
+  {
+    credentialSet: MacSigningCredentialSet,
+    missing: Schema.Array(Schema.String),
+  },
+) {
+  override get message(): string {
+    return `Incomplete ${MAC_SIGNING_CREDENTIAL_SETS[this.credentialSet].label} credentials: also set ${this.missing.join(", ")}.`;
+  }
+}
+
+export class ConflictingMacSigningCredentialsError extends Schema.TaggedError<ConflictingMacSigningCredentialsError>()(
+  "ConflictingMacSigningCredentialsError",
+  {
+    credentialSets: Schema.Array(MacSigningCredentialSet),
+  },
+) {
+  override get message(): string {
+    return `Set exactly one of ${this.credentialSets.map(describeMacSigningCredentialSet).join(" and ")}; unset the others.`;
+  }
+}
+
+export class InvalidMacSigningIdentityNameError extends Schema.TaggedError<InvalidMacSigningIdentityNameError>()(
+  "InvalidMacSigningIdentityNameError",
+  {},
+) {
+  override get message(): string {
+    return "CSC_NAME must not start with a certificate type such as `Developer ID Application:`. Use the rest of the certificate name, or its SHA-1.";
+  }
+}
+
+export class InvalidMacSigningTeamIdError extends Schema.TaggedError<InvalidMacSigningTeamIdError>()(
+  "InvalidMacSigningTeamIdError",
+  {},
+) {
+  override get message(): string {
+    return "APPLE_TEAM_ID must be a 10-character Apple Developer Team ID.";
+  }
+}
+
+/**
+ * What a macOS build signs with. It holds no credential values: the
+ * notarization step reads them from the environment when it runs, so the plan
+ * can be logged and recorded in the release proof.
+ */
+export interface MacSigningPlan {
+  readonly mode: MacSigningMode;
+  readonly identitySource: MacSigningIdentitySource | undefined;
+  /** The `CSC_NAME` qualifier electron-builder matches login keychain identities against. */
+  readonly keychainIdentity: string | undefined;
+  readonly notarization: MacNotarizationCredential | undefined;
+  /** `APPLE_TEAM_ID`, which a Developer ID signature must carry when set. */
+  readonly expectedTeamId: string | undefined;
+}
+
+// electron-builder (macCodeSign.appleCertificatePrefixes) refuses these as a
+// CSC_NAME prefix and skips them when it falls back to a "non-Apple" identity.
+const ELECTRON_BUILDER_APPLE_CERTIFICATE_PREFIXES = [
+  "Developer ID Application:",
+  "Developer ID Installer:",
+  "3rd Party Mac Developer Application:",
+  "3rd Party Mac Developer Installer:",
+] as const;
+
+const selectMacSigningCredentialSet = <S extends MacSigningCredentialSet>(
+  candidates: ReadonlyArray<S>,
+  isSet: (name: string) => boolean,
+) =>
+  Effect.gen(function* () {
+    const present = candidates.filter((set) =>
+      MAC_SIGNING_CREDENTIAL_SETS[set].triggers.some(isSet),
+    );
+    if (present.length > 1) {
+      return yield* new ConflictingMacSigningCredentialsError({ credentialSets: present });
+    }
+    const [selected] = present;
+    if (selected === undefined) return undefined;
+    const missing = MAC_SIGNING_CREDENTIAL_SETS[selected].required.filter((name) => !isSet(name));
+    if (missing.length > 0) {
+      return yield* new IncompleteMacSigningCredentialsError({ credentialSet: selected, missing });
+    }
+    return selected;
+  });
+
+/**
+ * Validates macOS signing before anything is built, so a missing or partial
+ * credential fails in seconds instead of after packaging. Credentials come only
+ * from the process environment and the login keychain; repo `.env` files are
+ * not read, because worktree setup links them into every worktree. Errors name
+ * variables, never their values.
+ */
+export const resolveMacSigningPlan = Effect.fn("resolveMacSigningPlan")(function* (input: {
+  readonly signed: boolean;
+  readonly env: Readonly<Record<string, string | undefined>>;
+}) {
+  const read = (name: string) => input.env[name]?.trim() ?? "";
+  const isSet = (name: string) => read(name).length > 0;
+  const configuredMode = read("STARK_CODE_MACOS_SIGNING_MODE");
+  if (!input.signed) {
+    if (configuredMode) return yield* new MacSigningModeRequiresSignedBuildError();
+    const unsigned: MacSigningPlan = {
+      mode: "unsigned",
+      identitySource: undefined,
+      keychainIdentity: undefined,
+      notarization: undefined,
+      expectedTeamId: undefined,
+    };
+    return unsigned;
+  }
+
+  const mode = configuredMode || "developer-id";
+  if (!isMacSignedMode(mode)) {
+    return yield* new InvalidMacSigningModeError({ inputLength: configuredMode.length });
+  }
+
+  const identitySource = yield* selectMacSigningCredentialSet(
+    ["certificate-file", "keychain"] as const,
+    isSet,
+  );
+  if (identitySource === undefined) return yield* new MissingMacSigningIdentityError();
+  const keychainIdentity = identitySource === "keychain" ? read("CSC_NAME") : undefined;
+  if (
+    keychainIdentity !== undefined &&
+    ELECTRON_BUILDER_APPLE_CERTIFICATE_PREFIXES.some((prefix) =>
+      keychainIdentity.startsWith(prefix),
+    )
+  ) {
+    return yield* new InvalidMacSigningIdentityNameError();
+  }
+
+  if (mode === "development") {
+    const development: MacSigningPlan = {
+      mode,
+      identitySource,
+      keychainIdentity,
+      notarization: undefined,
+      expectedTeamId: undefined,
+    };
+    return development;
+  }
+
+  const notarization = yield* selectMacSigningCredentialSet(
+    ["api-key", "apple-id", "keychain-profile"] as const,
+    isSet,
+  );
+  if (notarization === undefined) return yield* new MissingMacNotarizationCredentialsError();
+  const teamId = read("APPLE_TEAM_ID").toUpperCase();
+  if (teamId && !APPLE_TEAM_ID_PATTERN.test(teamId)) {
+    return yield* new InvalidMacSigningTeamIdError();
+  }
+  const developerId: MacSigningPlan = {
+    mode,
+    identitySource,
+    keychainIdentity,
+    notarization,
+    expectedTeamId: teamId || undefined,
+  };
+  return developerId;
+});
+
+const MAC_NOTARIZATION_ENV_KEYS = [
+  "APPLE_API_KEY",
+  "APPLE_API_KEY_ID",
+  "APPLE_API_ISSUER",
+  "APPLE_ID",
+  "APPLE_APP_SPECIFIC_PASSWORD",
+  "APPLE_TEAM_ID",
+  "APPLE_KEYCHAIN",
+  "APPLE_KEYCHAIN_PROFILE",
+] as const;
+const SIGNING_IDENTITY_ENV_KEYS = ["CSC_LINK", "CSC_KEY_PASSWORD", "CSC_NAME"] as const;
+
+/**
+ * Drops the credentials a build must not use from the electron-builder
+ * environment. electron-builder signs whenever CSC_NAME names a keychain
+ * certificate and notarizes whenever an Apple credential set is present,
+ * whatever --signed says, so an unsigned build drops all of them and a
+ * development build drops the notarization ones.
+ */
+export function removeUnusedSigningCredentials(
+  env: Readonly<Record<string, string | undefined>>,
+  input: { readonly signed: boolean; readonly macSigningMode: MacSigningMode | undefined },
+): Record<string, string | undefined> {
+  const next = { ...env };
+  const removed: ReadonlyArray<string> = !input.signed
+    ? [...SIGNING_IDENTITY_ENV_KEYS, ...MAC_NOTARIZATION_ENV_KEYS]
+    : input.macSigningMode === "development"
+      ? MAC_NOTARIZATION_ENV_KEYS
+      : [];
+  for (const key of removed) delete next[key];
+  if (!input.signed) next.CSC_IDENTITY_AUTO_DISCOVERY = "false";
+  return next;
+}
+
+/** A passkey build is opted into by pointing at its provisioning profile. */
+export function isMacPasskeySigningRequested(
+  env: Readonly<Record<string, string | undefined>>,
+): boolean {
+  return (env.STARK_CODE_MACOS_PROVISIONING_PROFILE?.trim() ?? "").length > 0;
+}
+
+export interface MacSigningIdentity {
+  readonly hash: string;
+  readonly name: string;
+}
+
+/**
+ * Lists signing identities the way electron-builder 26 does: the Apple
+ * certificate types from `security find-identity -v`, then every
+ * `security find-identity -v -p codesigning` line, unnumbered and deduplicated.
+ */
+export function parseMacSigningIdentities(
+  allIdentities: string,
+  codesigningIdentities: string,
+): ReadonlyArray<string> {
+  const appleCertificates = allIdentities
+    .trim()
+    .split("\n")
+    .filter((line) =>
+      ELECTRON_BUILDER_APPLE_CERTIFICATE_PREFIXES.some((prefix) => line.includes(prefix)),
+    );
+  const lines = [...appleCertificates, ...codesigningIdentities.trim().split("\n")]
+    .filter(
+      (line) =>
+        !line.includes("(Missing required extension)") &&
+        !line.includes("valid identities found") &&
+        !line.includes("iPhone ") &&
+        !line.includes("com.apple.idms.appleid.prd."),
+    )
+    .map((line) => line.slice(line.indexOf(")") + 1).trim())
+    .filter((line) => line.length > 0);
+  return [...new Set(lines)];
+}
+
+function parseMacSigningIdentityLine(line: string): MacSigningIdentity {
+  const firstQuote = line.indexOf('"');
+  return {
+    hash: line.slice(0, firstQuote - 1),
+    name: line.slice(firstQuote + 1, line.lastIndexOf('"')),
+  };
+}
+
+function findMacSigningIdentityOfType(
+  identities: ReadonlyArray<string>,
+  certificateType: string,
+  qualifier: string,
+): MacSigningIdentity | undefined {
+  const candidates = identities.filter((line) => line.includes(qualifier));
+  const typed = candidates.find((line) => line.includes(`${certificateType}:`));
+  if (typed !== undefined) return parseMacSigningIdentityLine(typed);
+  if (certificateType !== "Developer ID Application") return undefined;
+  const nonApple = candidates.find(
+    (line) =>
+      !line.includes("Mac Developer:") &&
+      !ELECTRON_BUILDER_APPLE_CERTIFICATE_PREFIXES.some((prefix) => line.includes(prefix)),
+  );
+  return nonApple === undefined ? undefined : parseMacSigningIdentityLine(nonApple);
+}
+
+/**
+ * The identity electron-builder 26 picks for a non-MAS build signed with
+ * CSC_NAME (MacTargetHelper.getCertificateTypes and macCodeSign._findIdentity).
+ * Its development search order is "Mac Developer" then "Developer ID
+ * Application", and an "Apple Development" certificate is only reached through
+ * the non-Apple fallback. A CSC_NAME matching both a Developer ID and a
+ * development certificate therefore signs a development build with Developer
+ * ID, and a Developer ID build falls back to a development certificate when no
+ * Developer ID certificate matches.
+ */
+export function selectMacSigningIdentity(
+  identities: ReadonlyArray<string>,
+  mode: MacSignedMode,
+  qualifier: string,
+): MacSigningIdentity | undefined {
+  const certificateTypes =
+    mode === "development"
+      ? ["Mac Developer", "Developer ID Application"]
+      : ["Developer ID Application"];
+  for (const certificateType of certificateTypes) {
+    const identity = findMacSigningIdentityOfType(identities, certificateType, qualifier);
+    if (identity !== undefined) return identity;
+  }
+  return undefined;
+}
+
+const MacSigningCertificateKind = Schema.Literals(["developer-id", "development", "other"]);
+export type MacSigningCertificateKind = typeof MacSigningCertificateKind.Type;
+
+export function classifyMacSigningCertificate(name: string): MacSigningCertificateKind {
+  if (name.startsWith("Developer ID Application:")) return "developer-id";
+  if (name.startsWith("Apple Development:") || name.startsWith("Mac Developer:")) {
+    return "development";
+  }
+  return "other";
+}
+
+const describeMacSigningCertificateKind = (kind: MacSigningCertificateKind) =>
+  kind === "developer-id"
+    ? "a Developer ID Application certificate"
+    : kind === "development"
+      ? "an Apple Development certificate"
+      : "a certificate that is neither Developer ID Application nor Apple Development";
+
+export class MacSigningIdentityNotFoundError extends Schema.TaggedError<MacSigningIdentityNotFoundError>()(
+  "MacSigningIdentityNotFoundError",
+  {},
+) {
+  override get message(): string {
+    return "No valid signing certificate in the login keychain matches CSC_NAME. List them with `security find-identity -v -p codesigning`.";
+  }
+}
+
+export class MacSigningIdentityMismatchError extends Schema.TaggedError<MacSigningIdentityMismatchError>()(
+  "MacSigningIdentityMismatchError",
+  {
+    mode: MacSignedMode,
+    selectedKind: MacSigningCertificateKind,
+  },
+) {
+  override get message(): string {
+    return `electron-builder would sign this ${this.mode} build with ${describeMacSigningCertificateKind(this.selectedKind)}. Set CSC_NAME to the SHA-1 of ${describeMacSigningCertificateKind(this.mode)} from \`security find-identity -v -p codesigning\`.`;
+  }
+}
+
+/** Parsed `codesign --display --verbose=2` output, which codesign writes to stderr. */
+export interface MacCodeSignature {
+  /** Leaf first, then its issuers. Empty for ad-hoc or missing signatures. */
+  readonly authorities: ReadonlyArray<string>;
+  readonly teamIdentifier: string | undefined;
+  readonly hardenedRuntime: boolean;
+  /** A secure timestamp from Apple, which notarization requires. */
+  readonly timestamped: boolean;
+}
+
+const MAC_HARDENED_RUNTIME_FLAG = 0x10000n;
+
+export function parseMacCodeSignature(output: string): MacCodeSignature {
+  const lines = output.split(/\r?\n/u).map((line) => line.trim());
+  const valueOf = (key: string) =>
+    lines.find((line) => line.startsWith(`${key}=`))?.slice(key.length + 1);
+  const teamIdentifier = valueOf("TeamIdentifier");
+  const flags = /^CodeDirectory\b[^\r\n]*\bflags=(0x[\da-f]+)\b/imu.exec(output)?.[1];
+  return {
+    authorities: lines
+      .filter((line) => line.startsWith("Authority="))
+      .map((line) => line.slice("Authority=".length)),
+    teamIdentifier: teamIdentifier && teamIdentifier !== "not set" ? teamIdentifier : undefined,
+    hardenedRuntime: flags !== undefined && (BigInt(flags) & MAC_HARDENED_RUNTIME_FLAG) !== 0n,
+    timestamped: valueOf("Timestamp") !== undefined,
+  };
+}
+
+/** Parsed `spctl --assess --verbose=2` output, which spctl writes to stderr. */
+export interface GatekeeperAssessment {
+  readonly accepted: boolean;
+  readonly source: string | undefined;
+}
+
+export const NOTARIZED_DEVELOPER_ID_SOURCE = "Notarized Developer ID";
+
+export function parseGatekeeperAssessment(output: string): GatekeeperAssessment {
+  const lines = output.split(/\r?\n/u).map((line) => line.trim());
+  return {
+    accepted: lines.some((line) => line.endsWith(": accepted")),
+    source: lines.find((line) => line.startsWith("source="))?.slice("source=".length),
+  };
+}
+
+export function isGatekeeperNotarized(assessment: GatekeeperAssessment | undefined): boolean {
+  return assessment?.accepted === true && assessment.source === NOTARIZED_DEVELOPER_ID_SOURCE;
+}
+
+/** `xcrun stapler validate` reports success on stdout and exits 0. */
+export function isStaplerValidation(result: {
+  readonly exitCode: number;
+  readonly stdout: string;
+}): boolean {
+  return result.exitCode === 0 && result.stdout.includes("The validate action worked!");
+}
+
+const NotarySubmission = Schema.Struct({
+  id: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+});
+const decodeNotarySubmission = Schema.decodeUnknownOption(Schema.fromJsonString(NotarySubmission));
+
+/** Reads `xcrun notarytool submit --wait --output-format json`. */
+export function parseNotarySubmission(output: string): {
+  readonly id: string | undefined;
+  readonly status: string | undefined;
+} {
+  const json = output.slice(output.indexOf("{"), output.lastIndexOf("}") + 1);
+  const submission = Option.getOrUndefined(decodeNotarySubmission(json));
+  return { id: submission?.id, status: submission?.status };
+}
+
+const MacReleaseCheck = Schema.Literals([
+  "signature-invalid",
+  "unexpected-certificate",
+  "unexpected-identity",
+  "team-mismatch",
+  "hardened-runtime-missing",
+  "timestamp-missing",
+  "not-stapled",
+  "gatekeeper-rejected",
+  "notarization-rejected",
+]);
+export type MacReleaseCheck = typeof MacReleaseCheck.Type;
+
+/**
+ * The checks a signed app must pass for its mode. A development rehearsal is
+ * held to a valid, hardened Apple Development signature only; it is never
+ * required to be timestamped, stapled or accepted as Notarized Developer ID.
+ */
+export function findMacAppVerificationFailures(input: {
+  readonly mode: MacSignedMode;
+  readonly expectedIdentityName: string | undefined;
+  readonly expectedTeamId: string | undefined;
+  readonly signatureValid: boolean;
+  readonly signature: MacCodeSignature;
+  readonly stapled: boolean | undefined;
+  readonly gatekeeper: GatekeeperAssessment | undefined;
+}): ReadonlyArray<MacReleaseCheck> {
+  const failures: MacReleaseCheck[] = [];
+  const leaf = input.signature.authorities[0];
+  if (!input.signatureValid) failures.push("signature-invalid");
+  if (leaf === undefined || classifyMacSigningCertificate(leaf) !== input.mode) {
+    failures.push("unexpected-certificate");
+  }
+  if (input.expectedIdentityName !== undefined && leaf !== input.expectedIdentityName) {
+    failures.push("unexpected-identity");
+  }
+  if (
+    input.expectedTeamId !== undefined &&
+    input.signature.teamIdentifier !== input.expectedTeamId
+  ) {
+    failures.push("team-mismatch");
+  }
+  if (!input.signature.hardenedRuntime) failures.push("hardened-runtime-missing");
+  if (input.mode === "developer-id") {
+    if (!input.signature.timestamped) failures.push("timestamp-missing");
+    if (input.stapled !== true) failures.push("not-stapled");
+    if (!isGatekeeperNotarized(input.gatekeeper)) failures.push("gatekeeper-rejected");
+  }
+  return failures;
+}
+
+const describeMacReleaseCheck = (check: MacReleaseCheck, mode: MacSignedMode) => {
+  switch (check) {
+    case "signature-invalid":
+      return "codesign --verify --deep --strict rejects the signature";
+    case "unexpected-certificate":
+      return `it is not signed with ${describeMacSigningCertificateKind(mode)}`;
+    case "unexpected-identity":
+      return "it is signed by a different certificate than CSC_NAME selected";
+    case "team-mismatch":
+      return "its TeamIdentifier is not APPLE_TEAM_ID";
+    case "hardened-runtime-missing":
+      return "hardened runtime is off";
+    case "timestamp-missing":
+      return "the signature has no secure timestamp";
+    case "not-stapled":
+      return "no notarization ticket is stapled";
+    case "gatekeeper-rejected":
+      return `Gatekeeper does not accept it as ${NOTARIZED_DEVELOPER_ID_SOURCE}`;
+    case "notarization-rejected":
+      return "Apple's notary service did not accept it";
+  }
+};
+
+export class MacReleaseVerificationError extends Schema.TaggedError<MacReleaseVerificationError>()(
+  "MacReleaseVerificationError",
+  {
+    artifact: Schema.Literals(["app", "dmg"]),
+    mode: MacSignedMode,
+    failures: Schema.Array(MacReleaseCheck),
+    notarySubmissionId: Schema.optionalKey(Schema.String),
+  },
+) {
+  override get message(): string {
+    const details = this.failures.map((check) => describeMacReleaseCheck(check, this.mode));
+    const log = this.notarySubmissionId
+      ? ` Read Apple's report with \`xcrun notarytool log ${this.notarySubmissionId}\` and the same credentials.`
+      : "";
+    return `The ${this.mode} ${this.artifact === "app" ? "app" : "DMG"} failed verification: ${details.join("; ")}.${log}`;
+  }
+}
+
+/** notarytool arguments for the selected credential set, read when the command runs. */
+function notarytoolCredentialArguments(
+  credential: MacNotarizationCredential,
+  env: Readonly<Record<string, string | undefined>>,
+): ReadonlyArray<string> {
+  const read = (name: string) => env[name]?.trim() ?? "";
+  switch (credential) {
+    case "api-key":
+      return [
+        "--key",
+        read("APPLE_API_KEY"),
+        "--key-id",
+        read("APPLE_API_KEY_ID"),
+        "--issuer",
+        read("APPLE_API_ISSUER"),
+      ];
+    case "apple-id":
+      return [
+        "--apple-id",
+        read("APPLE_ID"),
+        "--password",
+        read("APPLE_APP_SPECIFIC_PASSWORD"),
+        "--team-id",
+        read("APPLE_TEAM_ID"),
+      ];
+    case "keychain-profile": {
+      const keychain = read("APPLE_KEYCHAIN");
+      return [
+        "--keychain-profile",
+        read("APPLE_KEYCHAIN_PROFILE"),
+        ...(keychain ? ["--keychain", keychain] : []),
+      ];
+    }
+  }
+}
+
+/** electron-builder's per-architecture output directory for the packaged `.app`. */
+export function macPackagedAppDirectoryName(arch: typeof BuildArch.Type): string {
+  return arch === "x64" ? "mac" : `mac-${arch}`;
+}
+
 export function resolveFffNativeDependencies(
   platform: typeof BuildPlatform.Type,
   arch: typeof BuildArch.Type,
@@ -1757,6 +2426,13 @@ const BuildEnvConfig = Config.all({
   mockUpdateServerPort: Config.String("STARK_CODE_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(
     Config.option,
   ),
+  updateFeed: Config.String("STARK_CODE_DESKTOP_UPDATE_FEED").pipe(Config.option),
+  updateUrl: Config.String("STARK_CODE_DESKTOP_UPDATE_URL").pipe(Config.option),
+  // Removed: any value is an error that names the variables replacing it.
+  updateRepository: Config.String("STARK_CODE_DESKTOP_UPDATE_REPOSITORY").pipe(Config.option),
+  // Update rehearsals only (mock feed): the profile and fault baked into the app.
+  rehearsalProfile: Config.String("STARK_CODE_DESKTOP_REHEARSAL_PROFILE").pipe(Config.option),
+  rehearsalFault: Config.String("STARK_CODE_DESKTOP_REHEARSAL_FAULT").pipe(Config.option),
   // Path to the Linux CLI release archive (stark-<version>-linux-x64.tar.gz) built
   // by the build_linux_cli CI job. The Windows build embeds it verbatim as the
   // WSL runtime.
@@ -1827,14 +2503,6 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     });
   }
   const version = mergeOptions(input.buildVersion, env.version, undefined);
-  const releaseDir = resolveBooleanFlag(input.mockUpdates, env.mockUpdates)
-    ? "release-mock"
-    : "release";
-  const outputDir = path.resolve(
-    repoRoot,
-    mergeOptions(input.outputDir, env.outputDir, releaseDir),
-  );
-
   const skipBuild = resolveBooleanFlag(input.skipBuild, env.skipBuild);
   const keepStage = resolveBooleanFlag(input.keepStage, env.keepStage);
   const signed = resolveBooleanFlag(input.signed, env.signed);
@@ -1852,6 +2520,32 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
           ),
         ));
 
+  const updateFeed = yield* resolveDesktopUpdateFeedPlan({
+    mode: Option.getOrUndefined(env.updateFeed),
+    url: Option.getOrUndefined(env.updateUrl),
+    repository: Option.getOrUndefined(env.updateRepository),
+    mockUpdates,
+    mockUpdateServerPort,
+    signed,
+    rehearsalProfile: Option.getOrUndefined(env.rehearsalProfile),
+    rehearsalFault: Option.getOrUndefined(env.rehearsalFault),
+  });
+
+  // A mock feed build writes only below release-mock/, so it can never land
+  // beside release artifacts.
+  const mockOutputRoot = path.resolve(repoRoot, "release-mock");
+  const outputDir = path.resolve(
+    repoRoot,
+    mergeOptions(
+      input.outputDir,
+      env.outputDir,
+      updateFeed.kind === "mock" ? "release-mock" : "release",
+    ),
+  );
+  if (updateFeed.kind === "mock" && !isPathInside(path, mockOutputRoot, outputDir)) {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "mock-output-dir" });
+  }
+
   const wslRuntime =
     Option.getOrUndefined(input.wslRuntime) ?? Option.getOrUndefined(env.wslRuntime);
 
@@ -1865,8 +2559,7 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     keepStage,
     signed,
     verbose,
-    mockUpdates,
-    mockUpdateServerPort,
+    updateFeed,
     wslRuntime,
   } satisfies ResolvedBuildOptions;
 });
@@ -2389,6 +3082,29 @@ export const stageLinuxCaptureHelper = Effect.fn("stageLinuxCaptureHelper")(func
   }
 });
 
+/** Release helpers must not embed the builder's home or dependency-cache paths. */
+export function resourceMonitorReleaseEnvironment(
+  repoRoot: string,
+  env: Readonly<Record<string, string | undefined>>,
+): Record<string, string | undefined> {
+  // Cargo gives encoded flags precedence over RUSTFLAGS. Keep that precedence
+  // and use its separator so build directories containing spaces stay one flag.
+  const existing =
+    env.CARGO_ENCODED_RUSTFLAGS !== undefined
+      ? env.CARGO_ENCODED_RUSTFLAGS.split("\u001f").filter(Boolean)
+      : (env.RUSTFLAGS ?? "").split(/\s+/).filter(Boolean);
+  const prefixes = [
+    [env.HOME ?? env.USERPROFILE, "/build/home"],
+    [env.CARGO_HOME, "/build/cargo"],
+    [env.RUSTUP_HOME, "/build/rustup"],
+    [repoRoot, "/build/stark-code"],
+  ] as const;
+  const mappings = prefixes.flatMap(([source, destination]) =>
+    source ? [`--remap-path-prefix=${source}=${destination}`] : [],
+  );
+  return { ...env, CARGO_ENCODED_RUSTFLAGS: [...existing, ...mappings].join("\u001f") };
+}
+
 export const stageResourceMonitor = Effect.fn("stageResourceMonitor")(function* (input: {
   readonly repoRoot: string;
   readonly stageResourcesDir: string;
@@ -2421,6 +3137,7 @@ export const stageResourceMonitor = Effect.fn("stageResourceMonitor")(function* 
         ChildProcess.make(spawnCommand.command, spawnCommand.args, {
           cwd: input.repoRoot,
           shell: spawnCommand.shell,
+          env: resourceMonitorReleaseEnvironment(input.repoRoot, process.env),
         }),
         {
           label: `cargo build resource monitor (${rustTarget})`,
@@ -2783,31 +3500,325 @@ export function resolveDesktopRuntimeDependencies(
   );
 }
 
-export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig")(function* (
-  updateChannel: "latest" | "nightly",
+const DesktopUpdateFeedConfigReason = Schema.Literals([
+  "invalid-mode",
+  "mode-required",
+  "repository-removed",
+  "conflicts-with-mock-updates",
+  "url-required",
+  "url-not-allowed",
+  "url-invalid",
+  "mock-output-dir",
+  "mock-developer-id",
+  "not-mac",
+  "stark-needs-developer-id",
+  "team-id-not-configured",
+  "team-id-missing",
+  "team-id-mismatch",
+  "preview-version",
+  "channel-not-enabled",
+  "rehearsal-not-mock",
+  "rehearsal-profile-invalid",
+  "rehearsal-fault-invalid",
+]);
+export type DesktopUpdateFeedConfigReason = typeof DesktopUpdateFeedConfigReason.Type;
+
+const describeFeedUrlProblem = (problem: (typeof FEED_URL_PROBLEMS)[number] | undefined) => {
+  switch (problem) {
+    case "origin-not-allowed":
+      return "its origin is not in stark.brand.json updateFeedOrigins, which stays empty until hosting is approved";
+    case "not-https":
+      return "it is not https";
+    case "credentials":
+      return "it carries a user name or password";
+    case "query-or-fragment":
+      return "it has a query or fragment";
+    case "not-a-directory":
+      return "it does not end in /";
+    case "not-canonical":
+      return "it is not in canonical form (lowercase host, no default port, no dot segments)";
+    case "unsafe-path":
+      return "its path has characters other than letters, digits, . _ + -";
+    case "loopback":
+      return "it points at this machine";
+    default:
+      return "it is not a URL";
+  }
+};
+
+/**
+ * Why a build's update feed configuration was refused. Messages name
+ * variables and the rule that failed, never a credential.
+ */
+export class DesktopUpdateFeedConfigError extends Schema.TaggedError<DesktopUpdateFeedConfigError>()(
+  "DesktopUpdateFeedConfigError",
+  {
+    reason: DesktopUpdateFeedConfigReason,
+    urlProblem: Schema.optionalKey(Schema.Literals(FEED_URL_PROBLEMS)),
+    inputLength: Schema.optionalKey(Schema.Int),
+  },
 ) {
-  const env = yield* Config.all({
-    updateRepository: Config.String("STARK_CODE_DESKTOP_UPDATE_REPOSITORY").pipe(Config.option),
-    githubRepository: Config.String("GITHUB_REPOSITORY").pipe(Config.option),
-  });
-  const rawRepo = (
-    Option.getOrUndefined(env.updateRepository)?.trim() ||
-    Option.getOrUndefined(env.githubRepository)?.trim() ||
-    ""
-  ).trim();
-  if (!rawRepo) return undefined;
+  override get message(): string {
+    switch (this.reason) {
+      case "invalid-mode":
+        return "STARK_CODE_DESKTOP_UPDATE_FEED must be `none`, `stark` or `mock`.";
+      case "mode-required":
+        return "A --signed build must say which update feed it carries: set STARK_CODE_DESKTOP_UPDATE_FEED to `none`, `stark` or `mock`.";
+      case "repository-removed":
+        return "STARK_CODE_DESKTOP_UPDATE_REPOSITORY was removed and is never read. Unset it; a Stark feed is STARK_CODE_DESKTOP_UPDATE_FEED=stark with STARK_CODE_DESKTOP_UPDATE_URL.";
+      case "conflicts-with-mock-updates":
+        return "--mock-updates (STARK_CODE_DESKTOP_MOCK_UPDATES) needs STARK_CODE_DESKTOP_UPDATE_FEED unset or `mock`.";
+      case "url-required":
+        return "STARK_CODE_DESKTOP_UPDATE_FEED=stark needs STARK_CODE_DESKTOP_UPDATE_URL.";
+      case "url-not-allowed":
+        return "STARK_CODE_DESKTOP_UPDATE_URL only applies with STARK_CODE_DESKTOP_UPDATE_FEED=stark.";
+      case "url-invalid":
+        return `STARK_CODE_DESKTOP_UPDATE_URL was refused: ${describeFeedUrlProblem(this.urlProblem)}.`;
+      case "mock-output-dir":
+        return "A mock update feed build must write inside release-mock/. Drop --output-dir or point it below release-mock/.";
+      case "mock-developer-id":
+        return "The localhost mock update feed cannot be baked into a Developer ID build. Use STARK_CODE_MACOS_SIGNING_MODE=development for an update rehearsal.";
+      case "not-mac":
+        return "Update feeds are only baked into macOS builds; use STARK_CODE_DESKTOP_UPDATE_FEED=none.";
+      case "stark-needs-developer-id":
+        return "A Stark update feed needs a Developer ID build, whose designated requirement pins the Stark team.";
+      case "team-id-not-configured":
+        return "A Stark update feed needs appleTeamId in stark.brand.json.";
+      case "team-id-missing":
+        return "A Stark update feed needs APPLE_TEAM_ID, equal to appleTeamId in stark.brand.json.";
+      case "team-id-mismatch":
+        return "APPLE_TEAM_ID is not appleTeamId from stark.brand.json; a Stark feed only ships builds signed by that team.";
+      case "preview-version":
+        return "Preview and pull request builds never carry an update feed; use STARK_CODE_DESKTOP_UPDATE_FEED=none.";
+      case "channel-not-enabled":
+        return "This version's update channel is not in stark.brand.json updateChannels (latest only).";
+      case "rehearsal-not-mock":
+        return "STARK_CODE_DESKTOP_REHEARSAL_PROFILE and STARK_CODE_DESKTOP_REHEARSAL_FAULT only apply with STARK_CODE_DESKTOP_UPDATE_FEED=mock.";
+      case "rehearsal-profile-invalid":
+        return "STARK_CODE_DESKTOP_REHEARSAL_PROFILE must be an absolute directory without . or .. segments.";
+      case "rehearsal-fault-invalid":
+        return `STARK_CODE_DESKTOP_REHEARSAL_FAULT must be one of: ${DESKTOP_REHEARSAL_FAULTS.join(", ")}.`;
+    }
+  }
+}
 
-  const [owner, repo, ...rest] = rawRepo.split("/");
-  if (!owner || !repo || rest.length > 0) return undefined;
+/** The update feed a build bakes in, after its configuration was checked. */
+export type DesktopUpdateFeedPlan =
+  | { readonly kind: "none" }
+  | { readonly kind: "stark"; readonly url: string }
+  | {
+      readonly kind: "mock";
+      readonly url: string;
+      /** A rehearsal's own profile and fault, baked into the app (see BakedRehearsalPolicy). */
+      readonly rehearsal?: BakedRehearsalPolicy | null;
+    };
 
-  return {
-    provider: "github",
-    owner,
-    repo,
-    releaseType: updateChannel === "nightly" ? "prerelease" : "release",
-    ...(updateChannel === "nightly" ? { channel: "nightly" as const } : {}),
-  };
+export const NO_DESKTOP_UPDATE_FEED: DesktopUpdateFeedPlan = { kind: "none" };
+
+const DESKTOP_UPDATE_FEED_MODES = ["none", "stark", "mock"] as const;
+const isDesktopUpdateFeedMode = Schema.is(Schema.Literals(DESKTOP_UPDATE_FEED_MODES));
+
+/**
+ * Resolves STARK_CODE_DESKTOP_UPDATE_FEED and STARK_CODE_DESKTOP_UPDATE_URL.
+ * The feed is always explicit: an unsigned build defaults to none, a signed
+ * one must choose, and a Stark URL must be an HTTPS directory on an origin
+ * stark.brand.json allowlists. Nothing ambient (CI repository variables,
+ * tokens, package metadata) is ever read.
+ */
+export const resolveDesktopUpdateFeedPlan = Effect.fn("resolveDesktopUpdateFeedPlan")(function* (
+  input: {
+    readonly mode: string | undefined;
+    readonly url: string | undefined;
+    readonly repository: string | undefined;
+    readonly mockUpdates: boolean;
+    readonly mockUpdateServerPort: number | undefined;
+    readonly signed: boolean;
+    /** STARK_CODE_DESKTOP_REHEARSAL_PROFILE and _FAULT; mock builds only. */
+    readonly rehearsalProfile?: string | undefined;
+    readonly rehearsalFault?: string | undefined;
+  },
+  ownership: UpdateOwnership = STARK_UPDATE_OWNERSHIP,
+) {
+  if ((input.repository?.trim() ?? "") !== "") {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "repository-removed" });
+  }
+  const configuredMode = input.mode?.trim() ?? "";
+  if (configuredMode !== "" && !isDesktopUpdateFeedMode(configuredMode)) {
+    return yield* new DesktopUpdateFeedConfigError({
+      reason: "invalid-mode",
+      inputLength: configuredMode.length,
+    });
+  }
+  const mode = isDesktopUpdateFeedMode(configuredMode)
+    ? configuredMode
+    : input.mockUpdates
+      ? "mock"
+      : input.signed
+        ? undefined
+        : "none";
+  if (mode === undefined) {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "mode-required" });
+  }
+  if (input.mockUpdates && mode !== "mock") {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "conflicts-with-mock-updates" });
+  }
+  const url = input.url?.trim() ?? "";
+  const rehearsalProfile = input.rehearsalProfile?.trim() ?? "";
+  const rehearsalFault = input.rehearsalFault?.trim() ?? "";
+  if (mode !== "mock" && (rehearsalProfile !== "" || rehearsalFault !== "")) {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "rehearsal-not-mock" });
+  }
+  if (mode !== "stark") {
+    if (url !== "") return yield* new DesktopUpdateFeedConfigError({ reason: "url-not-allowed" });
+    if (mode === "none") return NO_DESKTOP_UPDATE_FEED;
+    if (rehearsalProfile !== "" && !isValidRehearsalProfile(rehearsalProfile)) {
+      return yield* new DesktopUpdateFeedConfigError({ reason: "rehearsal-profile-invalid" });
+    }
+    if (rehearsalFault !== "" && !isDesktopRehearsalFault(rehearsalFault)) {
+      return yield* new DesktopUpdateFeedConfigError({ reason: "rehearsal-fault-invalid" });
+    }
+    const rehearsal: BakedRehearsalPolicy | null =
+      rehearsalProfile === "" && rehearsalFault === ""
+        ? null
+        : {
+            profile: rehearsalProfile === "" ? null : rehearsalProfile,
+            fault: isDesktopRehearsalFault(rehearsalFault) ? rehearsalFault : null,
+          };
+    const mock: DesktopUpdateFeedPlan = {
+      kind: "mock",
+      url: resolveMockUpdateServerUrl(input.mockUpdateServerPort),
+      ...(rehearsal === null ? {} : { rehearsal }),
+    };
+    return mock;
+  }
+  if (url === "") return yield* new DesktopUpdateFeedConfigError({ reason: "url-required" });
+  const checked = checkFeedUrl(url, "stark", ownership);
+  if (!checked.ok) {
+    return yield* new DesktopUpdateFeedConfigError({
+      reason: "url-invalid",
+      urlProblem: checked.problem,
+    });
+  }
+  const stark: DesktopUpdateFeedPlan = { kind: "stark", url: checked.location.href };
+  return stark;
 });
+
+/**
+ * The signing a feed needs, checked before anything is built: a Stark feed
+ * only on a macOS Developer ID build whose APPLE_TEAM_ID is the checked-in
+ * team, and the localhost mock feed never on a Developer ID build.
+ */
+export const checkDesktopUpdateFeedSigning = Effect.fn("checkDesktopUpdateFeedSigning")(function* (
+  input: {
+    readonly feed: DesktopUpdateFeedPlan;
+    readonly platform: typeof BuildPlatform.Type;
+    readonly plan: MacSigningPlan | undefined;
+    readonly env: Readonly<Record<string, string | undefined>>;
+  },
+  ownership: UpdateOwnership = STARK_UPDATE_OWNERSHIP,
+) {
+  if (input.feed.kind === "none") return;
+  if (input.platform !== "mac") {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "not-mac" });
+  }
+  if (input.feed.kind === "mock") {
+    if (input.plan?.mode === "developer-id") {
+      return yield* new DesktopUpdateFeedConfigError({ reason: "mock-developer-id" });
+    }
+    return;
+  }
+  if (input.plan?.mode !== "developer-id") {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "stark-needs-developer-id" });
+  }
+  if (ownership.appleTeamId === null) {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "team-id-not-configured" });
+  }
+  const teamId = input.env.APPLE_TEAM_ID?.trim().toUpperCase() ?? "";
+  if (teamId === "") {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "team-id-missing" });
+  }
+  if (teamId !== ownership.appleTeamId) {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "team-id-mismatch" });
+  }
+});
+
+/**
+ * The electron-builder `publish` value for a build: `null` unless it carries a
+ * feed. `null`, not an omitted key, is what stops electron-builder deriving a
+ * GitHub feed from publish tokens, CI slug variables or a `repository` field.
+ * A feed is generic with an explicit channel; without one electron-builder
+ * derives `beta` from a -beta.N version and writes beta-mac.yml.
+ */
+export const resolveDesktopPublishConfig = Effect.fn("resolveDesktopPublishConfig")(function* (
+  platform: typeof BuildPlatform.Type,
+  version: string,
+  feed: DesktopUpdateFeedPlan,
+  ownership: UpdateOwnership = STARK_UPDATE_OWNERSHIP,
+) {
+  if (feed.kind === "none") return null;
+  if (platform !== "mac") return yield* new DesktopUpdateFeedConfigError({ reason: "not-mac" });
+  if (isDesktopPreviewVersion(version)) {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "preview-version" });
+  }
+  const channel = resolveDesktopUpdateChannel(version);
+  if (!ownership.updateChannels.includes(channel)) {
+    return yield* new DesktopUpdateFeedConfigError({ reason: "channel-not-enabled" });
+  }
+  return [{ provider: "generic" as const, url: feed.url, channel }];
+});
+
+/**
+ * The update policy baked into the packaged package.json. The app accepts its
+ * app-update.yml only when both agree and match stark.brand.json.
+ */
+export function createBakedUpdatePolicy(
+  feed: DesktopUpdateFeedPlan,
+  version: string,
+  ownership: UpdateOwnership = STARK_UPDATE_OWNERSHIP,
+): BakedUpdatePolicy {
+  if (feed.kind === "none") {
+    return { kind: "none", url: null, channels: [], appleTeamId: ownership.appleTeamId };
+  }
+  const rehearsal = feed.kind === "mock" ? (feed.rehearsal ?? null) : null;
+  return {
+    kind: feed.kind,
+    url: feed.url,
+    channels: [resolveDesktopUpdateChannel(version)],
+    appleTeamId: ownership.appleTeamId,
+    // Only a rehearsal build carries one; everything else leaves the key out.
+    ...(rehearsal === null ? {} : { rehearsal }),
+  };
+}
+
+/**
+ * The variables electron-builder reads to pick a publisher or a repository
+ * when a build gives it none. Builds never need them, so the packaging
+ * environment drops them whatever `publish` says.
+ */
+const PUBLISH_DETECTION_ENV_KEYS = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GITLAB_TOKEN",
+  "KEYGEN_TOKEN",
+  "BITBUCKET_TOKEN",
+  "BT_TOKEN",
+  "TRAVIS_REPO_SLUG",
+  "APPVEYOR_REPO_NAME",
+] as const;
+
+export function removePublishDetectionEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): Record<string, string | undefined> {
+  const next = { ...env };
+  for (const key of PUBLISH_DETECTION_ENV_KEYS) delete next[key];
+  for (const key of Object.keys(next)) {
+    if (key.startsWith("CIRCLE_PROJECT_")) delete next[key];
+  }
+  return next;
+}
+
+/** The electron-builder afterPack hook that adds `kind` to app-update.yml, relative to the repo root. */
+export const DESKTOP_UPDATE_KIND_HOOK = "scripts/bake-desktop-update-kind.ts";
 
 export function resolveDesktopUpdateChannel(version: string): "latest" | "nightly" {
   return /-nightly\.\d{8}\.\d+$/.test(version) ? "nightly" : "latest";
@@ -2845,7 +3856,15 @@ export function resolveDesktopBuildIconAssets(version: string): DesktopBuildIcon
 }
 
 export function resolveMockUpdateServerUrl(mockUpdateServerPort: number | undefined): string {
-  return `http://localhost:${mockUpdateServerPort ?? 3000}`;
+  return `http://localhost:${mockUpdateServerPort ?? 3000}/`;
+}
+
+function isPathInside(path: Path.Path, root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  );
 }
 
 // Electron Builder detects pnpm from npm_config_user_agent, whose value uses
@@ -2872,12 +3891,13 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   target: string,
   version: string,
   signed: boolean,
-  mockUpdates: boolean,
-  mockUpdateServerPort: number | undefined,
-  macPasskeySigning:
+  updateFeed: DesktopUpdateFeedPlan,
+  macSigning:
     | {
+        readonly mode: MacSignedMode;
         readonly entitlementsPath: string;
-        readonly provisioningProfilePath: string;
+        readonly entitlementsInheritPath: string;
+        readonly provisioningProfilePath?: string;
       }
     | undefined,
   // Windows only, and false when no Linux CLI archive was handed to the build:
@@ -2921,24 +3941,19 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     ],
   };
   const updateChannel = resolveDesktopUpdateChannel(version);
-  if (!isDesktopPreviewVersion(version)) {
-    const publishConfig = yield* resolveGitHubPublishConfig(updateChannel);
-    if (publishConfig) {
-      buildConfig.publish = [publishConfig];
-    } else if (mockUpdates) {
-      buildConfig.publish = [
-        {
-          provider: "generic",
-          url: resolveMockUpdateServerUrl(mockUpdateServerPort),
-        },
-      ];
-    }
-  }
+  // Set on the root and on the platform, which electron-builder reads first.
+  const publish = yield* resolveDesktopPublishConfig(platform, version, updateFeed);
+  buildConfig.publish = publish;
 
   if (platform === "mac") {
     const path = yield* Path.Path;
     const repoRoot = yield* RepoRoot;
+    if (publish !== null) {
+      // Adds the baked feed kind to app-update.yml before the app is signed.
+      buildConfig.afterPack = path.join(repoRoot, DESKTOP_UPDATE_KIND_HOOK);
+    }
     buildConfig.mac = {
+      publish,
       target: target === "dmg" ? [target, "zip"] : [target],
       icon: "icon.icns",
       category: "public.app-category.developer-tools",
@@ -2977,10 +3992,20 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
         },
       ],
       ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
-      ...(macPasskeySigning
+      ...(macSigning
         ? {
-            entitlements: macPasskeySigning.entitlementsPath,
-            provisioningProfile: macPasskeySigning.provisioningProfilePath,
+            // electron-builder skips signing without an error when a custom `sign`
+            // finds no identity, so preflightMacSigning and verifyMacSignedApp
+            // are what stop an unsigned app.
+            hardenedRuntime: true,
+            type: macSigning.mode === "development" ? "development" : "distribution",
+            // A development rehearsal is never notarized; a Developer ID build always is.
+            notarize: macSigning.mode === "developer-id",
+            entitlements: macSigning.entitlementsPath,
+            entitlementsInherit: macSigning.entitlementsInheritPath,
+            ...(macSigning.provisioningProfilePath
+              ? { provisioningProfile: macSigning.provisioningProfilePath }
+              : {}),
           }
         : {}),
     };
@@ -3005,6 +4030,9 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       ],
       iconSize: 120,
       iconTextSize: 12,
+      // Gatekeeper assesses a downloaded DMG by its own signature before the
+      // notarization ticket stapled to it counts.
+      ...(macSigning?.mode === "developer-id" ? { sign: true } : {}),
     };
   }
 
@@ -3016,6 +4044,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     const path = yield* Path.Path;
     const repoRoot = yield* RepoRoot;
     buildConfig.linux = {
+      publish,
       // The .deb is built from the same unpacked app after the AppImage.
       // electron-builder lists both in latest-linux.yml and writes
       // resources/package-type into the .deb only, so electron-updater updates
@@ -3074,6 +4103,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     // in trading update bandwidth for install speed.
     buildConfig.nsis = { differentialPackage: true };
     const winConfig: Record<string, unknown> = {
+      publish,
       target: [target],
       icon: "icon.ico",
       // Smart App Control validates unpacked native addons independently from
@@ -3658,6 +4688,589 @@ export const validateWindowsPackagedPayload = Effect.fn(
   return { packagedAppDir, fileCount, unpackedFiles } as const;
 });
 
+export class MissingMacNotarizationKeyFileError extends Schema.TaggedError<MissingMacNotarizationKeyFileError>()(
+  "MissingMacNotarizationKeyFileError",
+  {},
+) {
+  override get message(): string {
+    return "APPLE_API_KEY must be the path of the App Store Connect AuthKey_<key id>.p8 file, and no file exists at that path.";
+  }
+}
+
+/**
+ * Checks what can be checked about signing before packaging: the API key file
+ * exists, and a CSC_NAME qualifier resolves in the login keychain to the
+ * certificate kind the mode needs, the way electron-builder will resolve it.
+ * Returns that keychain identity, which the signed app must then carry.
+ */
+export const preflightMacSigning = Effect.fn("preflightMacSigning")(function* (input: {
+  readonly plan: MacSigningPlan;
+  readonly env: Readonly<Record<string, string | undefined>>;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const { plan } = input;
+  if (plan.notarization === "api-key") {
+    const keyPath = input.env.APPLE_API_KEY?.trim() ?? "";
+    const keyExists = keyPath
+      ? yield* fs.exists(keyPath).pipe(Effect.orElseSucceed(() => false))
+      : false;
+    if (!keyExists) return yield* new MissingMacNotarizationKeyFileError();
+  }
+  if (plan.mode === "unsigned" || plan.keychainIdentity === undefined) return undefined;
+
+  const allIdentities = yield* spawnAndCollectOutput(
+    ChildProcess.make("/usr/bin/security", ["find-identity", "-v"]),
+  );
+  const codesigningIdentities = yield* spawnAndCollectOutput(
+    ChildProcess.make("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"]),
+  );
+  const identity = selectMacSigningIdentity(
+    parseMacSigningIdentities(allIdentities.stdout, codesigningIdentities.stdout),
+    plan.mode,
+    plan.keychainIdentity,
+  );
+  if (identity === undefined) return yield* new MacSigningIdentityNotFoundError();
+  const selectedKind = classifyMacSigningCertificate(identity.name);
+  if (selectedKind !== plan.mode) {
+    return yield* new MacSigningIdentityMismatchError({ mode: plan.mode, selectedKind });
+  }
+  return identity;
+});
+
+export interface MacAppReleaseVerification {
+  readonly authority: string | null;
+  readonly teamId: string | null;
+  readonly hardenedRuntime: boolean;
+  readonly timestamped: boolean;
+  readonly appStapled: boolean;
+  /** spctl's `source`, such as "Notarized Developer ID"; null when not assessed. */
+  readonly gatekeeper: string | null;
+}
+
+/**
+ * Verifies the app electron-builder signed, while its stage still exists.
+ * Only a developer-id build runs stapler and Gatekeeper, so a development
+ * rehearsal never has to pass as Notarized Developer ID.
+ */
+export const verifyMacSignedApp = Effect.fn("verifyMacSignedApp")(function* (input: {
+  readonly appPath: string;
+  readonly mode: MacSignedMode;
+  readonly expectedIdentityName: string | undefined;
+  readonly expectedTeamId: string | undefined;
+}) {
+  const verification = yield* spawnAndCollectOutput(
+    ChildProcess.make("/usr/bin/codesign", [
+      "--verify",
+      "--deep",
+      "--strict",
+      "--verbose=2",
+      input.appPath,
+    ]),
+  );
+  const display = yield* spawnAndCollectOutput(
+    ChildProcess.make("/usr/bin/codesign", ["--display", "--verbose=2", input.appPath]),
+  );
+  const signature = parseMacCodeSignature(`${display.stdout}\n${display.stderr}`);
+
+  let stapled: boolean | undefined;
+  let gatekeeper: GatekeeperAssessment | undefined;
+  if (input.mode === "developer-id") {
+    stapled = isStaplerValidation(
+      yield* spawnAndCollectOutput(
+        ChildProcess.make("/usr/bin/xcrun", ["stapler", "validate", input.appPath]),
+      ),
+    );
+    const assessment = yield* spawnAndCollectOutput(
+      ChildProcess.make("/usr/sbin/spctl", [
+        "--assess",
+        "--type",
+        "execute",
+        "--verbose=2",
+        input.appPath,
+      ]),
+    );
+    gatekeeper = parseGatekeeperAssessment(`${assessment.stdout}\n${assessment.stderr}`);
+  }
+
+  const failures = findMacAppVerificationFailures({
+    mode: input.mode,
+    expectedIdentityName: input.expectedIdentityName,
+    expectedTeamId: input.expectedTeamId,
+    signatureValid: verification.exitCode === 0,
+    signature,
+    stapled,
+    gatekeeper,
+  });
+  if (failures.length > 0) {
+    return yield* new MacReleaseVerificationError({ artifact: "app", mode: input.mode, failures });
+  }
+  const result: MacAppReleaseVerification = {
+    authority: signature.authorities[0] ?? null,
+    teamId: signature.teamIdentifier ?? null,
+    hardenedRuntime: signature.hardenedRuntime,
+    timestamped: signature.timestamped,
+    appStapled: stapled === true,
+    gatekeeper: gatekeeper?.source ?? null,
+  };
+  return result;
+});
+
+const digestFile = Effect.fn("digestFile")(function* (
+  filePath: string,
+  algorithm: "sha256" | "sha512",
+  encoding: "hex" | "base64",
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const hash = NodeCrypto.createHash(algorithm);
+  let bytes = 0;
+  yield* fs.stream(filePath).pipe(
+    Stream.runForEach((chunk) =>
+      Effect.sync(() => {
+        hash.update(chunk);
+        bytes += chunk.byteLength;
+      }),
+    ),
+  );
+  return { bytes, digest: hash.digest(encoding) };
+});
+
+class MacDmgMetadataRefreshError extends Schema.TaggedError<MacDmgMetadataRefreshError>()(
+  "MacDmgMetadataRefreshError",
+  {
+    file: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Could not rebuild the block map of ${this.file} after stapling.`;
+  }
+}
+
+const isBlockMapModule = (
+  value: unknown,
+): value is {
+  readonly buildBlockMap: (file: string, compression: "gzip", outFile: string) => Promise<unknown>;
+} =>
+  typeof value === "object" &&
+  value !== null &&
+  "buildBlockMap" in value &&
+  typeof value.buildBlockMap === "function";
+
+// electron-builder's own writer, so a rebuilt block map matches the ones it emits.
+const loadElectronBuilderBlockMapWriter = (desktopPackageJsonPath: string) => {
+  const desktopRequire = NodeModule.createRequire(desktopPackageJsonPath);
+  const builderRequire = NodeModule.createRequire(desktopRequire.resolve("electron-builder"));
+  const blockMap: unknown = builderRequire("app-builder-lib/out/targets/blockmap/blockmap.js");
+  if (!isBlockMapModule(blockMap)) {
+    throw new Error("app-builder-lib no longer exports buildBlockMap.");
+  }
+  return blockMap.buildBlockMap;
+};
+
+/**
+ * Rebuilds what electron-builder derived from a DMG after the DMG changed: its
+ * block map and its digest in every update manifest beside it.
+ */
+const refreshMacDmgUpdateMetadata = Effect.fn("refreshMacDmgUpdateMetadata")(function* (input: {
+  readonly dmgPath: string;
+  readonly stageDistDir: string;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const repoRoot = yield* RepoRoot;
+  const dmgName = path.basename(input.dmgPath);
+  const blockMapPath = `${input.dmgPath}.blockmap`;
+  if (yield* fs.exists(blockMapPath)) {
+    yield* Effect.tryPromise({
+      try: () =>
+        loadElectronBuilderBlockMapWriter(path.join(repoRoot, "apps/desktop/package.json"))(
+          input.dmgPath,
+          "gzip",
+          blockMapPath,
+        ),
+      catch: (cause) => new MacDmgMetadataRefreshError({ file: dmgName, cause }),
+    });
+  }
+
+  const { bytes, digest } = yield* digestFile(input.dmgPath, "sha512", "base64");
+  for (const entry of yield* fs.readDirectory(input.stageDistDir)) {
+    if (!entry.endsWith(".yml") || entry.startsWith("builder-")) continue;
+    const manifestPath = path.join(input.stageDistDir, entry);
+    const manifest = yield* fs.readFileString(manifestPath);
+    const refreshed = replaceUpdateManifestFileDigest(manifest, {
+      url: dmgName,
+      sha512: digest,
+      size: bytes,
+    });
+    if (refreshed !== manifest) yield* fs.writeFileString(manifestPath, refreshed);
+  }
+});
+
+/** Stamps `starkFeedKind: mock` into every channel manifest a mock build wrote. */
+export const markMockFeedManifests = Effect.fn("markMockFeedManifests")(function* (
+  stageDistDir: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  for (const entry of yield* fs.readDirectory(stageDistDir)) {
+    if (!entry.endsWith(".yml") || entry.startsWith("builder-")) continue;
+    const manifestPath = path.join(stageDistDir, entry);
+    const manifest = yield* fs.readFileString(manifestPath);
+    const marked = withMockFeedKind(manifest);
+    if (marked !== manifest) yield* fs.writeFileString(manifestPath, marked);
+  }
+});
+
+export class MacNotarizationCommandError extends Schema.TaggedError<MacNotarizationCommandError>()(
+  "MacNotarizationCommandError",
+  {
+    reason: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `xcrun notarytool could not run (${this.reason}). Its arguments are not shown because they carry the notarization credentials.`;
+  }
+}
+
+/**
+ * Notarizes, staples and checks a Developer ID DMG, then rebuilds the metadata
+ * electron-builder derived from it. Stapling rewrites the DMG after
+ * electron-builder hashed it, so the block map and manifest digests are
+ * recomputed from the final bytes before anything is copied out or recorded.
+ */
+export const finalizeMacDmg = Effect.fn("finalizeMacDmg")(function* (input: {
+  readonly dmgPath: string;
+  readonly stageDistDir: string;
+  readonly notarization: MacNotarizationCredential;
+  readonly env: Readonly<Record<string, string | undefined>>;
+  readonly verbose: boolean;
+}) {
+  const path = yield* Path.Path;
+  const dmgName = path.basename(input.dmgPath);
+  yield* Effect.log(`[desktop-artifact] Notarizing ${dmgName}; this waits for Apple...`);
+  const submission = yield* spawnAndCollectOutput(
+    ChildProcess.make("/usr/bin/xcrun", [
+      "notarytool",
+      "submit",
+      input.dmgPath,
+      "--wait",
+      "--output-format",
+      "json",
+      ...notarytoolCredentialArguments(input.notarization, input.env),
+    ]),
+  ).pipe(
+    // A spawn error quotes the whole command line, credentials included.
+    Effect.mapError((error) => new MacNotarizationCommandError({ reason: error.reason._tag })),
+  );
+  const { id, status } = parseNotarySubmission(submission.stdout);
+  if (submission.exitCode !== 0 || status !== "Accepted") {
+    return yield* new MacReleaseVerificationError({
+      artifact: "dmg",
+      mode: "developer-id",
+      failures: ["notarization-rejected"],
+      ...(id ? { notarySubmissionId: id } : {}),
+    });
+  }
+
+  yield* runCommand(ChildProcess.make("/usr/bin/xcrun", ["stapler", "staple", input.dmgPath]), {
+    label: `xcrun stapler staple ${dmgName}`,
+    verbose: input.verbose,
+  });
+  const stapled = isStaplerValidation(
+    yield* spawnAndCollectOutput(
+      ChildProcess.make("/usr/bin/xcrun", ["stapler", "validate", input.dmgPath]),
+    ),
+  );
+  const assessment = yield* spawnAndCollectOutput(
+    ChildProcess.make("/usr/sbin/spctl", [
+      "--assess",
+      "--type",
+      "open",
+      "--context",
+      "context:primary-signature",
+      "--verbose=2",
+      input.dmgPath,
+    ]),
+  );
+  const failures: MacReleaseCheck[] = [];
+  if (!stapled) failures.push("not-stapled");
+  if (
+    !isGatekeeperNotarized(parseGatekeeperAssessment(`${assessment.stdout}\n${assessment.stderr}`))
+  ) {
+    failures.push("gatekeeper-rejected");
+  }
+  if (failures.length > 0) {
+    return yield* new MacReleaseVerificationError({
+      artifact: "dmg",
+      mode: "developer-id",
+      failures,
+    });
+  }
+
+  yield* refreshMacDmgUpdateMetadata({ dmgPath: input.dmgPath, stageDistDir: input.stageDistDir });
+});
+
+const PackagedDesktopUpdateFeedReason = Schema.Literals([
+  "unexpected-app-update",
+  "app-update-missing",
+  "app-update-mismatch",
+  "requirement-not-pinned",
+  "requirement-identifier",
+]);
+
+/** The packaged app does not carry exactly the update feed and signature the build asked for. */
+export class PackagedDesktopUpdateFeedError extends Schema.TaggedError<PackagedDesktopUpdateFeedError>()(
+  "PackagedDesktopUpdateFeedError",
+  {
+    reason: PackagedDesktopUpdateFeedReason,
+    file: Schema.String,
+    problem: Schema.optionalKey(Schema.Literals(STARK_UPDATE_FEED_PROBLEMS)),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "unexpected-app-update":
+        return `${this.file} exists, but this build carries no update feed. electron-builder derived one; refusing to ship it.`;
+      case "app-update-missing":
+        return `No app-update.yml was packaged, but this build carries an update feed (${this.file}).`;
+      case "app-update-mismatch":
+        return `${this.file} is not the update feed this build baked (${this.problem ?? "mismatch"}).`;
+      case "requirement-not-pinned":
+        return `The designated requirement of ${this.file} does not pin the bundle id and the Stark team.`;
+      case "requirement-identifier":
+        return `The designated requirement of ${this.file} does not name the Stark bundle id.`;
+    }
+  }
+}
+
+export interface PackagedUpdateFeedEvidence {
+  /** app-update.yml relative to the stage dist directory, or null for a build without a feed. */
+  readonly file: string | null;
+  readonly sha256: string | null;
+}
+
+/**
+ * Reads every app-update.yml electron-builder packaged (in a macOS .app's
+ * Resources, or `resources/` of an unpacked Linux or Windows app) and checks
+ * it with the code the app uses at runtime. A build without a feed must have
+ * none; a build with one must have exactly the baked feed.
+ */
+export const verifyPackagedUpdateFeed = Effect.fn("verifyPackagedUpdateFeed")(function* (
+  input: { readonly stageDistDir: string; readonly policy: BakedUpdatePolicy },
+  ownership: UpdateOwnership = STARK_UPDATE_OWNERSHIP,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const candidates: string[] = [];
+  for (const entry of (yield* fs.readDirectory(input.stageDistDir)).toSorted()) {
+    const entryPath = path.join(input.stageDistDir, entry);
+    const stat = yield* fs.stat(entryPath).pipe(Effect.orElseSucceed(() => null));
+    if (stat?.type !== "Directory") continue;
+    candidates.push(path.join(entryPath, "resources", "app-update.yml"));
+    for (const child of (yield* fs.readDirectory(entryPath)).toSorted()) {
+      if (child.endsWith(".app")) {
+        candidates.push(path.join(entryPath, child, "Contents", "Resources", "app-update.yml"));
+      }
+    }
+  }
+  const found: string[] = [];
+  for (const candidate of candidates) {
+    if (yield* fs.exists(candidate)) found.push(candidate);
+  }
+  const relative = (file: string) => path.relative(input.stageDistDir, file);
+  if (input.policy.kind === "none") {
+    const [unexpected] = found;
+    if (unexpected !== undefined) {
+      return yield* new PackagedDesktopUpdateFeedError({
+        reason: "unexpected-app-update",
+        file: relative(unexpected),
+      });
+    }
+    const none: PackagedUpdateFeedEvidence = { file: null, sha256: null };
+    return none;
+  }
+  const [first] = found;
+  if (first === undefined) {
+    return yield* new PackagedDesktopUpdateFeedError({
+      reason: "app-update-missing",
+      file: input.stageDistDir,
+    });
+  }
+  for (const file of found) {
+    const validation = validateStarkUpdateFeed(
+      yield* fs.readFileString(file),
+      input.policy,
+      ownership,
+    );
+    if (!validation.ok) {
+      return yield* new PackagedDesktopUpdateFeedError({
+        reason: "app-update-mismatch",
+        file: relative(file),
+        problem: validation.problem,
+      });
+    }
+  }
+  const evidence: PackagedUpdateFeedEvidence = {
+    file: relative(first),
+    sha256: (yield* digestFile(first, "sha256", "hex")).digest,
+  };
+  return evidence;
+});
+
+/**
+ * Reads the signed app's designated requirement, which Squirrel.Mac holds
+ * every update to. A Stark feed build must pin the bundle id and the
+ * checked-in team; every signed build must at least name the bundle id.
+ */
+export const verifyMacDesignatedRequirement = Effect.fn("verifyMacDesignatedRequirement")(
+  function* (
+    input: { readonly appPath: string; readonly feed: DesktopUpdateFeedPlan },
+    ownership: UpdateOwnership = STARK_UPDATE_OWNERSHIP,
+  ) {
+    const display = yield* spawnAndCollectOutput(
+      ChildProcess.make("/usr/bin/codesign", ["--display", "-r-", input.appPath]),
+    );
+    const requirement = parseDesignatedRequirement(`${display.stdout}\n${display.stderr}`);
+    const file = input.appPath;
+    if (input.feed.kind === "stark") {
+      const teamId = ownership.appleTeamId;
+      if (
+        teamId === null ||
+        !requirementPinsIdentity(requirement, { bundleId: ownership.bundleId, teamId })
+      ) {
+        return yield* new PackagedDesktopUpdateFeedError({
+          reason: "requirement-not-pinned",
+          file,
+        });
+      }
+    } else if (requirement.identifier !== ownership.bundleId) {
+      return yield* new PackagedDesktopUpdateFeedError({ reason: "requirement-identifier", file });
+    }
+    return requirement;
+  },
+);
+
+/** What release-proof.json records about the update feed, from the packaged files. */
+export interface DesktopReleaseFeed {
+  readonly kind: BakedUpdatePolicy["kind"];
+  readonly url: string | null;
+  readonly channel: string | null;
+  readonly policy: BakedUpdatePolicy;
+  readonly appUpdateYml: PackagedUpdateFeedEvidence;
+}
+
+export function describeDesktopReleaseFeed(
+  policy: BakedUpdatePolicy,
+  appUpdateYml: PackagedUpdateFeedEvidence,
+): DesktopReleaseFeed {
+  return {
+    kind: policy.kind,
+    url: policy.url,
+    channel: policy.channels[0] ?? null,
+    policy,
+    appUpdateYml,
+  };
+}
+
+export interface DesktopReleaseArtifact {
+  readonly file: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+/**
+ * The contents of release-proof.json. It names the signing certificate and
+ * which credential set notarized the build, never a credential value.
+ */
+export function createDesktopReleaseProof(input: {
+  readonly version: string;
+  readonly arch: typeof BuildArch.Type;
+  readonly commit: string;
+  readonly builtAt: string;
+  readonly feed: DesktopReleaseFeed;
+  readonly artifacts: ReadonlyArray<DesktopReleaseArtifact>;
+  readonly plan: MacSigningPlan;
+  readonly app: MacAppReleaseVerification | undefined;
+  /** `codesign -d -r-` of the signed app, or undefined when it is unsigned. */
+  readonly requirement: string | undefined;
+  readonly dmgStapled: boolean;
+  readonly ownership?: UpdateOwnership;
+}) {
+  const ownership = input.ownership ?? STARK_UPDATE_OWNERSHIP;
+  const teamId = ownership.appleTeamId;
+  const teamPinned =
+    teamId !== null &&
+    input.app?.teamId === teamId &&
+    input.requirement !== undefined &&
+    requirementPinsIdentity(parseDesignatedRequirement(`designated => ${input.requirement}`), {
+      bundleId: ownership.bundleId,
+      teamId,
+    });
+  return {
+    schema: 1,
+    version: input.version,
+    channel: resolveDesktopUpdateChannel(input.version),
+    arch: input.arch,
+    commit: input.commit,
+    builtAt: input.builtAt,
+    feed: input.feed,
+    artifacts: input.artifacts,
+    mac: {
+      signingMode: input.plan.mode,
+      identitySource: input.plan.identitySource ?? null,
+      notarization: input.plan.notarization ?? null,
+      authority: input.app?.authority ?? null,
+      teamId: input.app?.teamId ?? null,
+      hardenedRuntime: input.app?.hardenedRuntime ?? false,
+      timestamped: input.app?.timestamped ?? false,
+      appStapled: input.app?.appStapled ?? false,
+      dmgStapled: input.dmgStapled,
+      gatekeeper: input.app?.gatekeeper ?? null,
+      designatedRequirement: input.requirement ?? null,
+      teamPinned,
+      // Only a notarized Developer ID build of the checked-in team, whose
+      // requirement pins that team, on a Stark feed or explicitly without
+      // one, is fit for another Mac.
+      distributable:
+        input.plan.mode === "developer-id" &&
+        input.app?.appStapled === true &&
+        input.app.gatekeeper === NOTARIZED_DEVELOPER_ID_SOURCE &&
+        (input.feed.kind === "stark" || input.feed.kind === "none") &&
+        teamPinned,
+    },
+  };
+}
+
+export const RELEASE_PROOF_FILE_NAME = "release-proof.json";
+const encodeReleaseProof = Schema.encodeEffect(fromJsonStringPretty(Schema.Unknown));
+
+/**
+ * Writes release-proof.json beside the artifacts. It hashes the files as they
+ * were finally copied out, so it must run after every artifact mutation.
+ */
+export const writeDesktopReleaseProof = Effect.fn("writeDesktopReleaseProof")(function* (
+  input: Omit<Parameters<typeof createDesktopReleaseProof>[0], "artifacts" | "builtAt"> & {
+    readonly outputDir: string;
+    readonly artifactPaths: ReadonlyArray<string>;
+  },
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const artifacts: DesktopReleaseArtifact[] = [];
+  for (const artifactPath of input.artifactPaths) {
+    const { bytes, digest } = yield* digestFile(artifactPath, "sha256", "hex");
+    artifacts.push({ file: path.basename(artifactPath), bytes, sha256: digest });
+  }
+  const proof = createDesktopReleaseProof({
+    ...input,
+    builtAt: DateTime.formatIso(yield* DateTime.now),
+    artifacts,
+  });
+  const proofPath = path.join(input.outputDir, RELEASE_PROOF_FILE_NAME);
+  yield* fs.writeFileString(proofPath, `${yield* encodeReleaseProof(proof)}\n`);
+  return proofPath;
+});
+
 const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   options: ResolvedBuildOptions,
 ) {
@@ -3680,6 +5293,27 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       }),
     });
   }
+  // Signing credentials are read from the process environment only, never
+  // from the repo .env files that worktree setup links everywhere.
+  const macSigningPlan =
+    options.platform === "mac"
+      ? yield* resolveMacSigningPlan({ signed: options.signed, env: process.env })
+      : undefined;
+  const macSigningIdentity =
+    macSigningPlan && hostPlatform === "darwin"
+      ? yield* preflightMacSigning({ plan: macSigningPlan, env: process.env })
+      : undefined;
+  if (macSigningPlan) {
+    yield* Effect.log(
+      `[desktop-artifact] macOS signing: ${macSigningPlan.mode}${macSigningPlan.notarization ? `, notarized with the ${macSigningPlan.notarization} credentials` : ""}.`,
+    );
+  }
+  yield* checkDesktopUpdateFeedSigning({
+    feed: options.updateFeed,
+    platform: options.platform,
+    plan: macSigningPlan,
+    env: process.env,
+  });
   const workspaceConfig = yield* readWorkspaceConfig();
   const workspaceCatalog = workspaceConfig.catalog ?? {};
   const workspaceOverrides = workspaceConfig.overrides ?? {};
@@ -3735,6 +5369,18 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   });
 
   const appVersion = options.version ?? serverPackageJson.version;
+  // Fails before staging when this version cannot carry the requested feed.
+  yield* resolveDesktopPublishConfig(options.platform, appVersion, options.updateFeed);
+  const bakedUpdatePolicy = createBakedUpdatePolicy(options.updateFeed, appVersion);
+  yield* Effect.log(
+    `[desktop-artifact] Update feed: ${options.updateFeed.kind === "none" ? "none (the app never checks for updates)" : `${options.updateFeed.kind} ${options.updateFeed.url}`}.`,
+  );
+  const rehearsal = bakedUpdatePolicy.rehearsal ?? null;
+  if (rehearsal !== null) {
+    yield* Effect.log(
+      `[desktop-artifact] Update rehearsal: profile ${rehearsal.profile ?? "none"}, fault ${rehearsal.fault ?? "none"}.`,
+    );
+  }
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
   const commitHash = yield* resolveGitCommitHash(repoRoot);
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
@@ -3934,10 +5580,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const stageProdResourcesDir = path.join(stageAppDir, "apps/desktop/prod-resources");
   yield* fs.copy(stageResourcesDir, stageProdResourcesDir);
 
+  const macPasskeyEnv =
+    options.platform === "mac" && options.signed ? loadRepoEnv({ repoRoot }) : undefined;
   const configuredMacPasskeySigning =
-    options.platform === "mac" && options.signed
+    macPasskeyEnv && isMacPasskeySigningRequested(macPasskeyEnv)
       ? yield* Effect.try({
-          try: () => resolveMacPasskeySigningConfiguration(loadRepoEnv({ repoRoot })),
+          try: () => resolveMacPasskeySigningConfiguration(macPasskeyEnv),
           catch: MacPasskeySigningConfigurationResolutionError.fromCause,
         })
       : undefined;
@@ -4002,6 +5650,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     starkcodeCommitHash: commitHash,
     // Read by apps/desktop/src/preview/Passkeys.ts; must match the signed entitlements.
     ...(macWebAuthn ? { starkcodeWebAuthn: macWebAuthn } : {}),
+    [BAKED_UPDATE_POLICY_KEY]: bakedUpdatePolicy,
     private: true,
     packageManager: rootPackageJson.packageManager,
     description:
@@ -4016,12 +5665,20 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       options.target,
       appVersion,
       options.signed,
-      options.mockUpdates,
-      options.mockUpdateServerPort,
-      macPasskeySigning && macEntitlementsPath
+      options.updateFeed,
+      macSigningPlan && macSigningPlan.mode !== "unsigned"
         ? {
-            entitlementsPath: macEntitlementsPath,
-            provisioningProfilePath: macPasskeySigning.provisioningProfilePath,
+            mode: macSigningPlan.mode,
+            entitlementsPath:
+              macPasskeySigning && macEntitlementsPath
+                ? macEntitlementsPath
+                : path.join(stageResourcesDir, MAC_ENTITLEMENTS_FILE_NAME),
+            // Helper processes never get the passkey entitlements, only the
+            // hardened-runtime exceptions and microphone access.
+            entitlementsInheritPath: path.join(stageResourcesDir, MAC_ENTITLEMENTS_FILE_NAME),
+            ...(macPasskeySigning
+              ? { provisioningProfilePath: macPasskeySigning.provisioningProfilePath }
+              : {}),
           }
         : undefined,
       bundlesWslRuntime({ platform: options.platform, runtimeArchivePath: options.wslRuntime }),
@@ -4103,9 +5760,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   // electron-builder treats several set-but-empty variables (e.g. CSC_LINK="")
   // as enabled, so copy the host env and scrub empty values instead of relying
   // on `extendEnv` merging.
-  const buildEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-  };
+  const buildEnv: NodeJS.ProcessEnv = removePublishDetectionEnv(
+    removeUnusedSigningCredentials(process.env, {
+      signed: options.signed,
+      macSigningMode: macSigningPlan?.mode,
+    }),
+  );
   buildEnv.npm_config_user_agent = resolvePackageManagerUserAgent(rootPackageJson.packageManager);
   for (const [key, value] of Object.entries(buildEnv)) {
     if (value === "") {
@@ -4116,14 +5776,6 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     // fpm compresses the .deb with the system xz through tar. Threaded mode
     // takes seconds on a many-core runner instead of about two minutes.
     buildEnv.XZ_DEFAULTS = "-T0";
-  }
-  if (!options.signed) {
-    buildEnv.CSC_IDENTITY_AUTO_DISCOVERY = "false";
-    delete buildEnv.CSC_LINK;
-    delete buildEnv.CSC_KEY_PASSWORD;
-    delete buildEnv.APPLE_API_KEY;
-    delete buildEnv.APPLE_API_KEY_ID;
-    delete buildEnv.APPLE_API_ISSUER;
   }
 
   if (hostPlatform === "win32") {
@@ -4187,6 +5839,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     platform: options.platform,
     productName: resolveDesktopProductName(appVersion),
   });
+  const packagedUpdateFeed = yield* verifyPackagedUpdateFeed({
+    stageDistDir,
+    policy: bakedUpdatePolicy,
+  });
 
   // Prove the packaged bundle is self-contained by loading it the way the WSL
   // backend does, rather than by reasoning about the emitted source.
@@ -4214,6 +5870,51 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     });
   }
 
+  // Verify and finalize signed macOS artifacts while the stage still exists,
+  // and before anything is copied out or hashed into the release proof.
+  let macAppVerification: MacAppReleaseVerification | undefined;
+  let macRequirement: string | undefined;
+  let macDmgStapled = false;
+  if (macSigningPlan && macSigningPlan.mode !== "unsigned") {
+    const appPath = path.join(
+      stageDistDir,
+      macPackagedAppDirectoryName(options.arch),
+      `${resolveDesktopProductName(appVersion)}.app`,
+    );
+    macAppVerification = yield* verifyMacSignedApp({
+      appPath,
+      mode: macSigningPlan.mode,
+      expectedIdentityName: macSigningIdentity?.name,
+      expectedTeamId: macSigningPlan.expectedTeamId,
+    });
+    macRequirement = (yield* verifyMacDesignatedRequirement({ appPath, feed: options.updateFeed }))
+      .text;
+    yield* Effect.log(
+      `[desktop-artifact] Verified the ${macSigningPlan.mode} signature of the packaged app.`,
+    );
+    if (macSigningPlan.notarization) {
+      const dmgNames = (yield* fs.readDirectory(stageDistDir)).filter((entry) =>
+        entry.endsWith(".dmg"),
+      );
+      for (const dmgName of dmgNames) {
+        yield* finalizeMacDmg({
+          dmgPath: path.join(stageDistDir, dmgName),
+          stageDistDir,
+          notarization: macSigningPlan.notarization,
+          env: process.env,
+          verbose: options.verbose,
+        });
+      }
+      macDmgStapled = dmgNames.length > 0;
+    }
+  }
+
+  // A mock build's channel manifests say so; the mock server serves nothing
+  // else and the release publisher refuses them.
+  if (options.updateFeed.kind === "mock") {
+    yield* markMockFeedManifests(stageDistDir);
+  }
+
   const stageEntries = yield* fs.readDirectory(stageDistDir);
   yield* fs.makeDirectory(options.outputDir, { recursive: true });
 
@@ -4234,6 +5935,22 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       platform: options.platform,
       arch: options.arch,
     });
+  }
+
+  if (macSigningPlan) {
+    const proofPath = yield* writeDesktopReleaseProof({
+      outputDir: options.outputDir,
+      artifactPaths: copiedArtifacts,
+      version: appVersion,
+      arch: options.arch,
+      commit: commitHash,
+      feed: describeDesktopReleaseFeed(bakedUpdatePolicy, packagedUpdateFeed),
+      plan: macSigningPlan,
+      app: macAppVerification,
+      requirement: macRequirement,
+      dmgStapled: macDmgStapled,
+    });
+    yield* Effect.log(`[desktop-artifact] Wrote ${proofPath}.`);
   }
 
   yield* Effect.log("[desktop-artifact] Done. Artifacts:").pipe(
@@ -4278,7 +5995,7 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
   ),
   signed: Flag.Boolean("signed").pipe(
     Flag.withDescription(
-      "Enable signing/notarization discovery; Windows uses Azure Trusted Signing (env: STARK_CODE_DESKTOP_SIGNED).",
+      "Sign the build. macOS signs per STARK_CODE_MACOS_SIGNING_MODE (developer-id, notarized, by default; or development) and fails without complete credentials; Windows uses Azure Trusted Signing (env: STARK_CODE_DESKTOP_SIGNED).",
     ),
     Flag.optional,
   ),
@@ -4287,7 +6004,9 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
     Flag.optional,
   ),
   mockUpdates: Flag.Boolean("mock-updates").pipe(
-    Flag.withDescription("Enable mock updates (env: STARK_CODE_DESKTOP_MOCK_UPDATES)."),
+    Flag.withDescription(
+      "Bake the localhost mock update feed, the same as STARK_CODE_DESKTOP_UPDATE_FEED=mock; writes below release-mock/ and is refused for Developer ID builds (env: STARK_CODE_DESKTOP_MOCK_UPDATES).",
+    ),
     Flag.optional,
   ),
   mockUpdateServerPort: Flag.Int("mock-update-server-port").pipe(

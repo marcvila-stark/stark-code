@@ -6,6 +6,10 @@ import { nativeAgentLaunch } from "./NativeAgentLaunch.ts";
 import * as NodeChildProcess from "node:child_process";
 import * as HostProcess from "@starkfuture/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import { ProviderInstanceConfig } from "@starkfuture/contracts";
+
+const decodeProviderInstanceConfig = Schema.decodeUnknownSync(ProviderInstanceConfig);
 
 const defaultCodexPolicy = [
   "--ask-for-approval",
@@ -42,6 +46,34 @@ describe("native agent shell launch", () => {
     expect(JSON.stringify(launch)).not.toContain("test-router-key");
   });
 
+  it.each(["inherit", "override"] as const)(
+    "keeps a Claude terminal's own permission flags when new chats default to %s",
+    (source) => {
+      // The terminal manager launches with the instance's `config` only; the instance's
+      // new-chat permission source sits beside it and never reaches the terminal.
+      const instance = (config: Record<string, unknown>, newChatPermissionSource?: typeof source) =>
+        decodeProviderInstanceConfig({
+          driver: "claudeAgent",
+          config,
+          ...(newChatPermissionSource === undefined ? {} : { newChatPermissionSource }),
+        });
+      const launch = (config: ProviderInstanceConfig) =>
+        nativeAgentLaunch({
+          driver: config.driver,
+          config: config.config ?? {},
+          home: "/tmp",
+          platform: "linux",
+          nodeExecutable: "node",
+        }).args;
+      expect(launch(instance({}, source))).toEqual(launch(instance({})));
+      expect(launch(instance({}, source))).toEqual(
+        expect.arrayContaining(["--permission-mode", "default"]),
+      );
+      const acceptEdits = { launchArgs: "--permission-mode acceptEdits" };
+      expect(launch(instance(acceptEdits, source))).toEqual(launch(instance(acceptEdits)));
+      expect(launch(instance(acceptEdits, source))).not.toContain("default");
+    },
+  );
   it.each([
     "--model haiku",
     "--model=claude-haiku-5-5",

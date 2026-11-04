@@ -17,6 +17,29 @@ import * as HttpClientResponse from "effect/http/HttpClientResponse";
 
 import * as CliTokenManager from "./CliTokenManager.ts";
 
+import { vi } from "vite-plus/test";
+
+// The product disables hosted auth. Polling is tested entirely against a fake
+// HTTP client and explicit test-only configuration; no sign-in is started.
+vi.mock("./publicConfig.ts", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./publicConfig.ts")>();
+  const Config = await import("effect/Config");
+  const { CONNECT_OAUTH_SCOPES } = await import("@starkfuture/shared/connectAuth");
+  return {
+    ...original,
+    cloudCliOAuthConfig: Config.all({
+      tokenEndpoint: Config.succeed("https://clerk.example.test/oauth/token"),
+      deviceAuthorizationEndpoint: Config.succeed(
+        "https://clerk.example.test/oauth/device_authorization",
+      ),
+      clientId: Config.String("STARK_CODE_CLERK_CLI_OAUTH_CLIENT_ID"),
+      loopbackPort: Config.succeed(34338),
+      redirectUri: Config.succeed("http://127.0.0.1:34338/callback"),
+      scopes: Config.succeed(CONNECT_OAUTH_SCOPES),
+    }),
+  };
+});
+
 // pk_test_<base64 of "clerk.example.test$">
 const TEST_ENV = {
   STARK_CODE_CLERK_PUBLISHABLE_KEY: "pk_test_Y2xlcmsuZXhhbXBsZS50ZXN0JA==",

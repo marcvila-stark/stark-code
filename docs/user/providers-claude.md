@@ -94,6 +94,45 @@ Claude Code's verbose mode can stay enabled when you use Claude for text generat
 thread titles, branch names, commit messages, and pull request descriptions. On a remote connection,
 Stark Code uses the Claude configuration on the connected server.
 
+## Permissions
+
+New Claude chats inherit Claude's own permission settings: Stark Code sends no permission mode,
+so `permissions.defaultMode` and the rules in Claude's user, project, local and managed settings
+decide. Picking a mode in the composer overrides them for that chat; **Reset to inherited** in the
+chat's permission popover hands it back and needs settings permission. The popover shows the mode
+Claude reported for the running session and what its settings files configure for the next launch.
+The native terminal keeps its own launch arguments either way. See
+[Permission modes](./permission-modes.md) for the modes themselves.
+
+Claude decides what needs approval, and Stark Code shows every approval it asks for. Claude's
+summary of a command appears as text under the card's title, above the exact command; a
+subagent's approval names the subagent. The card offers only these choices, each bound to
+exactly what Claude receives:
+
+- **Allow once**.
+- **Allow for this session**, only when Claude suggests a session permission. It grants exactly
+  that suggestion, such as a command prefix, an extra folder or a mode switch, until Claude
+  restarts.
+- **Always allow in this project** (or worktree), only when Claude suggests narrow allow rules. It
+  saves the rules shown on the card to `.claude/settings.local.json` and needs settings permission.
+  It is not offered when Claude matched one of your ask rules, when Claude asks not to remember the
+  choice, or for broad rules such as a whole interpreter or a wildcard server. The mobile app does
+  not offer it.
+- **Decline**, which tells Claude no and lets it continue.
+- **Decline and stop**, which tells Claude no and ends its current work.
+
+Either decline can carry a reason of up to 2,000 characters; choose **Decline with a reason…**
+and Claude receives it with the refusal. An answer that no longer matches an offered choice, such
+as one sent after the request changed, is refused rather than mapped to a nearby choice.
+
+Publishing to Stark Pages is off in Claude chats, in every mode including Bypass: `spage publish`
+or `spage upload` (run directly or wrapped in `env`, `sh -c`, `npx` and similar), Pages MCP tools
+that change a page, and uploads to a Pages host with `curl` or `wget` are refused. A command
+Stark Code cannot read for certain, such as one that runs a program named by a variable and
+mentions publishing, asks you first in every mode, with one-time choices only. Reading pages still
+works, and mentioning Pages in files, comments or searches is not a publish. Use native shell mode
+to publish.
+
 ## Compact long conversations
 
 Set **Auto-compact after** in the Claude provider settings to an integer between
@@ -147,6 +186,9 @@ addresses and FortiClient on macOS for other network failures. A confirmed
 disconnected VPN pauses reconnection; other network failures retry slowly.
 The chat shows a connection notice only when a tool call in the current turn
 needs that connection. Other issues remain available in connection settings.
+These checks read Claude's connection status without running tools or sending a
+model request. A silent connection that still reports Connected may only be
+identified when the provider observes its next failed operation.
 
 In a live conversation, open **+ → Connectors → Manage connections** and choose
 **Reload plugins** to apply installed plugin changes. This does not download newer versions.

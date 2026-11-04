@@ -1,5 +1,6 @@
 import * as Option from "effect/Option";
 import type { EnvironmentThreadShell } from "@starkfuture/client-runtime/state/shell";
+import { groupCheckpointFilesByOrigin } from "@starkfuture/client-runtime/state/thread-checkpoints";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
   type AssetCreateUrlInput,
@@ -12,6 +13,7 @@ import {
   type MessageId,
   type ModelSelection,
   type OrchestrationV2ProjectedTurnItem,
+  type PermissionSource,
   type PreviewAnnotationPayload,
   type ProviderInteractionMode,
   ProviderDriverKind,
@@ -23,6 +25,7 @@ import {
   type ThreadId,
   type ThreadLinkedPullRequest,
   type RunId,
+  type RuntimeMode,
   type WorktreeSetupSnapshot,
 } from "@starkfuture/contracts";
 import { worktreeSetupAgentStarted } from "@starkfuture/client-runtime/worktree-setup";
@@ -34,12 +37,14 @@ import {
   type AtomCommandResult,
 } from "@starkfuture/client-runtime/state/runtime";
 import { videoMimeType } from "@starkfuture/shared/video";
+import { truncate } from "@starkfuture/shared/String";
 import {
   appendCodexArtifactTemplateUsePrompt,
   codexArtifactTemplateUsePrompt,
   type CodexArtifactTemplate,
 } from "@starkfuture/shared/codexArtifactTemplates";
 import { presentThreadShell } from "@starkfuture/client-runtime/state/shell";
+import type { EnvironmentConnectionPresentation } from "@starkfuture/client-runtime/connection";
 import {
   type ChatMessage,
   isImageAttachment,
@@ -191,18 +196,13 @@ export function resolveProactiveTurnDiffAction(input: {
   }
   if (input.checkpoint === undefined || input.checkpoint.status === "missing") return "defer";
   if (input.isGitRepo === undefined) return "defer";
-  if (
-    !input.isGitRepo ||
-    input.checkpoint.status !== "ready" ||
-    input.checkpoint.files.length === 0
-  ) {
-    return "ignore";
-  }
-  const changedLines = input.checkpoint.files.reduce(
-    (total, file) => total + file.additions + file.deletions,
-    0,
-  );
-  return input.checkpoint.files.length >= 3 || changedLines >= 50 ? "open" : "ignore";
+  if (!input.isGitRepo || input.checkpoint.status !== "ready") return "ignore";
+  // Only count files the agent could have changed; other edits in the folder are not its work.
+  const groups = groupCheckpointFilesByOrigin(input.checkpoint.files);
+  const files = [...groups.agent, ...groups.unknown];
+  if (files.length === 0) return "ignore";
+  const changedLines = files.reduce((total, file) => total + file.additions + file.deletions, 0);
+  return files.length >= 3 || changedLines >= 50 ? "open" : "ignore";
 }
 
 export function codexArtifactTemplatePromptToAppend(
@@ -508,6 +508,54 @@ export function resolveThreadMetadataUpdateForNextTurn(input: {
   };
 }
 
+/**
+ * What a mode picked in the composer sends. A saved chat changes on the server now, as an override
+ * of the provider's settings: a narrowing during a run waits for the run to stop (the thread's
+ * `permissionChangePending`, with Stop and apply now in the permission popover) instead of
+ * staying in the draft until the next message, which may never come. A new chat keeps the mode
+ * on its draft until it is created (null).
+ */
+export function runtimeModeChangeRequest(input: {
+  readonly serverThreadId: ThreadId | null;
+  readonly runtimeMode: RuntimeMode;
+}): {
+  readonly threadId: ThreadId;
+  readonly permissionSource: PermissionSource;
+  readonly runtimeMode: RuntimeMode;
+  readonly whileRunning: "apply-after-run";
+} | null {
+  if (input.serverThreadId === null) return null;
+  return {
+    threadId: input.serverThreadId,
+    permissionSource: "override",
+    runtimeMode: input.runtimeMode,
+    whileRunning: "apply-after-run",
+  };
+}
+
+/**
+ * What "Stop and apply now" sends: the chat's stored settings (the change waiting on the run),
+ * asking the server to stop the run and apply them, which it does itself.
+ */
+export function stopAndApplyPermissionRequest(input: {
+  readonly threadId: ThreadId;
+  readonly permissionSource: PermissionSource;
+  readonly runtimeMode: RuntimeMode;
+}): {
+  readonly threadId: ThreadId;
+  readonly permissionSource: PermissionSource;
+  readonly runtimeMode: RuntimeMode;
+  readonly whileRunning: "stop-and-apply";
+} {
+  return { ...input, whileRunning: "stop-and-apply" };
+}
+
+/** An explicitly named draft keeps its name; unnamed drafts ask for an automatic title. */
+export function resolveDraftSubmissionTitle(explicitTitle: string | undefined, fallback: string) {
+  const title = truncate(explicitTitle ?? fallback);
+  return { title, ...(explicitTitle === undefined ? { titleSeed: title } : {}) };
+}
+
 export function buildLocalDraftThread(
   threadId: ThreadId,
   draftThread: DraftThreadState,
@@ -517,7 +565,7 @@ export function buildLocalDraftThread(
   return presentThreadShell(draftThread.environmentId, {
     id: threadId,
     projectId: draftThread.projectId,
-    title: "New thread",
+    title: draftThread.title ?? "New thread",
     providerInstanceId: fallbackModelSelection.instanceId,
     modelSelection: fallbackModelSelection,
     runtimeMode: draftThread.runtimeMode,
@@ -576,9 +624,12 @@ export function resolveComposerProviderSelection(input: {
   const requestedInstanceId = input.candidateInstanceIds.find(
     (candidate) => candidate != null && candidate !== NO_PROVIDER_MODEL_SELECTION.instanceId,
   );
+  // With nothing requested, the automatic pick decides the driver, so a fresh
+  // draft does not land on whichever provider the server happens to list first.
   const requestedDriverKind =
     input.lockedProvider ??
     input.entries.find((entry) => entry.instanceId === requestedInstanceId)?.driverKind ??
+    resolveSelectableProviderInstanceEntry(input.entries, undefined)?.driverKind ??
     input.entries[0]?.driverKind ??
     ProviderDriverKind.make("unconfigured");
   const lockedContinuationGroupKey = input.lockedProvider
@@ -1347,4 +1398,45 @@ export function restorePlanFollowUpComposer(input: {
     prompt: input.snapshot.prompt,
     detectTrigger: true,
   });
+}
+
+/**
+ * Title and detail of the composer banner for an environment that is not connected. It names
+ * what is actually wrong (this device offline, a failed connection, a host that refuses this
+ * client, an environment switched off) and says when answers wait for the connection, so a
+ * device that lost its network is not reported as the host being offline.
+ */
+export function environmentUnavailableBanner(input: {
+  readonly label: string;
+  readonly connection: EnvironmentConnectionPresentation;
+  readonly answersAwaitingReconnect: number;
+}): { readonly title: string; readonly description: string | null } {
+  const { label, connection } = input;
+  const title = (() => {
+    switch (connection.phase) {
+      case "connecting":
+      case "reconnecting":
+      case "connected":
+        return `${label} is reconnecting`;
+      case "offline":
+        return "This device is offline";
+      case "error":
+        return `Can't connect to ${label}`;
+      case "unsupported":
+        return `This app and ${label} are not compatible`;
+      case "available":
+        return `${label} is not connected`;
+    }
+  })();
+  const error =
+    connection.phase === "error" || connection.phase === "unsupported" ? connection.error : null;
+  const reason = error === null || /[.!?]$/u.test(error) ? error : `${error}.`;
+  const waiting =
+    input.answersAwaitingReconnect === 0
+      ? null
+      : input.answersAwaitingReconnect === 1
+        ? "Your answer is sent once it reconnects."
+        : `${input.answersAwaitingReconnect} answers are sent once it reconnects.`;
+  const description = [reason, waiting].filter((part) => part !== null).join(" ");
+  return { title, description: description.length > 0 ? description : null };
 }

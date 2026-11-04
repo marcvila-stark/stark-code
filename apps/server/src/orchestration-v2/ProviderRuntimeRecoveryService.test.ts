@@ -13,6 +13,7 @@ import {
   ThreadId,
   TurnItemId,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2DomainEvent,
 } from "@starkfuture/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -44,6 +45,7 @@ it.effect("leaves durable effects for the worker after runtime reconciliation", 
             ),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -106,6 +108,7 @@ it.effect("reads recovery projections only for threads that need runtime recover
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           cancelUnsettled: () => Effect.succeed([]),
           signalCancellations: () => Effect.void,
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
@@ -162,6 +165,7 @@ it.effect("expires orphaned runtime requests before command readiness", () => {
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -214,6 +218,7 @@ it.effect("preserves async questions across startup and shutdown", () => {
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           cancelUnsettled: () => Effect.succeed([]),
           signalCancellations: () => Effect.void,
@@ -267,6 +272,7 @@ it.effect("uses the same reconciliation path to cancel runtime requests during s
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -353,6 +359,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             listByCommandId: () =>
               Effect.succeed([
                 {
@@ -496,6 +503,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -562,6 +570,7 @@ it.effect("cancels a stale waiting run when no checkpoint capture can finish it"
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           listByCommandId: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
@@ -627,6 +636,7 @@ it.effect("closes a secret request card's form when its run is recovered", () =>
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           listByCommandId: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
@@ -636,7 +646,9 @@ it.effect("closes a secret request card's form when its run is recovered", () =>
 
   return Effect.gen(function* () {
     yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
-    const itemEvent = committedInput?.events.find((event) => event.type === "turn-item.updated");
+    const itemEvent = committedInput?.events.find(
+      (event) => event.type === "turn-item.updated" && event.payload.type === "secret_request",
+    );
     const card = itemEvent?.type === "turn-item.updated" ? itemEvent.payload : null;
     assert.equal(card?.status, "cancelled");
     assert.equal(card?.type === "secret_request" ? card.secretStatus : null, "cancelled");
@@ -712,6 +724,7 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -837,6 +850,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -855,6 +869,7 @@ it.effect(
         "provider-turn.steer",
         "provider-turn.restart",
         "runtime-request.respond",
+        "provider-runtime.apply-policy",
       ]);
       const events = committedInput?.events ?? [];
       assert.deepEqual(
@@ -867,6 +882,7 @@ it.effect(
           ["run-attempt.updated", "cancelled"],
           ["node.updated", "cancelled"],
           ["provider-turn.updated", "cancelled"],
+          ["turn-item.updated", "interrupted"],
           ["message.updated", null],
           ["turn-item.updated", "cancelled"],
           ["provider-thread.updated", "idle"],
@@ -875,6 +891,17 @@ it.effect(
       );
       const messageEvent = events.find((event) => event.type === "message.updated");
       assert.isFalse(messageEvent?.type === "message.updated" && messageEvent.payload.streaming);
+      // The cut turn keeps its partial reply but says it was interrupted, so
+      // clients never present it as a finished answer.
+      const interrupted = events.flatMap((event) =>
+        event.type === "turn-item.updated" && event.payload.type === "run_interrupt_result"
+          ? [event.payload]
+          : [],
+      );
+      assert.deepEqual(
+        interrupted.map((item) => [item.title, item.message]),
+        [["Interrupted by restart", "The server restarted before this turn finished."]],
+      );
     }).pipe(Effect.provide(layer));
   },
 );
@@ -945,6 +972,7 @@ it.effect("cancels workflow members and child roots without run ids after restar
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -1113,6 +1141,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             listByCommandId: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
@@ -1270,6 +1299,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             listByCommandId: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
@@ -1402,6 +1432,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             listByCommandId: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
@@ -1563,6 +1594,7 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listUnsettled: () => Effect.succeed([]),
           listByCommandId: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
@@ -1603,3 +1635,83 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
     assert.deepEqual(noted, [`subagent ${nativeSubagentId}`]);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect(
+  "restart ends a side chat's workspace wait instead of leaving a false waiting status",
+  () => {
+    const threadId = ThreadId.make("thread-side-chat-workspace-wait");
+    const runId = RunId.make("run-side-chat-workspace-wait");
+    const itemId = TurnItemId.make("item-side-chat-workspace-wait");
+    const instanceId = ProviderInstanceId.make("codex");
+    let events: ReadonlyArray<OrchestrationV2DomainEvent> = [];
+    const projection = {
+      thread: { id: threadId },
+      runtimeRequests: [],
+      providerSessions: [],
+      providerThreads: [],
+      providerTurns: [],
+      runs: [{ id: runId, status: "starting", providerInstanceId: instanceId }],
+      attempts: [],
+      nodes: [],
+      subagents: [],
+      messages: [],
+      turnItems: [
+        {
+          id: itemId,
+          runId,
+          nodeId: null,
+          type: "notification",
+          status: "waiting",
+          toolNonExecutionKind: "workspace_wait",
+          source: { kind: "system" },
+          outcome: "updated",
+          summary: "Waiting for this folder to become available.",
+        },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const layer = ProviderRuntimeRecovery.layer.pipe(
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed([threadId]),
+            getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            commitCommand: (input) => {
+              events = input.events;
+              return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+            },
+          }),
+          IdAllocator.layer,
+          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+            runRecoveryOnce: Effect.succeed(false),
+          }),
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listByCommandId: () => Effect.succeed([]),
+            listUnsettled: () => Effect.succeed([]),
+            reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+          }),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
+      assert.isTrue(
+        events.some(
+          (event) =>
+            event.type === "run.updated" &&
+            event.payload.id === runId &&
+            event.payload.status === "cancelled",
+        ),
+      );
+      const item = events.find(
+        (event) => event.type === "turn-item.updated" && event.payload.id === itemId,
+      );
+      assert.equal(item?.type, "turn-item.updated");
+      if (item?.type !== "turn-item.updated" || item.payload.type !== "notification") return;
+      assert.equal(item.payload.status, "cancelled");
+      assert.equal(item.payload.summary, "Chat stopped before it could start.");
+    }).pipe(Effect.provide(layer));
+  },
+);

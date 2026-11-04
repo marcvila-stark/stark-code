@@ -288,6 +288,7 @@ describe("DesktopBackendConfiguration", () => {
         assert.equal(first.cwd, environment.backendCwd);
         assert.equal(first.captureOutput, true);
         assert.equal(first.env.ELECTRON_RUN_AS_NODE, "1");
+        assert.equal(first.env.STARK_CODE_APP_VERSION, "1.2.3");
         assert.isUndefined(first.env.STARK_CODE_PORT);
         assert.isUndefined(first.env.STARK_CODE_MODE);
         assert.isUndefined(first.env.STARK_CODE_DESKTOP_LAN_HOST);
@@ -843,7 +844,7 @@ describe("DesktopBackendConfiguration", () => {
     ),
   );
 
-  it.effect("resolveWsl carries environment-configured observability endpoints", () =>
+  it.effect("resolveWsl ignores environment exporters disabled by the desktop privacy policy", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -854,12 +855,11 @@ describe("DesktopBackendConfiguration", () => {
         const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
         const config = yield* configuration.resolveWsl({ port: 5050, distro: null });
 
-        // No settings.json exists here: the endpoints come from the desktop
-        // environment, and the bootstrap carries them for a WSL child that
-        // lacks the variables.
-        assert.equal(config.bootstrap.otlpTracesUrl, "http://127.0.0.1:4318/v1/traces");
-        assert.equal(config.bootstrap.otlpMetricsUrl, "http://127.0.0.1:4318/v1/metrics");
-        assert.equal(config.bootstrap.otlpLogsUrl, "http://127.0.0.1:4318/v1/logs");
+        // DesktopConfig deliberately ignores environment exporter endpoints.
+        // No settings.json exists here, so WSL gets no exporter in its bootstrap.
+        assert.isUndefined(config.bootstrap.otlpTracesUrl);
+        assert.isUndefined(config.bootstrap.otlpMetricsUrl);
+        assert.isUndefined(config.bootstrap.otlpLogsUrl);
       }).pipe(
         Effect.provide(
           DesktopBackendConfiguration.layer.pipe(
@@ -887,7 +887,7 @@ describe("DesktopBackendConfiguration", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("environment observability endpoints win over the persisted settings file", () =>
+  it.effect("disabled environment exporters do not override explicit persisted settings", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -913,9 +913,8 @@ describe("DesktopBackendConfiguration", () => {
         );
 
         const config = yield* configuration.resolvePrimary;
-        assert.equal(config.bootstrap.otlpLogsUrl, "http://env:4318/v1/logs");
-        // Only the logs endpoint is set in env, so the other two still come
-        // from the settings file rather than being dropped together.
+        assert.equal(config.bootstrap.otlpLogsUrl, "http://persisted:4318/v1/logs");
+        // The ignored environment endpoint must not replace the user's saved choice.
         assert.equal(config.bootstrap.otlpTracesUrl, "http://persisted:4318/v1/traces");
         assert.equal(config.bootstrap.otlpMetricsUrl, "http://persisted:4318/v1/metrics");
       }).pipe(

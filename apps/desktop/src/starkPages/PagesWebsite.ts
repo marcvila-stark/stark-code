@@ -36,6 +36,22 @@ export class PagesWebsiteError extends Schema.TaggedError<PagesWebsiteError>()(
   },
 ) {}
 
+const LOAD_TIMEOUT_MS = 15_000;
+
+/** Only Chromium's known network errors can label a failure; none imply expired login. */
+function loadFailure(code?: number) {
+  if (code === -106) return "This Mac is offline. Reconnect to the internet, then try again.";
+  if (code === -105)
+    return "The Pages address could not be found. Check your connection or required company VPN, then try again.";
+  if (code === -7 || code === -118)
+    return "The connection to Pages timed out. Check your connection or required company VPN, then try again. The website may also be unavailable.";
+  if (code === -21)
+    return "The network changed while Pages was loading. Wait for your connection to settle, then try again.";
+  if (code !== undefined && code <= -200 && code > -300)
+    return "A secure connection to Pages could not be verified. Check this Mac’s date and network, or contact IT.";
+  return "Stark Pages could not be reached. Check your connection and try again. The website may also be unavailable.";
+}
+
 const initialState = (): PagesWebsiteState => ({
   url: PAGES_WEBSITE_HOME,
   title: "Stark Pages",
@@ -63,6 +79,8 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
   let parentHidden = false;
   let pendingSession: Promise<Session> | undefined;
   let pendingCapture: ReturnType<WebContents["capturePage"]> | undefined;
+  let cancelLoading: (() => void) | undefined;
+  let navigateWebsite: ((action: PagesWebsiteNavigation["action"]) => void) | undefined;
   const emit = () => {
     if (!parent?.isDestroyed() && !parent?.webContents.isDestroyed())
       parent?.webContents.send(channels.stateChanged, state);
@@ -77,10 +95,9 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
       ...state,
       url: url && !url.pathname.startsWith("/auth/") ? url.toString() : PAGES_WEBSITE_HOME,
       title: title || "Stark Pages",
-      loading: wc.isLoading(),
       canGoBack: wc.navigationHistory.canGoBack(),
       canGoForward: wc.navigationHistory.canGoForward(),
-      signInRequired: /^sign in\b/i.test(title),
+      signInRequired: !state.error && /^sign in\b/i.test(title),
     };
     emit();
   };
@@ -98,6 +115,9 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
     );
   };
   const dispose = () => {
+    cancelLoading?.();
+    cancelLoading = undefined;
+    navigateWebsite = undefined;
     revision++;
     pendingSession = undefined;
     pendingCapture = undefined;
@@ -159,18 +179,58 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
     window.contentView.addChildView(current);
     const wc = current.webContents;
     (dependencies.restrictWebsitePermissions ?? BrowserSession.restrictWebsitePermissions)(wc);
-    const load = (url: string) => {
-      state = { ...state, error: undefined, loading: true };
+    let attempt = 0;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const clearDeadline = () => {
+      if (deadline !== undefined) clearTimeout(deadline);
+      deadline = undefined;
+    };
+    cancelLoading = () => {
+      attempt++;
+      clearDeadline();
+    };
+    const finish = (error?: string) => {
+      if (view !== current || wc.isDestroyed()) return;
+      attempt++;
+      clearDeadline();
+      state = { ...state, loading: false, error, ...(error ? { signInRequired: false } : {}) };
       emit();
-      void wc.loadURL(url).catch(() => {
-        if (view !== current || wc.isDestroyed()) return;
-        state = {
-          ...state,
-          loading: false,
-          error: "Stark Pages could not load. Check your connection and try Reload.",
-        };
-        emit();
+    };
+    const begin = () => {
+      clearDeadline();
+      const request = ++attempt;
+      state = { ...state, error: undefined, loading: true, signInRequired: false };
+      emit();
+      // @effect-diagnostics-next-line globalTimers:off -- Electron navigation events need a cancellable deadline outside an Effect fiber.
+      deadline = setTimeout(() => {
+        if (view !== current || wc.isDestroyed() || attempt !== request) return;
+        finish(
+          "Stark Pages did not finish loading within 15 seconds. Check your connection or required company VPN, then try again. The website may also be unavailable.",
+        );
+        // Invalidate this attempt before stop emits abort/stop events.
+        wc.stop();
+      }, LOAD_TIMEOUT_MS);
+      return request;
+    };
+    const load = (url: string) => {
+      const request = begin();
+      void wc.loadURL(url).catch((error: unknown) => {
+        if (view !== current || wc.isDestroyed() || attempt !== request) return;
+        const code =
+          error && typeof error === "object" && "errno" in error && typeof error.errno === "number"
+            ? error.errno
+            : undefined;
+        if (code !== -3) finish(loadFailure(code));
       });
+    };
+    navigateWebsite = (action) => {
+      if (action === "home") return load(PAGES_WEBSITE_HOME);
+      if (action === "back" && !wc.navigationHistory.canGoBack()) return;
+      if (action === "forward" && !wc.navigationHistory.canGoForward()) return;
+      begin();
+      if (action === "back") wc.navigationHistory.goBack();
+      if (action === "forward") wc.navigationHistory.goForward();
+      if (action === "reload") wc.reload();
     };
     wc.on("will-navigate", (event, raw) => {
       if (pagesWebsiteNavigationUrl(raw)) return;
@@ -180,8 +240,7 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
     wc.on("will-redirect", (event, raw, _inPlace, isMainFrame) => {
       if (!isMainFrame || pagesWebsiteNavigationUrl(raw)) return;
       event.preventDefault();
-      state = { ...state, loading: false, error: "This page needs to open in your browser." };
-      emit();
+      finish("This page needs to open in your browser.");
     });
     wc.setWindowOpenHandler(({ url: raw }) => {
       const url = pagesWebsiteNavigationUrl(raw);
@@ -189,28 +248,26 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
       // No popup gets a bridge or a different browsing session.
       return { action: "deny" };
     });
-    wc.on("did-start-loading", update);
-    wc.on("did-stop-loading", update);
+    wc.on("did-start-loading", () => {
+      if (view !== current || wc.isDestroyed()) return;
+      // A redirect is part of the same attempt, not a fresh 15-second budget.
+      if (deadline === undefined) begin();
+      update();
+    });
+    wc.on("did-stop-loading", () => {
+      if (view !== current || wc.isDestroyed() || wc.isLoading()) return;
+      finish(state.error);
+      update();
+    });
     wc.on("page-title-updated", update);
     wc.on("did-navigate", update);
     wc.on("did-navigate-in-page", update);
     wc.on("did-fail-load", (_event, code, _description, _url, mainFrame) => {
       if (view !== current || wc.isDestroyed() || !mainFrame || code === -3) return;
-      state = {
-        ...state,
-        loading: false,
-        error: "Stark Pages could not load. Check your connection and try Reload.",
-      };
-      emit();
+      if (deadline !== undefined) finish(loadFailure(code));
     });
     wc.on("render-process-gone", () => {
-      if (view !== current || wc.isDestroyed()) return;
-      state = {
-        ...state,
-        loading: false,
-        error: "The Pages view stopped. Choose Reload to reopen it.",
-      };
-      emit();
+      finish("The Pages view stopped. Choose Reload to reopen it.");
     });
     wc.on("before-input-event", (event, input) => {
       if (input.type !== "keyDown" || input.key !== "Escape") return;
@@ -410,7 +467,6 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
     },
     navigate(input: PagesWebsiteNavigation) {
       if (input.viewId !== lease || !view || view.webContents.isDestroyed()) return;
-      const wc = view.webContents;
       if (input.action === "open-external") {
         external(state.url);
         return;
@@ -418,13 +474,7 @@ export function makePagesWebsite(dependencies: PagesWebsiteDependencies = {}) {
       revision++;
       pendingCapture = undefined;
       if (!bounds?.visible) hide();
-      state = { ...state, error: undefined };
-      if (input.action === "back" && wc.navigationHistory.canGoBack())
-        wc.navigationHistory.goBack();
-      if (input.action === "forward" && wc.navigationHistory.canGoForward())
-        wc.navigationHistory.goForward();
-      if (input.action === "reload") wc.reload();
-      if (input.action === "home") void wc.loadURL(PAGES_WEBSITE_HOME).catch(() => {});
+      navigateWebsite?.(input.action);
       update();
     },
     dispose,

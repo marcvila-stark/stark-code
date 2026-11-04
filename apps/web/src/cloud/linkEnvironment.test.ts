@@ -33,6 +33,18 @@ import {
   updatePrimaryCloudPreferences,
 } from "./linkEnvironment";
 
+// Exercise configured relay behavior through fake HTTP, independently of the local-build default.
+vi.mock("./publicConfig", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./publicConfig")>();
+  return {
+    ...actual,
+    resolveCloudPublicConfig: () => ({
+      ...actual.resolveCloudPublicConfig(),
+      relayUrl: "https://relay.example.test",
+    }),
+  };
+});
+
 const TARGET: CloudLinkTarget = {
   environmentId: "environment-1",
   label: "Desktop",

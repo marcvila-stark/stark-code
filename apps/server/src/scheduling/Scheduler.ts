@@ -6,6 +6,7 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
+import * as MaintenanceGate from "../maintenance/MaintenanceGate.ts";
 import { forkParked } from "../serverActivation.ts";
 
 /** Sources load due work from their durable state; registration owns its execution lifetime. */
@@ -20,6 +21,7 @@ export class Scheduler extends Context.Service<
 >()("stark-code/scheduling/Scheduler") {}
 
 const make = Effect.gen(function* () {
+  const maintenance = yield* MaintenanceGate.MaintenanceGate;
   const sources = yield* Ref.make(new Map<symbol, Effect.Effect<void>>());
   const register: Scheduler["Service"]["register"] = Effect.fn("Scheduler.register")(function* <
     E,
@@ -30,6 +32,9 @@ const make = Effect.gen(function* () {
     const permit = yield* Semaphore.make(1);
     const run = runDueWork.pipe(
       Effect.provideContext(context),
+      // Skipped during an update or a recovery hold: sources reload due work
+      // from durable state on the next tick, so nothing is lost.
+      (due) => maintenance.guard("scheduler", due),
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.void

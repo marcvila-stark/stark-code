@@ -12,6 +12,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
 } from "@starkfuture/contracts";
@@ -186,6 +187,38 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
     const next = applyOrchestrationV2ProjectionEvent(emptyProjection, event);
     expect(next?.thread.archivedAt).toEqual(archivedAt);
     expect(next?.updatedAt).toEqual(archivedAt);
+  });
+
+  it("closes a lost request when another client asks again or dismisses it", () => {
+    const lostRequest = {
+      id: RuntimeRequestId.make("request-lost"),
+      nodeId: NodeId.make("node-lost"),
+      providerTurnId: null,
+      nativeRequestRef: null,
+      kind: "command",
+      status: "expired",
+      responseCapability: { type: "not_resumable", reason: "The server restarted." },
+      createdAt: now,
+      resolvedAt: now,
+      lost: { cause: "server_restart", lostAt: now },
+    } satisfies OrchestrationV2ThreadProjection["runtimeRequests"][number];
+    const projection = { ...emptyProjection, runtimeRequests: [lostRequest] };
+    for (const [type, field] of [
+      ["runtime-request.asked-again", "askedAgainAt"],
+      ["runtime-request.lost-dismissed", "dismissedAt"],
+    ] as const) {
+      const next = applyOrchestrationV2ProjectionEvent(projection, {
+        id: `event-${type}`,
+        type,
+        threadId,
+        nodeId: lostRequest.nodeId,
+        occurredAt: now,
+        payload: { ...lostRequest, lost: { ...lostRequest.lost, [field]: now } },
+      } as OrchestrationV2DomainEvent);
+      expect(next?.runtimeRequests).toEqual([
+        { ...lostRequest, lost: { ...lostRequest.lost, [field]: now } },
+      ]);
+    }
   });
 
   it("ignores events for another thread", () => {

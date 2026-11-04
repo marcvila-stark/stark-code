@@ -59,6 +59,7 @@ import {
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
 import { buildThreadFeed } from "../lib/threadActivity";
+import { deriveDeclinedApprovalItemIds } from "@starkfuture/client-runtime/state/thread-requests";
 import { acknowledgedThreadMessagesAtom } from "./acknowledged-thread-messages";
 import { appendPendingThreadMessages } from "../features/threads/pending-thread-feed";
 import { threadAllowsProviderSwitch } from "./thread-provider-switching";
@@ -260,6 +261,20 @@ export function useThreadComposerState() {
   const selectedThreadMessages = selectedThreadProjection?.projection.messages;
   const selectedThreadAttempts = selectedThreadProjection?.projection.attempts;
   const selectedThreadNodes = selectedThreadProjection?.projection.nodes;
+  const selectedThreadRuntimeRequests = selectedThreadProjection?.projection.runtimeRequests;
+  const selectedThreadTurnItems = selectedThreadProjection?.projection.turnItems;
+  // Commands and tool calls their approval never allowed read as declined, not as run or failed.
+  const declinedApprovalItemIds = useMemo(
+    () =>
+      selectedThreadRuntimeRequests === undefined || selectedThreadTurnItems === undefined
+        ? undefined
+        : deriveDeclinedApprovalItemIds({
+            runtimeRequests: selectedThreadRuntimeRequests,
+            turnItems: selectedThreadTurnItems,
+            ...(selectedThreadNodes === undefined ? {} : { nodes: selectedThreadNodes }),
+          }),
+    [selectedThreadNodes, selectedThreadRuntimeRequests, selectedThreadTurnItems],
+  );
   // A thread whose creation has not delivered its turn yet: the prompt only
   // exists in the outbox, so it is appended to whatever the server has. The
   // detail is usually present but empty during a worktree checkout, so this
@@ -275,6 +290,9 @@ export function useThreadComposerState() {
       anchoredMessages: pendingCreation,
       attempts: selectedThreadAttempts,
       nodes: selectedThreadNodes,
+      ...(declinedApprovalItemIds === undefined
+        ? {}
+        : { declinedItemIds: declinedApprovalItemIds }),
     });
     const pendingAcknowledgments = acknowledgedMessages.filter(
       (message) =>
@@ -286,6 +304,7 @@ export function useThreadComposerState() {
       entry.pendingMessage ? { ...entry, acknowledged: true } : entry,
     );
   }, [
+    declinedApprovalItemIds,
     selectedThreadMessages,
     selectedThreadAttempts,
     selectedThreadNodes,

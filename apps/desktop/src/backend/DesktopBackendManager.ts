@@ -25,6 +25,7 @@
 
 import * as Brand from "effect/Brand";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -43,6 +44,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import {
   SERVER_EXIT_CODE_STATE_DIR_OWNED,
+  SERVER_TERMINAL_EXIT_CODES,
   DesktopBackendBootstrap,
   type DesktopBackendBootstrap as DesktopBackendBootstrapValue,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
@@ -70,6 +72,10 @@ const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
 // and a busy one needs a few seconds to stop every provider session.
 const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(5);
 const DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT = Duration.seconds(5);
+// An awaited stop (before an update touches the data) gives the backend this
+// long to exit on SIGTERM, then sends SIGKILL and waits this much again.
+const DEFAULT_BACKEND_AWAITED_STOP_GRACE = Duration.seconds(10);
+const BACKEND_KILL_EXIT_WAIT = Duration.seconds(5);
 const BACKEND_READINESS_PATH = "/.well-known/stark-code/environment";
 const { logWarning: logBackendProcessWarning } =
   DesktopObservability.makeComponentLogger("desktop-backend-process");
@@ -236,6 +242,10 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
   readonly readinessTimeout?: Duration.Duration;
   readonly outputDrainTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
+  /** Receives the spawned process's kill, for a stop that escalates on its own schedule. */
+  readonly onProcessKill?: (
+    kill: ChildProcessSpawner.ChildProcessHandle["kill"],
+  ) => Effect.Effect<void>;
   readonly onExitObserved?: () => Effect.Effect<void>;
   readonly onReady?: () => Effect.Effect<void>;
   readonly onReadinessFailure?: (error: BackendReadinessTimeoutError) => Effect.Effect<void>;
@@ -252,6 +262,17 @@ export interface DesktopBackendSnapshot {
   readonly activePid: Option.Option<number>;
   readonly restartAttempt: number;
   readonly restartScheduled: boolean;
+  /** The last exit code in `SERVER_TERMINAL_EXIT_CODES`, after which the
+      instance stopped instead of restarting; cleared by the next start. */
+  readonly terminalExitCode?: number;
+}
+
+/** What an awaited stop proved about the backend process. */
+export interface BackendStopOutcome {
+  /** No backend process is left: it exited, or none was running. */
+  readonly exited: boolean;
+  /** SIGKILL was sent because the process outlived SIGTERM's grace period. */
+  readonly forced: boolean;
 }
 
 // Opaque identifier for one backend process inside the pool. Today only
@@ -274,6 +295,14 @@ export interface DesktopBackendInstance {
   readonly label: Effect.Effect<string>;
   readonly start: Effect.Effect<void>;
   readonly stop: (options?: { readonly timeout?: Duration.Duration }) => Effect.Effect<void>;
+  // Stops the backend and waits for its process to exit: SIGTERM, then
+  // SIGKILL once `gracePeriod` (10 s) passes. Unlike `stop`, the result says
+  // whether the process is gone, so an update never touches data a backend
+  // may still write. Optional only so lightweight test doubles can omit it;
+  // every instance from `makeBackendInstance` has it.
+  readonly stopAndAwaitExit?: (options?: {
+    readonly gracePeriod?: Duration.Duration;
+  }) => Effect.Effect<BackendStopOutcome>;
   readonly currentConfig: Effect.Effect<Option.Option<DesktopBackendStartConfig>>;
   readonly snapshot: Effect.Effect<DesktopBackendSnapshot>;
   // Polls desiredRunning + the instance's own ready flag until the
@@ -308,6 +337,11 @@ export interface BackendInstanceSpec {
   // manager should resolve once more; false stops the failed instance.
   readonly onPreflightFailed?: (failure: PreflightFailure) => Effect.Effect<boolean>;
   readonly onStateDirOwned?: () => Effect.Effect<void>;
+  // Fired once when the backend exits with a code in
+  // SERVER_TERMINAL_EXIT_CODES (78 also fires onStateDirOwned first). The
+  // instance stops instead of restarting, since a restart cannot change the
+  // outcome; `snapshot.terminalExitCode` keeps the code for recovery UI.
+  readonly onTerminalExit?: (exitCode: number) => Effect.Effect<void>;
 }
 
 interface ActiveBackendRun {
@@ -315,7 +349,10 @@ interface ActiveBackendRun {
   readonly scope: Scope.Closeable;
   readonly fiber: Option.Option<Fiber.Fiber<void, never>>;
   readonly pid: Option.Option<number>;
+  readonly kill: Option.Option<ChildProcessSpawner.ChildProcessHandle["kill"]>;
   readonly exitObserved: boolean;
+  // Completed once the process exit is observed or the run ends without one.
+  readonly exited: Deferred.Deferred<void>;
   readonly stopRequested: boolean;
 }
 
@@ -330,6 +367,7 @@ interface BackendManagerState {
   readonly preflightFailureAttempt: number;
   readonly restartFiber: Option.Option<Fiber.Fiber<void, never>>;
   readonly nextRunId: number;
+  readonly terminalExitCode: Option.Option<number>;
 }
 
 const initialState: BackendManagerState = {
@@ -341,6 +379,7 @@ const initialState: BackendManagerState = {
   preflightFailureAttempt: 0,
   restartFiber: Option.none(),
   nextRunId: 1,
+  terminalExitCode: Option.none(),
 };
 
 const activePid = (active: Option.Option<ActiveBackendRun>): Option.Option<number> =>
@@ -525,6 +564,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
   );
   const outputFibers: Array<Fiber.Fiber<void, never>> = [];
 
+  yield* options.onProcessKill?.(handle.kill) ?? Effect.void;
   yield* options.onStarted?.(handle.pid) ?? Effect.void;
   if (
     options.bootstrap.desktopTelemetryControlFd !== undefined &&
@@ -712,6 +752,10 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
       activePid: activePid(current.active),
       restartAttempt: current.restartAttempt,
       restartScheduled: Option.isSome(current.restartFiber),
+      ...Option.match(current.terminalExitCode, {
+        onNone: () => ({}),
+        onSome: (terminalExitCode) => ({ terminalExitCode }),
+      }),
     })),
   );
   const currentConfig = Ref.get(state).pipe(Effect.map((current) => current.config));
@@ -778,6 +822,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           ready: false,
           config: Option.some(config.value),
           preflightFailureAttempt: resetFatalPreflightCounter ? 0 : latest.preflightFailureAttempt,
+          terminalExitCode: Option.none(),
         }));
 
         const preflightFailure = config.value.preflightFailure;
@@ -853,6 +898,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         }
 
         const runScope = yield* Scope.make("sequential");
+        const runExited = yield* Deferred.make<void>();
         const runId = yield* Ref.modify(state, (latest) => [
           latest.nextRunId,
           {
@@ -862,7 +908,9 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               scope: runScope,
               fiber: Option.none(),
               pid: Option.none(),
+              kill: Option.none(),
               exitObserved: false,
+              exited: runExited,
               stopRequested: false,
             } satisfies ActiveBackendRun),
             nextRunId: latest.nextRunId + 1,
@@ -874,6 +922,10 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           exitCode?: number,
         ) {
           const stateDirOwned = exitCode === SERVER_EXIT_CODE_STATE_DIR_OWNED;
+          const terminalExitCode =
+            exitCode !== undefined && SERVER_TERMINAL_EXIT_CODES.has(exitCode)
+              ? exitCode
+              : undefined;
           yield* mutex.withPermits(1)(
             Effect.gen(function* () {
               const { isCurrentRun, nextState, pid, exitObserved, stopRequested, wasReady } =
@@ -943,9 +995,18 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               }
 
               if (isCurrentRun && nextState.desiredRunning) {
-                if (stateDirOwned && !stopRequested) {
-                  yield* Ref.update(state, (latest) => ({ ...latest, desiredRunning: false }));
-                  yield* (spec.onStateDirOwned?.() ?? Effect.void).pipe(Effect.ignore);
+                if (terminalExitCode !== undefined && !stopRequested) {
+                  yield* Ref.update(state, (latest) => ({
+                    ...latest,
+                    desiredRunning: false,
+                    terminalExitCode: Option.some(terminalExitCode),
+                  }));
+                  if (stateDirOwned) {
+                    yield* (spec.onStateDirOwned?.() ?? Effect.void).pipe(Effect.ignore);
+                  }
+                  yield* (spec.onTerminalExit?.(terminalExitCode) ?? Effect.void).pipe(
+                    Effect.ignore,
+                  );
                   return;
                 }
                 yield* scheduleRestart(reason);
@@ -971,11 +1032,16 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               details: `pid=${pid} port=${config.value.bootstrap.port} cwd=${config.value.cwd}`,
             });
           }),
+          onProcessKill: (kill) =>
+            updateActiveRun(runId, (run) => ({
+              ...run,
+              kill: Option.some(kill),
+            })),
           onExitObserved: () =>
             updateActiveRun(runId, (run) => ({
               ...run,
               exitObserved: true,
-            })),
+            })).pipe(Effect.andThen(Deferred.succeed(runExited, undefined)), Effect.asVoid),
           onReady: Effect.fn("desktop.backendInstance.onReady")(function* () {
             const isCurrentRun = yield* Ref.modify(state, (latest) => {
               const activeRun = Option.getOrUndefined(latest.active);
@@ -1027,6 +1093,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
             onSuccess: (exit) => finalizeRun(exit.reason, Option.getOrUndefined(exit.code)),
           }),
           Effect.ensuring(Scope.close(runScope, Exit.void).pipe(Effect.ignore)),
+          Effect.ensuring(Deferred.succeed(runExited, undefined)),
         );
 
         const fiber = yield* Effect.forkIn(program, parentScope);
@@ -1098,9 +1165,8 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     });
   });
 
-  const stop = Effect.fn("desktop.backendInstance.stop")(function* (options?: {
-    readonly timeout?: Duration.Duration;
-  }) {
+  // Marks the instance stopped and returns the run that still has to be closed.
+  const requestStop = Effect.gen(function* () {
     const { active, restartFiber, notifyShutdown } = yield* mutex.withPermits(1)(
       Effect.gen(function* () {
         const result = yield* Ref.modify(state, (latest) => {
@@ -1133,62 +1199,121 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
       onNone: () => Effect.void,
       onSome: (fiber) => Fiber.interrupt(fiber).pipe(Effect.asVoid),
     });
-    yield* Option.match(active, {
-      onNone: () => Effect.void,
-      onSome: (run) =>
-        Effect.gen(function* () {
-          const closed = yield* closeRun(run, parentScope, options);
-          if (!closed) {
-            return;
-          }
-          const cleanup = yield* mutex.withPermits(1)(
-            Ref.modify(
-              state,
-              (
-                latest,
-              ): readonly [
-                {
-                  readonly needsCleanup: boolean;
-                  readonly shouldStart: boolean;
-                },
-                BackendManagerState,
-              ] => {
-                const current = Option.getOrUndefined(latest.active);
-                if (current?.id !== run.id) {
-                  return [
-                    {
-                      needsCleanup: false,
-                      shouldStart:
-                        latest.desiredRunning &&
-                        Option.isNone(latest.active) &&
-                        Option.isNone(latest.restartFiber),
-                    },
-                    latest,
-                  ];
-                }
-                return [
-                  {
-                    needsCleanup: true,
-                    shouldStart: latest.desiredRunning,
-                  },
-                  {
-                    ...latest,
-                    active: Option.none<ActiveBackendRun>(),
-                  },
-                ];
-              },
-            ),
-          );
-          if (cleanup.needsCleanup) {
-            yield* desktopTelemetryPublisher.removeControlSource(spec.id);
-            yield* backendOutputLog.discardSession;
-          }
-          if (cleanup.shouldStart) {
-            yield* start;
-          }
-        }),
-    });
+    return active;
   });
+
+  // Closes a stopped run's scope, which terminates its process, then clears it.
+  const closeStoppedRun = Effect.fn("desktop.backendInstance.closeStoppedRun")(function* (
+    run: ActiveBackendRun,
+    options?: { readonly timeout?: Duration.Duration },
+  ) {
+    const closed = yield* closeRun(run, parentScope, options);
+    if (!closed) {
+      return;
+    }
+    const cleanup = yield* mutex.withPermits(1)(
+      Ref.modify(
+        state,
+        (
+          latest,
+        ): readonly [
+          {
+            readonly needsCleanup: boolean;
+            readonly shouldStart: boolean;
+          },
+          BackendManagerState,
+        ] => {
+          const current = Option.getOrUndefined(latest.active);
+          if (current?.id !== run.id) {
+            return [
+              {
+                needsCleanup: false,
+                shouldStart:
+                  latest.desiredRunning &&
+                  Option.isNone(latest.active) &&
+                  Option.isNone(latest.restartFiber),
+              },
+              latest,
+            ];
+          }
+          return [
+            {
+              needsCleanup: true,
+              shouldStart: latest.desiredRunning,
+            },
+            {
+              ...latest,
+              active: Option.none<ActiveBackendRun>(),
+            },
+          ];
+        },
+      ),
+    );
+    if (cleanup.needsCleanup) {
+      yield* desktopTelemetryPublisher.removeControlSource(spec.id);
+      yield* backendOutputLog.discardSession;
+    }
+    if (cleanup.shouldStart) {
+      yield* start;
+    }
+  });
+
+  const stop = Effect.fn("desktop.backendInstance.stop")(function* (options?: {
+    readonly timeout?: Duration.Duration;
+  }) {
+    const active = yield* requestStop;
+    if (Option.isSome(active)) {
+      yield* closeStoppedRun(active.value, options);
+    }
+  });
+
+  const stopAndAwaitExit = Effect.fn("desktop.backendInstance.stopAndAwaitExit")(
+    function* (options?: { readonly gracePeriod?: Duration.Duration }) {
+      const active = yield* requestStop;
+      if (Option.isNone(active)) {
+        return { exited: true, forced: false } satisfies BackendStopOutcome;
+      }
+      const run = active.value;
+      // The kill handle arrives when the spawn completes, after the run was recorded.
+      const currentKill = Ref.get(state).pipe(
+        Effect.map((latest) => {
+          const current = Option.getOrUndefined(latest.active);
+          return current?.id === run.id ? current.kill : Option.none();
+        }),
+      );
+      const awaitExit = (timeout: Duration.Duration) =>
+        Deferred.await(run.exited).pipe(Effect.timeoutOption(timeout), Effect.map(Option.isSome));
+      let forced = false;
+      if (!(yield* Deferred.isDone(run.exited))) {
+        const kill = yield* currentKill;
+        if (Option.isNone(kill)) {
+          // Not spawned yet: closing the run's scope interrupts the spawn and
+          // terminates whatever it started.
+          yield* closeStoppedRun(run, {
+            timeout: options?.gracePeriod ?? DEFAULT_BACKEND_AWAITED_STOP_GRACE,
+          });
+          return {
+            exited: yield* Deferred.isDone(run.exited),
+            forced: false,
+          } satisfies BackendStopOutcome;
+        }
+        // `kill` waits for the exit itself; the wait below bounds it on the
+        // Effect clock, and closing the run interrupts the forked signal.
+        const signal = (killSignal: "SIGTERM" | "SIGKILL") =>
+          kill.value({ killSignal }).pipe(Effect.ignore, Effect.forkIn(run.scope), Effect.asVoid);
+        yield* signal("SIGTERM");
+        if (!(yield* awaitExit(options?.gracePeriod ?? DEFAULT_BACKEND_AWAITED_STOP_GRACE))) {
+          forced = true;
+          yield* signal("SIGKILL");
+          yield* awaitExit(BACKEND_KILL_EXIT_WAIT);
+        }
+      }
+      const exited = yield* Deferred.isDone(run.exited);
+      // Bounded only when the process outlived SIGKILL, so the caller cannot hang on it.
+      yield* closeStoppedRun(run, exited ? undefined : { timeout: BACKEND_KILL_EXIT_WAIT });
+      return { exited, forced } satisfies BackendStopOutcome;
+    },
+  );
 
   const waitForReady = (timeout: Duration.Duration): Effect.Effect<boolean> =>
     Effect.gen(function* () {
@@ -1214,6 +1339,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     label: spec.label,
     start,
     stop,
+    stopAndAwaitExit,
     currentConfig,
     snapshot,
     waitForReady,

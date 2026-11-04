@@ -7,7 +7,7 @@ import { terminalEnvironment } from "../state/terminal";
 import { Button } from "./ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "./ui/popover";
 
-export function nativeVoiceCommand(driver: string): string | null {
+function nativeVoiceCommand(driver: string): string | null {
   return driver === "claudeAgent" ? "/voice hold" : driver === "codex" ? "/voice" : null;
 }
 

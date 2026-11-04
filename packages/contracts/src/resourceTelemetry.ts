@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { HostPowerSnapshot } from "./background.ts";
 import { DesktopUpdateStateSchema } from "./ipc.ts";
+import { MaintenancePrepareMode, MaintenanceStatus } from "./maintenance.ts";
 
 export const RESOURCE_MONITOR_PROTOCOL_VERSION = 3 as const;
 
@@ -306,10 +307,26 @@ export const DesktopUpdateStatusReport = Schema.Struct({
 });
 export type DesktopUpdateStatusReport = typeof DesktopUpdateStatusReport.Type;
 
+/**
+ * Desktop main -> server: drive this backend's maintenance gate before an
+ * update. `prepare` closes it, `renew` extends its lease (and re-evaluates the
+ * blockers), `release` reopens it, `resumeRecovery` ends a recovery hold. The
+ * server answers each with a `maintenanceStatus` control message.
+ */
+export const DesktopMaintenanceRequest = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("maintenanceRequest"),
+  requestId: TrimmedNonEmptyString,
+  action: Schema.Literals(["prepare", "renew", "release", "resumeRecovery", "status"]),
+  mode: Schema.optionalKey(MaintenancePrepareMode),
+});
+export type DesktopMaintenanceRequest = typeof DesktopMaintenanceRequest.Type;
+
 export const DesktopHostTelemetryMessage = Schema.Union([
   DesktopHostTelemetryHello,
   DesktopHostTelemetrySnapshot,
   DesktopUpdateStatusReport,
+  DesktopMaintenanceRequest,
 ]);
 export type DesktopHostTelemetryMessage = typeof DesktopHostTelemetryMessage.Type;
 
@@ -355,12 +372,23 @@ export const DesktopTelemetryCancelDesktopUpdate = Schema.Struct({
 });
 export type DesktopTelemetryCancelDesktopUpdate = typeof DesktopTelemetryCancelDesktopUpdate.Type;
 
+/** Server -> desktop main: the gate's state after a maintenance request or a change. */
+export const DesktopTelemetryMaintenanceStatus = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("maintenanceStatus"),
+  /** The request this answers, or null for an unsolicited change (lease expiry). */
+  replyTo: Schema.NullOr(Schema.String),
+  status: MaintenanceStatus,
+});
+export type DesktopTelemetryMaintenanceStatus = typeof DesktopTelemetryMaintenanceStatus.Type;
+
 export const DesktopTelemetryControlMessage = Schema.Union([
   DesktopTelemetrySetDiagnosticsDemand,
   DesktopTelemetrySetHostPowerIntervals,
   DesktopTelemetryRequestDesktopUpdate,
   DesktopTelemetryCommitDesktopUpdate,
   DesktopTelemetryCancelDesktopUpdate,
+  DesktopTelemetryMaintenanceStatus,
 ]);
 export type DesktopTelemetryControlMessage = typeof DesktopTelemetryControlMessage.Type;
 

@@ -157,6 +157,7 @@ function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<Thread
     case "thread.pull-request.sync":
     case "thread.title.regeneration.complete":
     case "thread.runtime-mode.set":
+    case "thread.permission.set":
     case "thread.interaction-mode.set":
     case "thread.model-selection.set":
     case "provider-session.detach":
@@ -188,6 +189,9 @@ function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<Thread
     case "thread.fork":
     case "thread.merge_back":
       return [command.sourceThreadId, command.targetThreadId];
+    case "runtime-request.ask-again":
+    case "runtime-request.lost.dismiss":
+      return [command.threadId];
   }
 }
 
@@ -211,7 +215,20 @@ function scenarioCommands(scenario: OrchestratorV2Scenario): ReadonlyArray<Orche
 }
 
 const findPendingRuntimeRequest = (projection: OrchestrationV2ThreadProjection) =>
-  projection.runtimeRequests.find((request) => request.status === "pending");
+  projection.runtimeRequests.find(
+    (request) =>
+      request.status === "pending" &&
+      (request.kind === "user_input" ||
+        request.kind === "dynamic_tool_call" ||
+        request.kind === "auth_refresh" ||
+        request.responseCapability.type !== "live" ||
+        projection.turnItems.some(
+          (item) =>
+            item.type === "approval_request" &&
+            item.requestId === request.id &&
+            item.nodeId === request.nodeId,
+        )),
+  );
 
 const hasActiveRun = (projection: OrchestrationV2ThreadProjection) =>
   projection.runs.some((run) =>
@@ -297,30 +314,34 @@ export function runOrchestratorV2Scenario(
           storedEventGroups.push(events);
         });
 
-      const waitForPendingRuntimeRequest = (
-        threadId: ThreadId,
-        attemptsRemaining = SCENARIO_WAIT_ATTEMPTS,
-        deadlineAt = scenarioWaitDeadline(),
-      ): Effect.Effect<
-        OrchestrationV2RuntimeRequest,
-        Orchestrator.OrchestratorV2Error | OrchestratorV2ScenarioStepError,
-        never
-      > =>
+      const waitForPendingRuntimeRequest = (threadId: ThreadId) =>
         Effect.gen(function* () {
+          // Request and card are separate committed events. Answer only once
+          // the card's native choices exist, just as the UI does.
+          const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
           const projection = yield* orchestrator.getThreadProjection(threadId);
           const request = findPendingRuntimeRequest(projection);
-          if (request !== undefined) {
-            return request;
-          }
-          if (scenarioWaitExhausted(attemptsRemaining, deadlineAt)) {
-            const runState = projection.runs.map((run) => `${run.id}:${run.status}`).join(",");
-            return yield* new OrchestratorV2ScenarioStepError({
-              scenario: scenario.name,
-              step: `respond_to_next_runtime_request:${threadId}:runs=${runState}:providerTurns=${projection.providerTurns.length}`,
-            });
-          }
-          yield* yieldToRuntime;
-          return yield* waitForPendingRuntimeRequest(threadId, attemptsRemaining - 1, deadlineAt);
+          if (request !== undefined) return request;
+          const result = yield* orchestrator
+            .streamStoredEventsFrom({ threadId, afterSequence })
+            .pipe(
+              Stream.mapEffect(() => orchestrator.getThreadProjection(threadId)),
+              Stream.map(findPendingRuntimeRequest),
+              Stream.filter(
+                (request): request is OrchestrationV2RuntimeRequest => request !== undefined,
+              ),
+              Stream.runHead,
+            );
+          return yield* Option.match(result, {
+            onSome: Effect.succeed,
+            onNone: () =>
+              Effect.fail(
+                new OrchestratorV2ScenarioStepError({
+                  scenario: scenario.name,
+                  step: `respond_to_next_runtime_request:${threadId}:stream-ended`,
+                }),
+              ),
+          });
         });
 
       const waitForThreadIdle = (
@@ -485,81 +506,54 @@ export function runOrchestratorV2Scenario(
         label: string,
         threadId: ThreadId,
         runId: OrchestrationV2Run["id"],
-        attemptsRemaining = SCENARIO_WAIT_ATTEMPTS,
-      ): Effect.Effect<
-        void,
-        Orchestrator.OrchestratorV2Error | OrchestratorV2ScenarioStepError,
-        never
-      > =>
+      ) =>
         Effect.gen(function* () {
+          const gate = options.replayGate;
+          if (gate === undefined || !(yield* Effect.promise(() => gate.waitForReached(label)))) {
+            return yield* new OrchestratorV2ScenarioStepError({
+              scenario: scenario.name,
+              step: `release_replay_gate_after_waiting:${label}:missing-gate`,
+            });
+          }
+          // Background Bash holds the root in post-terminal waiting until its
+          // roster clears. Await that committed milestone, including replayed
+          // events, before releasing the recorded completion.
+          yield* orchestrator.streamStoredEventsFrom({ threadId, afterSequence: 0 }).pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "run.updated" &&
+                event.runId === runId &&
+                event.payload.status === "waiting",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+          );
           const projection = yield* orchestrator.getThreadProjection(threadId);
           const run = projection.runs.find((candidate) => candidate.id === runId);
           const providerThread = projection.providerThreads.find(
             (candidate) => candidate.id === run?.providerThreadId,
           );
-          const pendingTaskCount = providerThread?.pendingBackgroundTasks?.length ?? 0;
-          const gateReached = options.replayGate?.hasReached(label) ?? false;
           if (
-            gateReached &&
-            run?.status === "completed" &&
-            providerThread !== undefined &&
-            pendingTaskCount > 0
+            providerThread === undefined ||
+            (providerThread.pendingBackgroundTasks?.length ?? 0) === 0
           ) {
-            options.replayGate?.release(label);
-            yield* waitForProviderBackgroundTasksCleared(threadId, providerThread.id);
-            return;
-          }
-          if (attemptsRemaining <= 0) {
-            options.replayGate?.release(label);
             return yield* new OrchestratorV2ScenarioStepError({
               scenario: scenario.name,
-              step: `release_replay_gate_after_waiting:${label}:reached=${gateReached}:run=${run?.status ?? "missing"}:providerThread=${run?.providerThreadId ?? "missing"}:pending=${pendingTaskCount}`,
+              step: `release_replay_gate_after_waiting:${label}:missing-background-task`,
             });
           }
-          yield* yieldToRuntime;
-          return yield* releaseReplayGateAfterWaiting(
-            label,
-            threadId,
-            runId,
-            attemptsRemaining - 1,
-          );
-        });
-
-      const waitForProviderBackgroundTasksCleared = (
-        threadId: ThreadId,
-        providerThreadId: NonNullable<OrchestrationV2Run["providerThreadId"]>,
-        attemptsRemaining = SCENARIO_WAIT_ATTEMPTS,
-      ): Effect.Effect<
-        void,
-        Orchestrator.OrchestratorV2Error | OrchestratorV2ScenarioStepError,
-        never
-      > =>
-        Effect.gen(function* () {
-          const projection = yield* orchestrator.getThreadProjection(threadId);
-          const providerThread = projection.providerThreads.find(
-            (candidate) => candidate.id === providerThreadId,
-          );
-          const hasPendingTasks = (providerThread?.pendingBackgroundTasks?.length ?? 0) > 0;
-          if (!hasPendingTasks && providerThread?.status === "idle") {
-            return;
-          }
-          if (attemptsRemaining <= 0) {
-            const providerState = projection.providerThreads
-              .map(
-                (candidate) =>
-                  `${candidate.id}:${candidate.status}:pending=${candidate.pendingBackgroundTasks?.length ?? 0}`,
-              )
-              .join(",");
-            return yield* new OrchestratorV2ScenarioStepError({
-              scenario: scenario.name,
-              step: `await_provider_background_tasks_cleared:${threadId}:target=${providerThreadId}:providers=${providerState}`,
-            });
-          }
-          yield* yieldToRuntime;
-          return yield* waitForProviderBackgroundTasksCleared(
-            threadId,
-            providerThreadId,
-            attemptsRemaining - 1,
+          const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+          gate.release(label);
+          yield* orchestrator.streamStoredEventsFrom({ threadId, afterSequence }).pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "provider-thread.updated" &&
+                event.payload.id === providerThread.id &&
+                event.payload.status === "idle" &&
+                (event.payload.pendingBackgroundTasks?.length ?? 0) === 0,
+            ),
+            Stream.take(1),
+            Stream.runDrain,
           );
         });
 

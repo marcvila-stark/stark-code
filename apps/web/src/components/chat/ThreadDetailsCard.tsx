@@ -1,6 +1,8 @@
 import { useLayoutEffect, useState, type ReactNode, type RefObject } from "react";
 import type { ScopedThreadRef } from "@starkfuture/contracts";
+import { EyeOffIcon } from "lucide-react";
 import { ScrollArea } from "../ui/scroll-area";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { cn } from "../../lib/utils";
 import { Popover, PopoverPopup, PopoverCreateHandle } from "../ui/popover";
 import { selectThreadPanelOpen, useRightPanelStore } from "../../rightPanelStore";
@@ -12,19 +14,30 @@ import {
   resolveThreadDetailsCardLayout,
 } from "./threadDetailsCardLayout";
 import { observeResize } from "../../lib/observeResize";
+import { ThreadDetailsControl } from "./ThreadDetailsControl";
+import {
+  THREAD_DETAILS_PANEL_ICON_CLASS,
+  THREAD_DETAILS_PANEL_LABEL_CLASS,
+} from "./threadDetailsPanelStyles";
 
-/** One card owns its placement and folds content only when that content cannot fit. */
+/**
+ * One card owns its placement and folds content only when that content cannot
+ * fit. Its own Hide control closes it; Tools → Chat details brings it back.
+ */
 export function ThreadDetailsCard({
   threadRef,
   anchor,
   handle,
   onPresentationChange,
+  onHidden,
   children,
 }: {
   threadRef: ScopedThreadRef;
   anchor: RefObject<Element | null>;
   handle: ReturnType<typeof PopoverCreateHandle>;
   onPresentationChange: (presentation: ThreadPanelPresentation) => void;
+  /** Runs after the Hide control closes the card, so focus can move somewhere useful. */
+  onHidden?: () => void;
   children: (density: "full" | "compact" | "essential") => ReactNode;
 }) {
   const canvas = useChatCanvas();
@@ -48,10 +61,10 @@ export function ThreadDetailsCard({
   const mode = placement ? "inline" : "popover";
   const topInset = canvas?.detailsCardTopInset ?? 0;
   const inlineOpen = useRightPanelStore((state) =>
-    selectThreadPanelOpen(state.threadPanelVisibilityByThreadKey, threadRef, "inline"),
+    selectThreadPanelOpen(state, threadRef, "inline"),
   );
   const popoverOpen = useRightPanelStore((state) =>
-    selectThreadPanelOpen(state.threadPanelVisibilityByThreadKey, threadRef, "popover"),
+    selectThreadPanelOpen(state, threadRef, "popover"),
   );
   const [contentElement, setContentElement] = useState<HTMLDivElement | null>(null);
   const measurementKey = `${threadRef.environmentId}:${threadRef.threadId}:${preferredPlacement?.width ?? "popup"}`;
@@ -93,7 +106,12 @@ export function ThreadDetailsCard({
     // observed height so increasing available space restores the detail it can hold.
     const measure = () => {
       const frame = element.closest<HTMLElement>("[data-thread-details-card]");
-      const next = element.offsetHeight + (frame ? frame.offsetHeight - frame.clientHeight : 0);
+      // The Hide row sits outside the scrolling content but takes card height too.
+      const footer = frame?.querySelector<HTMLElement>("[data-thread-details-card-footer]");
+      const next =
+        element.offsetHeight +
+        (footer?.offsetHeight ?? 0) +
+        (frame ? frame.offsetHeight - frame.clientHeight : 0);
       // Lineage scrolls as it expands. Counting it toward density would hide
       // the section and workspace controls when the user asks to see more rows.
       const lineage = element.querySelector<HTMLElement>("[data-thread-relationships-panel]");
@@ -120,10 +138,14 @@ export function ThreadDetailsCard({
     measure();
     return observeResize(element, measure);
   }, [contentElement, density, measurementKey]);
+  const hideCard = () => {
+    useRightPanelStore.getState().hideThreadPanel(threadRef);
+    onHidden?.();
+  };
   const card = (
     <div
       className={cn(
-        "dropdown-glass isolate contain-paint grid max-h-full grid-rows-[minmax(0,1fr)] overflow-hidden rounded-3xl",
+        "dropdown-glass isolate contain-paint grid max-h-full grid-rows-[minmax(0,1fr)_auto] overflow-hidden rounded-3xl",
         mode === "popover" &&
           "max-h-[min(calc(100dvh-6.5rem),calc(var(--available-height,100dvh)-1rem))]",
       )}
@@ -133,6 +155,17 @@ export function ThreadDetailsCard({
       <ScrollArea scrollFade className="min-h-0">
         <div ref={setContentElement}>{children(density)}</div>
       </ScrollArea>
+      <div className="border-t border-border/65 px-2 py-1.5" data-thread-details-card-footer>
+        <Tooltip>
+          <TooltipTrigger
+            render={<ThreadDetailsControl part="row" tone="muted" onClick={hideCard} />}
+          >
+            <EyeOffIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} />
+            <span className={THREAD_DETAILS_PANEL_LABEL_CLASS}>Hide chat details</span>
+          </TooltipTrigger>
+          <TooltipPopup side="top">Show it again from Tools → Chat details.</TooltipPopup>
+        </Tooltip>
+      </div>
     </div>
   );
   return (

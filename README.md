@@ -2,34 +2,27 @@
 
 Stark Future’s Mac coding workspace. Run Codex and Claude with graphical conversations, native agent shells, terminals, diff review, and Git worktrees for parallel tasks.
 
-## Install the private Alpha
+## Install on Mac
 
-Packaged Mac builds are shared through [GitHub Releases](https://github.com/starkfuture/stark-code/releases). Sign in to GitHub with an account that has access to this private repository.
+[Download Stark Code for Apple silicon Macs from Stark Pages](https://pages.starkfuture.com/stark-code/index.html).
 
-The first build targets **Apple silicon (M1 or newer), macOS 13.3 or newer**. Download the DMG, open it, and drag **Stark Code (Alpha)** into **Applications**. You do not need the source code, Node.js, or npm to use the packaged app.
+Open the DMG and drag **Stark Code (Alpha)** to **Applications**. The download page uses Stark's access settings and may require your work sign-in. This is an alpha preview; its current signing and installation requirements are listed with the download.
 
-This internal Alpha is not distributed through the App Store and is not Apple-notarized. If macOS blocks it, use the app-specific **Open Anyway** option in **System Settings → Privacy & Security**, where company device policy allows it. See [Apple's instructions](https://support.apple.com/en-us/102445). Automatic updates are not configured; install new builds from Releases.
+Run agents with your own installed Codex or Claude CLI and subscription. New graphical chats ask for action approvals by default. Chrome Capture can add selected text, images, and region screenshots—with their source URL—to a new or existing chat draft. You review the draft before sending. See [Chrome Capture setup](apps/chrome-extension/README.md).
 
-On first launch, connect Claude or Codex and choose a folder. Existing supported agent installations and sign-ins may be detected. Each tester uses their own provider account. Browser sign-in import is optional.
+Updates are installed manually from the download page while the production signing and update feed are being configured.
 
-The app is an Alpha for a small internal pilot. Report problems with the app version and what you were trying to do; do not attach tokens, cookies, credentials, or private conversation exports.
+## Run from source
 
-## Start from source
-
-Use Node 24. Dependencies are installed in this checkout. Double-click **Start Stark Code.command**, or run:
+Use Node.js 24 and the pinned package manager:
 
 ```sh
 nvm use 24
+npx --yes --package=pnpm@11.10.0 pnpm install --frozen-lockfile
 npm run dev:desktop -- --home-dir "$PWD/.stark-code"
 ```
 
-The launcher keeps development data and the Electron profile inside the checkout. The app does not send telemetry and hosted relay services are disabled. New agents require approvals by default. The app is built and updated locally.
-
-For a fresh checkout, install the pinned dependencies before starting:
-
-```sh
-npx --yes --package=pnpm@11.10.0 pnpm install --frozen-lockfile
-```
+You can also double-click **Start Stark Code.command** after installing dependencies. Development data and the Electron profile stay in the checkout. Hosted sign-in and relay services are disabled in this fork.
 
 ## Native shell mode
 

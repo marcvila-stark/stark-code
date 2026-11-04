@@ -712,6 +712,15 @@ const SETTINGS_SEARCH_CATALOG = [
     providerSettingsOnly: true,
   },
   {
+    id: "preview-browser",
+    title: "Preview browser",
+    to: "/settings/providers",
+    searchTerms: [
+      "headless browser chrome html preview html_preview screenshot install download setup doctor",
+    ],
+    providerSettingsOnly: true,
+  },
+  {
     id: "claude-organizations",
     title: "Claude organizations",
     to: "/settings/providers",
@@ -1046,6 +1055,12 @@ const SETTINGS_SEARCH_CATALOG = [
     title: "Archived threads",
     to: "/settings/archived",
     searchTerms: ["restore reopen deleted history projects"],
+  },
+  {
+    id: "scheduled-task-runs",
+    title: "Scheduled task runs",
+    to: "/settings/scheduled-tasks",
+    searchTerms: ["automation run history last run status started ended thread webhook schedule"],
   },
 ] as const satisfies ReadonlyArray<SettingsSearchItem>;
 

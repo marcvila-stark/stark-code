@@ -161,13 +161,15 @@ function branchPullRequestFor(row: LegacyThreadRow) {
   return Option.getOrNull(decodeLinkedPullRequest(parseJson(row.branch_pull_request_json)));
 }
 
+// A mode this build does not know never imports as anything broader than
+// Supervised; the startup freeze then aligns known modes to what they ran.
 function runtimeModeFor(value: string): OrchestrationV2AppThread["runtimeMode"] {
   return value === "approval-required" ||
     value === "auto-accept-edits" ||
     value === "auto" ||
     value === "full-access"
     ? value
-    : "full-access";
+    : "approval-required";
 }
 
 function interactionModeFor(value: string): OrchestrationV2AppThread["interactionMode"] {
@@ -212,6 +214,8 @@ function importedThread(row: LegacyThreadRow): OrchestrationV2AppThread {
     modelSelection,
     runtimeMode: runtimeModeFor(row.runtime_mode),
     interactionMode: interactionModeFor(row.interaction_mode),
+    // Imported chats always run an explicit preset.
+    permissionSource: "override",
     branch,
     worktreePath,
     linkedPullRequest,

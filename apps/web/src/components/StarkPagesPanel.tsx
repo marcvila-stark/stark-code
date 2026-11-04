@@ -7,9 +7,11 @@ import {
   useRef,
   useState,
   type ComponentProps,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import { usePreviewPanelInlineSize } from "~/hooks/usePreviewPanelInlineSize";
+import { RESIZABLE_WIDTH_PROPERTY } from "~/hooks/useResizableWidth";
 import { cn } from "~/lib/utils";
 import { isElectron } from "~/env";
 import { StarkPagesSidebar } from "./StarkPagesSidebar";
@@ -84,7 +86,7 @@ export function StarkPagesPanel({
     enabled: active && !overlay,
     container: portalHost?.parentElement,
     widthStorageKey: "starkcode:pages-panel-width",
-    defaultWidth: 540,
+    defaultWidth: 460,
   });
   useLayoutEffect(() => {
     if (
@@ -115,8 +117,8 @@ export function StarkPagesPanel({
   return (
     <Dialog.Root
       open={active}
-      modal={active && overlay}
-      disablePointerDismissal={!overlay}
+      modal={active && overlay && !expanded}
+      disablePointerDismissal={!overlay || expanded}
       onOpenChange={(open, details) => {
         if (open || !active) return;
         // Escape restores the reading panel before a second Escape closes it.
@@ -129,14 +131,14 @@ export function StarkPagesPanel({
       <div ref={setPortalHost} className="contents" />
       {portalHost ? (
         <Dialog.Portal keepMounted container={portalHost} className="contents">
-          {active && overlay ? (
+          {active && overlay && !expanded ? (
             <Dialog.Backdrop className="fixed inset-0 z-[60] bg-background/60 backdrop-blur-xs" />
           ) : null}
           <Dialog.Popup
             ref={panel}
-            role={overlay ? "dialog" : "complementary"}
+            role={overlay && !expanded ? "dialog" : "complementary"}
             aria-label="Stark Pages"
-            aria-modal={(active && overlay) || undefined}
+            aria-modal={(active && overlay && !expanded) || undefined}
             initialFocus={false}
             hidden={!active}
             inert={!active}
@@ -147,15 +149,22 @@ export function StarkPagesPanel({
               "min-h-0 min-w-0 flex-col bg-background text-foreground outline-none [-webkit-app-region:no-drag]",
               active ? "flex" : "hidden",
               overlay
-                ? "fixed inset-y-0 right-0 z-[60]"
+                ? "fixed bottom-0 top-[var(--stark-app-topbar-height,0px)] right-0 z-[60]"
                 : "relative h-full shrink-0 border-l border-border",
-              overlay && !expanded && isElectron && "top-(--workspace-topbar-height)",
+
               overlay &&
                 (expanded
-                  ? "left-0"
+                  ? "left-[var(--stark-app-rail-width,0px)]"
                   : "w-[min(540px,calc(100%-2rem))] border-l border-border shadow-lg"),
             )}
-            style={overlay ? undefined : { width }}
+            style={
+              overlay
+                ? undefined
+                : ({
+                    [RESIZABLE_WIDTH_PROPERTY]: `${width}px`,
+                    width: `var(${RESIZABLE_WIDTH_PROPERTY})`,
+                  } as CSSProperties)
+            }
           >
             {!overlay ? <RightPanelResizeHandle handlers={handlers} /> : null}
             <div

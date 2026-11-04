@@ -2,6 +2,7 @@ import {
   EnvironmentId,
   MessageId,
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
   type OrchestrationV2ConversationMessage,
 } from "@starkfuture/contracts";
@@ -12,12 +13,14 @@ import {
   forgetLegacySideWorkRecord,
   groupWorkspaceThreads,
   latestSideWorkResponse,
+  nativeReplyLabel,
   parseSideQuestionPrompt,
   readSideWorkRecords,
   sideWorkContext,
   sideWorkPrompt,
   sideWorkStatus,
   sideWorkTurn,
+  workspaceAgentSummary,
 } from "./sideWork.logic";
 
 function memoryStorage(): Storage {
@@ -107,6 +110,8 @@ describe("side work context", () => {
     });
     expect(prompt).toContain(JSON.stringify(source));
     expect(prompt).toContain("html_render");
+    // Diagrams need no tool call, so the formatting chat never waits on an approval for one.
+    expect(prompt).toContain("```mermaid");
     expect(prompt).toContain("no scripts");
     expect(prompt).toContain("Do not research");
   });
@@ -168,6 +173,33 @@ it("groups only this environment's workspace, collapsing shared worktree paths a
     ["/work/branch", [attention.id, parent.id]],
   ]);
   expect(sideWorkStatus(attention)).toBe("Approval needed");
+});
+
+it("names an agent's provider by brand instead of its driver or instance id", () => {
+  const ping = makeThreadFixture({ id: ThreadId.make("ping"), title: "Readiness ping" });
+  expect(
+    workspaceAgentSummary({
+      ...ping,
+      runtime: {
+        status: "completed",
+        activeRunId: null,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        providerName: "claudeAgent",
+        lastError: null,
+        updatedAt: "2026-10-15T00:00:00Z",
+      },
+    }),
+  ).toBe("Claude · completed");
+  expect(workspaceAgentSummary({ ...parent, runtime: null })).toBe("Codex · idle · feature");
+});
+
+it("labels captured native replies by provider brand", () => {
+  expect(nativeReplyLabel({ provider: "claude", text: "Done.\n\nAll   checks pass" })).toBe(
+    "Claude · Done. All checks pass",
+  );
+  expect(nativeReplyLabel({ provider: "codex", text: "x".repeat(120) })).toBe(
+    `Codex · ${"x".repeat(90)}`,
+  );
 });
 
 it("recovers saved local associations without trusting malformed storage", () => {

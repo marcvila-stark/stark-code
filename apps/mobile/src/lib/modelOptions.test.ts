@@ -569,6 +569,61 @@ describe("mobile model options", () => {
     ).toBeNull();
   });
 
+  it("starts a new task on Claude when nothing is chosen and Claude is ready", () => {
+    const provider = (instanceId: string, driver: string, status: string, slug: string) => ({
+      instanceId,
+      driver,
+      enabled: true,
+      installed: true,
+      status,
+      auth: { status: "authenticated" },
+      models: [{ slug, name: slug, isCustom: false, isDefault: true, capabilities: null }],
+    });
+    const resolveWith = (providers: ReadonlyArray<ReturnType<typeof provider>>) =>
+      resolveNewTaskModelSelection({
+        draftSelection: null,
+        projectDefaultSelection: null,
+        stickySelection: null,
+        modelOptions: buildModelOptions(
+          { providers } as unknown as ServerConfig,
+          null,
+          undefined,
+          null,
+        ),
+      });
+
+    expect(
+      resolveWith([
+        provider("codex", "codex", "ready", "gpt-5.6"),
+        provider("claudeAgent", "claudeAgent", "ready", "claude-opus-4-8"),
+      ]),
+    ).toEqual({ instanceId: "claudeAgent", model: "claude-opus-4-8" });
+    // A Claude that has not reported ready does not beat a ready provider.
+    expect(
+      resolveWith([
+        provider("codex", "codex", "ready", "gpt-5.6"),
+        provider("claudeAgent", "claudeAgent", "warning", "claude-opus-4-8"),
+      ]),
+    ).toEqual({ instanceId: "codex", model: "gpt-5.6" });
+    // The last manual pick still wins over the automatic one.
+    const sticky = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6" };
+    expect(
+      resolveNewTaskModelSelection({
+        draftSelection: null,
+        projectDefaultSelection: null,
+        stickySelection: sticky,
+        modelOptions: buildModelOptions(
+          {
+            providers: [provider("claudeAgent", "claudeAgent", "ready", "claude-opus-4-8")],
+          } as unknown as ServerConfig,
+          null,
+          undefined,
+          null,
+        ),
+      }),
+    ).toBe(sticky);
+  });
+
   describe("project-aware enablement", () => {
     const projectId = ProjectId.make("project-a");
     const instanceId = ProviderInstanceId.make("codex_work");

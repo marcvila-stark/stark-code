@@ -23,8 +23,8 @@ class StarkReviewDiffModule : Module() {
       Prop("selectedRowIdsJson") { view: StarkReviewDiffView, selectedRowIdsJson: String ->
         view.setSelectedRowIdsJson(selectedRowIdsJson)
       }
-      Prop("collapsedCommentIdsJson") { view: StarkReviewDiffView, collapsedCommentIdsJson: String ->
-        view.setCollapsedCommentIdsJson(collapsedCommentIdsJson)
+      Prop("collapsedCommentIdsJson") { view: StarkReviewDiffView, idsJson: String ->
+        view.setCollapsedCommentIdsJson(idsJson)
       }
       Prop("appearanceScheme") { view: StarkReviewDiffView, appearanceScheme: String ->
         view.setAppearanceScheme(appearanceScheme)
@@ -60,8 +60,8 @@ class StarkReviewDiffModule : Module() {
         "onToggleComment",
       )
 
-      AsyncFunction("scrollToFile") { view: StarkReviewDiffView, fileId: String, animated: Boolean ->
-        view.scrollToFile(fileId, animated)
+      AsyncFunction("scrollToFile") { view: StarkReviewDiffView, id: String, animated: Boolean ->
+        view.scrollToFile(id, animated)
       }
       AsyncFunction("scrollToTop") { view: StarkReviewDiffView, animated: Boolean ->
         view.scrollToTop(animated)

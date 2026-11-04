@@ -22,7 +22,8 @@ beforeEach(() => {
   useRightPanelStore.setState({
     byThreadKey: {},
     auxiliaryPanelByThreadKey: {},
-    threadPanelVisibilityByThreadKey: {},
+    threadPanelInlineOpen: true,
+    threadPanelPopoverOpenByThreadKey: {},
     userActionRevisionByThreadKey: {},
     closeRevisionByThreadKey: {},
   });

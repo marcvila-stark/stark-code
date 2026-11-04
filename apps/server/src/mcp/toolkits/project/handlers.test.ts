@@ -26,6 +26,7 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
+import { liveThreadRecords } from "../../McpToolAccess.testkit.ts";
 import * as ProjectHandlers from "./handlers.ts";
 import { ProjectToolkit } from "./tools.ts";
 
@@ -64,6 +65,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
         getThreadShell: () => Effect.succeed(caller),
+        getThreadRecords: () => liveThreadRecords(caller) as never,
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({
         launch: (input) => {
@@ -136,6 +138,7 @@ it.effect("launches a scratch thread into the Scratch project", () =>
       }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
         getThreadShell: () => Effect.succeed(caller),
+        getThreadRecords: () => liveThreadRecords(caller) as never,
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({
         launch: (input) => {
@@ -193,7 +196,8 @@ it.effect("starts a project from just a title when workspaceRoot is omitted", ()
   Effect.gen(function* () {
     const sourceThreadId = ThreadId.make("source-thread");
     const createdProjectId = ProjectId.make("project:named");
-    const providerInstanceId = ProviderInstanceId.make("codex");
+    // Creating projects needs a provider that really runs Bypass: Claude, not clamped Codex.
+    const providerInstanceId = ProviderInstanceId.make("claudeAgent");
     const caller = {
       id: sourceThreadId,
       projectId: ProjectId.make("project:caller"),
@@ -234,6 +238,7 @@ it.effect("starts a project from just a title when workspaceRoot is omitted", ()
       }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
         getThreadShell: () => Effect.succeed(caller),
+        getThreadRecords: () => liveThreadRecords(caller) as never,
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
       Layer.mock(Project.ProjectService)({

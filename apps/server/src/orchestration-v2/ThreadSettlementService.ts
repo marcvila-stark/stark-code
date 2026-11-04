@@ -144,6 +144,8 @@ export function isAutoSettlementCandidate(
   if (thread.pinnedAt != null || thread.autoSettleDisabledAt != null) return false;
   // Blocked-on-you work must never park behind a settled override.
   if (thread.pendingRuntimeRequest !== null) return false;
+  // A decision lost to a restart is still owed until the user asks again or dismisses it.
+  if (thread.lostRuntimeRequest != null) return false;
   // A live run, or background work that will wake the agent, is not
   // staleness. A dev server left running is: the agent is done.
   if (thread.activityRunStatus != null) return false;
@@ -165,8 +167,8 @@ export function isAutoSettlementCandidate(
 
 /**
  * Whether a thread is parked on its snooze: its wake time is in the future and
- * it has not raised its hand with a pending request, a fresh failure, or work
- * that completed after the snooze. Server twin of the client's
+ * it has not raised its hand with a pending or lost request, a fresh failure,
+ * or work that completed after the snooze. Server twin of the client's
  * `effectiveSnoozed`, so agents and the sidebar agree on what is snoozed. One
  * difference: a failure counts as fresh when its run completed after the
  * snooze, like `isAutoSettlementCandidate`. The client compares the shell's
@@ -175,13 +177,18 @@ export function isAutoSettlementCandidate(
 export function isSnoozed(
   thread: Pick<
     ProjectionStore.ProjectionSettlementCandidate,
-    "snoozedUntil" | "snoozedAt" | "latestRunCompletedAt" | "status" | "pendingRuntimeRequest"
+    | "snoozedUntil"
+    | "snoozedAt"
+    | "latestRunCompletedAt"
+    | "status"
+    | "pendingRuntimeRequest"
+    | "lostRuntimeRequest"
   >,
   nowMs: number,
 ): boolean {
   const snoozedUntilMs = toMillis(thread.snoozedUntil);
   if (snoozedUntilMs === null || snoozedUntilMs <= nowMs) return false;
-  if (thread.pendingRuntimeRequest !== null) return false;
+  if (thread.pendingRuntimeRequest !== null || thread.lostRuntimeRequest != null) return false;
   const snoozedAtMs = toMillis(thread.snoozedAt);
   const completedAtMs = toMillis(thread.latestRunCompletedAt);
   const wokeOnError =

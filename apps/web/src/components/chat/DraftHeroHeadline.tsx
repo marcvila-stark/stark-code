@@ -234,14 +234,11 @@ export function DraftHeroHeadline({
             : logicalProjectKey,
         );
     if (!composerDraftHasUserContent(currentDraft)) {
-      const opened = await openProjectDraft(
-        scopeProjectRef(project.environmentId, project.id),
-        {
-          isCurrent: () =>
-            latestTargetRef.current.draftId === draftId &&
-            latestTargetRef.current.activeProjectKey === logicalProjectKey,
-        },
-      );
+      const opened = await openProjectDraft(scopeProjectRef(project.environmentId, project.id), {
+        isCurrent: () =>
+          latestTargetRef.current.draftId === draftId &&
+          latestTargetRef.current.activeProjectKey === logicalProjectKey,
+      });
       if (opened !== null && latestTargetRef.current.activeProjectKey === logicalProjectKey)
         updateFolderScope();
       return;

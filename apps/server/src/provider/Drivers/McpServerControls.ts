@@ -85,20 +85,20 @@ export function codexMcpStatusEntry(
   value: CodexSchema.V2ListMcpServerStatusResponse__McpServerStatus,
 ): McpServerStatusEntry {
   const endpointHost = mcpEndpointHost(value.httpOrigin);
+  // The runtime can retain its initialized transport state after discovery fails.
+  // An explicit toolsError is stronger evidence than that old Connected label.
   const status =
     value.runtimeStatus === "disabled"
       ? "disabled"
       : value.runtimeStatus === "authenticationRequired" || value.authStatus === "notLoggedIn"
         ? "needs-auth"
-        : value.runtimeStatus === "connected" ||
-            (value.runtimeStatus == null &&
-              Object.keys(value.tools).length > 0 &&
-              !value.toolsError)
-          ? "connected"
-          : value.runtimeStatus === "failed" ||
-              value.runtimeStatus === "cancelled" ||
-              (value.runtimeStatus == null && Boolean(value.toolsError))
-            ? "failed"
+        : value.runtimeStatus === "failed" ||
+            value.runtimeStatus === "cancelled" ||
+            Boolean(value.toolsError)
+          ? "failed"
+          : value.runtimeStatus === "connected" ||
+              (value.runtimeStatus == null && Object.keys(value.tools).length > 0)
+            ? "connected"
             : "connecting";
   return {
     name: clean(value.name),

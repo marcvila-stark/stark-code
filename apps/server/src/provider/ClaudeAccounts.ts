@@ -493,6 +493,7 @@ export const runtimeLayer = Layer.effect(
           ),
           (instance) =>
             (instance.invalidateCaches ?? Effect.void).pipe(
+              Effect.andThen(instance.snapshot.invalidateAccount ?? Effect.void),
               Effect.andThen(registry.refreshInstance(instance.instanceId)),
             ),
           { concurrency: 2, discard: true },

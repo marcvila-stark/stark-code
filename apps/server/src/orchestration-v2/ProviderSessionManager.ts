@@ -1,7 +1,14 @@
-import { BRAND } from "@starkfuture/shared/branding";
+import {
+  isPersonFacingRuntimeRequest,
+  lostRuntimeRequestLabel,
+} from "@starkfuture/shared/orchestrationV2LostRequests";
 import {
   claimAgentWorkspace,
+  canQueueBehindWorkspaceOwner,
+  workspaceCooperationRoot,
   releaseAgentWorkspace,
+  waitForAgentWorkspace,
+  WorkspaceAgentBusyError,
 } from "../workspace/WorkspaceAgentOwnership.ts";
 import { AgentScope } from "@starkfuture/shared/AgentScope";
 import * as KeyedLock from "@starkfuture/shared/KeyedLock";
@@ -51,36 +58,35 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as McpProviderSessions from "@starkfuture/provider-core/server/McpProviderSessions";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@starkfuture/provider-core/server/IdAllocator";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderAdapter from "@starkfuture/provider-core/server/ProviderAdapter";
+import { ProviderWorkspaceBusyError } from "@starkfuture/provider-core/server/failure";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { supervisedRuntimePolicy } from "./PermissionPolicy.ts";
 
-function supervisedRuntimePolicy(
+/**
+ * The runtime policy a session runtime receives for every launch, ensure,
+ * resume, fork and turn: Claude's as resolved, every other driver's clamped to
+ * Supervised (`supervisedRuntimePolicy`, which passes an allowed inherit
+ * through). The permission wire golden checks this exact routing.
+ */
+export function sessionRuntimePolicy(
+  driver: string,
   policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
 ): ProviderAdapter.ProviderAdapterV2RuntimePolicy;
-function supervisedRuntimePolicy(
+export function sessionRuntimePolicy(
+  driver: string,
   policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy | undefined,
 ): ProviderAdapter.ProviderAdapterV2RuntimePolicy | undefined;
-function supervisedRuntimePolicy(
+export function sessionRuntimePolicy(
+  driver: string,
   policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy | undefined,
 ): ProviderAdapter.ProviderAdapterV2RuntimePolicy | undefined {
-  if (!BRAND.requireApprovalsByDefault || policy === undefined) return policy;
-  const { approvalPolicy, sandboxPolicy, ...rest } = policy;
-  const readOnlySandbox =
-    sandboxPolicy === "read-only" ||
-    (typeof sandboxPolicy === "object" &&
-      sandboxPolicy !== null &&
-      "type" in sandboxPolicy &&
-      sandboxPolicy.type === "readOnly");
-  return {
-    ...rest,
-    runtimeMode: "approval-required",
-    ...(approvalPolicy === "untrusted" ? { approvalPolicy } : {}),
-    ...(readOnlySandbox ? { sandboxPolicy } : {}),
-  };
+  return driver === "claudeAgent" ? policy : supervisedRuntimePolicy(policy);
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -310,6 +316,27 @@ function releasedRuntimeRequestStatusFor(
   return reason === "manual_shutdown" || reason === "server_shutdown" ? "cancelled" : "expired";
 }
 
+/**
+ * Why a release loses the decisions its pending requests waited on. A user's
+ * own stop and an idle release lose nothing the user did not choose; a
+ * provider that exits, even cleanly, does.
+ */
+function releasedRuntimeRequestLossCause(
+  reason: ProviderSessionReleaseReason,
+  exitedByProvider: boolean,
+): NonNullable<OrchestrationV2RuntimeRequest["lost"]>["cause"] | undefined {
+  switch (reason) {
+    case "runtime_error":
+      return "provider_exit";
+    case "server_shutdown":
+      return "server_shutdown";
+    case "manual_shutdown":
+      return exitedByProvider ? "provider_exit" : undefined;
+    case "idle_timeout":
+      return undefined;
+  }
+}
+
 function sessionKey(providerSessionId: ProviderSessionId): string {
   return String(providerSessionId);
 }
@@ -369,6 +396,7 @@ export const layerWithOptions = (
 ): Layer.Layer<
   ProviderSessionManagerV2,
   never,
+  | EffectOutbox.EffectOutboxV2
   | EventSink.EventSinkV2
   | FileSystem.FileSystem
   | IdAllocator.IdAllocatorV2
@@ -397,6 +425,7 @@ export const layerWithOptions = (
       const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
       const projectService = yield* Effect.serviceOption(ProjectService.ProjectService);
       const eventSink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
@@ -461,17 +490,21 @@ export const layerWithOptions = (
       );
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
       const workspaceTurnTokens = new Map<string, symbol>();
+      const workspaceTurnWaitCancels = new Map<string, () => void>();
       const workspaceTurnKey = (sessionId: ProviderSessionId, turnKey: string) =>
         `${sessionId}#${turnKey}`;
       const releaseSessionWorkspaces = (sessionId: ProviderSessionId) => {
         for (const [key, token] of workspaceTurnTokens) {
           if (!key.startsWith(`${sessionId}#`)) continue;
+          workspaceTurnWaitCancels.get(key)?.();
           releaseAgentWorkspace(token);
           workspaceTurnTokens.delete(key);
         }
       };
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
+          for (const cancel of workspaceTurnWaitCancels.values()) cancel();
+          workspaceTurnWaitCancels.clear();
           for (const token of workspaceTurnTokens.values()) releaseAgentWorkspace(token);
           workspaceTurnTokens.clear();
         }),
@@ -731,11 +764,17 @@ export const layerWithOptions = (
         readonly reason: ProviderSessionReleaseReason;
         /** Requests created later belong to a replacement session with the same id. */
         readonly releasedAt: DateTime.Utc;
+        /** The provider ended the session itself, not the user or Stark Code. */
+        readonly exitedByProvider?: boolean;
       }) =>
         Effect.gen(function* () {
           const providerSessionId = input.entry.runtime.providerSessionId;
           const now = yield* DateTime.now;
           const status = releasedRuntimeRequestStatusFor(input.reason);
+          const lostCause = releasedRuntimeRequestLossCause(
+            input.reason,
+            input.exitedByProvider === true,
+          );
           const reason =
             input.reason === "runtime_error"
               ? "Provider session failed before this runtime request was resolved."
@@ -757,6 +796,10 @@ export const layerWithOptions = (
             );
 
             for (const request of releasedRequests) {
+              const lost =
+                lostCause !== undefined && isPersonFacingRuntimeRequest(request)
+                  ? { cause: lostCause, lostAt: now }
+                  : undefined;
               events.push({
                 id: yield* idAllocator.allocate.event({
                   threadId,
@@ -775,6 +818,7 @@ export const layerWithOptions = (
                     reason,
                   },
                   resolvedAt: now,
+                  ...(lost === undefined ? {} : { lost }),
                 },
               });
 
@@ -821,9 +865,85 @@ export const layerWithOptions = (
                     status: input.reason === "runtime_error" ? "failed" : "cancelled",
                     completedAt: now,
                     updatedAt: now,
+                    ...(lost === undefined
+                      ? {}
+                      : {
+                          title: lostRuntimeRequestLabel({ kind: request.kind, cause: lost.cause }),
+                        }),
                   },
                 });
               }
+            }
+
+            // An answer that committed just before the session ended may not
+            // have reached the provider. It is kept, marked uncertain, and
+            // never sent again: its response effect refuses a closed request.
+            if (lostCause === undefined) continue;
+            const answeredRequests = projection.runtimeRequests.filter(
+              (request) =>
+                request.status === "resolved" &&
+                request.lost === undefined &&
+                request.responseCapability.type === "live" &&
+                request.responseCapability.providerSessionId === providerSessionId &&
+                isPersonFacingRuntimeRequest(request) &&
+                DateTime.isLessThanOrEqualTo(request.createdAt, input.releasedAt),
+            );
+            if (answeredRequests.length === 0) continue;
+            const undeliveredRequestIds = new Set(
+              (yield* outbox.listUnsettled({
+                threadId,
+                effectTypes: ["runtime-request.respond"],
+              })).flatMap((effect) =>
+                effect.request.type === "runtime-request.respond" &&
+                effect.request.providerSessionId === providerSessionId
+                  ? [effect.request.requestId]
+                  : [],
+              ),
+            );
+            for (const request of answeredRequests) {
+              if (!undeliveredRequestIds.has(request.id)) continue;
+              events.push({
+                id: yield* idAllocator.allocate.event({ threadId, providerSessionId }),
+                type: "runtime-request.updated",
+                threadId,
+                nodeId: request.nodeId,
+                driver: input.entry.runtime.driver,
+                occurredAt: now,
+                payload: {
+                  ...request,
+                  status,
+                  responseCapability: {
+                    type: "not_resumable",
+                    reason: "Provider session ended before this answer was confirmed delivered.",
+                  },
+                  lost: { cause: lostCause, lostAt: now, deliveryUncertain: true },
+                },
+              });
+              const turnItem = projection.turnItems.find(
+                (item) =>
+                  (item.type === "approval_request" || item.type === "user_input_request") &&
+                  item.requestId === request.id,
+              );
+              if (turnItem === undefined) continue;
+              // The item keeps its answered status; only the title says why.
+              events.push({
+                id: yield* idAllocator.allocate.event({ threadId, providerSessionId }),
+                type: "turn-item.updated",
+                threadId,
+                ...(turnItem.runId === null ? {} : { runId: turnItem.runId }),
+                ...(turnItem.nodeId === null ? {} : { nodeId: turnItem.nodeId }),
+                driver: input.entry.runtime.driver,
+                occurredAt: now,
+                payload: {
+                  ...turnItem,
+                  title: lostRuntimeRequestLabel({
+                    kind: request.kind,
+                    cause: lostCause,
+                    deliveryUncertain: true,
+                  }),
+                  updatedAt: now,
+                },
+              });
             }
           }
 
@@ -842,6 +962,7 @@ export const layerWithOptions = (
         readonly detail?: string;
         readonly releasedAt: DateTime.Utc;
         readonly replaced: boolean;
+        readonly exitedByProvider?: boolean;
       }) =>
         Effect.all(
           [
@@ -999,6 +1120,8 @@ export const layerWithOptions = (
         readonly cancelIdleFiber?: boolean;
         readonly onlyIfIdleGeneration?: number;
         readonly gracefulSubscribers?: boolean;
+        /** Set when the provider ended the session itself; see releasedRuntimeRequestLossCause. */
+        readonly exitedByProvider?: boolean;
       }) =>
         Effect.acquireUseRelease(
           removeLiveEntry(input),
@@ -1029,6 +1152,7 @@ export const layerWithOptions = (
                     reason: input.reason,
                     ...(input.detail === undefined ? {} : { detail: input.detail }),
                     releasedAt,
+                    ...(input.exitedByProvider === true ? { exitedByProvider: true } : {}),
                   };
                   const recorded = yield* Effect.exit(
                     writeReleaseRecords({ ...records, replaced: false }),
@@ -1199,6 +1323,31 @@ export const layerWithOptions = (
             ),
           ),
         );
+
+      // Names the chat holding the folder, and whether it waits on the user,
+      // so the refused turn can say so and link to it. A failed read still
+      // refuses the turn, with the reason it can prove.
+      const workspaceBusyError = (threadId: ThreadId, busy: WorkspaceAgentBusyError) =>
+        Effect.gen(function* () {
+          const blockingThreadId = ThreadId.make(busy.threadId);
+          const shell = yield* projectionStore
+            .getThreadShell(blockingThreadId)
+            .pipe(Effect.orElseSucceed(() => null));
+          const pending = shell?.pendingRuntimeRequest ?? null;
+          return yield* new ProviderWorkspaceBusyError({
+            threadId,
+            blockingThreadId,
+            blockingThreadTitle: shell?.title ?? null,
+            reason:
+              busy.kind === "native"
+                ? "terminal_agent"
+                : pending === null
+                  ? "working"
+                  : pending.kind === "user_input"
+                    ? "user_input"
+                    : "approval",
+          });
+        });
 
       // Provider activity restarts the pin budget, so background work that keeps
       // reporting progress (a long Claude workflow) is never cut off; only work
@@ -1770,10 +1919,187 @@ export const layerWithOptions = (
               modelFamily: normalizeModelMetricLabel(model),
             },
           });
+        const workspaceWaitingCancels = new Map<string, () => void>();
+        const claimTurnWorkspace = (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+          Effect.gen(function* () {
+            const cwd = input.runtimePolicy.cwd;
+            if (cwd === null) return;
+            const workspace = yield* fileSystem.realPath(cwd).pipe(Effect.orElseSucceed(() => cwd));
+            const ownerKey = workspaceTurnKey(
+              providerSessionId,
+              busyTurnKey(input.providerThread.id, input.runOrdinal),
+            );
+            const token = workspaceTurnTokens.get(ownerKey) ?? Symbol("graphical workspace owner");
+            const isSideChat = input.appThread.lineage.relationshipToParent === "side_chat";
+            // A fork and a side chat start their own cooperation family. Only
+            // delegated workers follow their recorded parent chain; the
+            // conversation root also includes forks and is too broad here.
+            let familyRoot = input.appThread;
+            const seen = new Set<ThreadId>();
+            while (
+              familyRoot.lineage.relationshipToParent === "subagent" &&
+              familyRoot.lineage.parentThreadId !== null &&
+              !seen.has(familyRoot.id)
+            ) {
+              seen.add(familyRoot.id);
+              familyRoot = (yield* projectionStore.getThreadRecords(
+                familyRoot.lineage.parentThreadId,
+                [],
+              )).thread;
+            }
+            // MCP may also start ordinary threads. Its server-recorded sender
+            // is cooperative work from the active caller, without changing the
+            // created thread's conversation lineage. Native agents never join.
+            const sender =
+              !isSideChat &&
+              input.message.createdBy === "agent" &&
+              input.message.creationSource === "mcp"
+                ? input.message.senderThreadId
+                : undefined;
+            const owner = {
+              token,
+              threadId: input.threadId,
+              kind: "graphical" as const,
+              delegationRootThreadId:
+                (sender === undefined ? undefined : workspaceCooperationRoot(workspace, sender)) ??
+                workspaceCooperationRoot(workspace, familyRoot.id) ??
+                familyRoot.id,
+              ...(isSideChat && input.appThread.lineage.parentThreadId !== null
+                ? { sideChatParentThreadId: input.appThread.lineage.parentThreadId }
+                : {}),
+            };
+            workspaceTurnTokens.set(ownerKey, token);
+            const blockingOwner = yield* Effect.try({
+              try: () => claimAgentWorkspace(workspace, owner),
+              catch: (cause) =>
+                cause instanceof WorkspaceAgentBusyError ? cause : new Cause.UnknownError(cause),
+            }).pipe(
+              Effect.as(null),
+              Effect.catchTags({
+                // A side chat and its parent queue behind each other; any other
+                // holder refuses the turn, naming the chat that holds the folder.
+                WorkspaceAgentBusyError: (busy) =>
+                  canQueueBehindWorkspaceOwner(owner, busy)
+                    ? Effect.succeed(busy.kind)
+                    : workspaceBusyError(input.threadId, busy),
+              }),
+            );
+            if (blockingOwner === null) return;
+
+            // Plan/read-only modes can still expose MCP writes or approval escalation.
+            // Side questions therefore wait for the writer, rather than bypassing its lock.
+            const startedAt = yield* DateTime.now;
+            const itemId = idAllocator.derive.turnItemFromProviderItem({
+              driver: runtime.driver,
+              nativeItemId: `workspace-wait:${input.runId}:${input.attemptId}`,
+            });
+            const publishWait = (status: "waiting" | "completed" | "cancelled") =>
+              Effect.gen(function* () {
+                const now = yield* DateTime.now;
+                yield* eventSink.write({
+                  events: [
+                    {
+                      id: yield* idAllocator.allocate.event({
+                        threadId: input.threadId,
+                        providerSessionId,
+                      }),
+                      type: "turn-item.updated",
+                      threadId: input.threadId,
+                      runId: input.runId,
+                      nodeId: input.rootNodeId,
+                      driver: runtime.driver,
+                      occurredAt: now,
+                      payload: {
+                        id: itemId,
+                        type: "notification",
+                        toolNonExecutionKind: "workspace_wait",
+                        source: { kind: "system" },
+                        outcome: status === "cancelled" ? "cancelled" : "updated",
+                        summary:
+                          status === "waiting"
+                            ? blockingOwner === "native"
+                              ? "A native terminal session is using this folder. Exit that session to continue automatically."
+                              : isSideChat
+                                ? "Waiting for this folder to become available. Your side chat will start automatically."
+                                : "Waiting for your side chat to finish using this folder. This chat will continue automatically."
+                            : status === "completed"
+                              ? "Chat can now start."
+                              : "Chat stopped while waiting.",
+                        title: isSideChat ? "Side chat" : "Chat",
+                        threadId: input.threadId,
+                        runId: input.runId,
+                        nodeId: input.rootNodeId,
+                        providerThreadId: input.providerThread.id,
+                        providerTurnId: null,
+                        nativeItemRef: null,
+                        parentItemId: null,
+                        ordinal: 0,
+                        status,
+                        startedAt,
+                        completedAt: status === "waiting" ? null : now,
+                        updatedAt: now,
+                      },
+                    },
+                  ],
+                });
+              });
+            let cancelled = false;
+            let removeWait = () => {};
+            let interruptWait = () => {};
+            const cancelWait = () => {
+              cancelled = true;
+              removeWait();
+              interruptWait();
+            };
+            workspaceWaitingCancels.set(input.providerThread.id, cancelWait);
+            workspaceTurnWaitCancels.set(ownerKey, cancelWait);
+            yield* Effect.gen(function* () {
+              yield* publishWait("waiting");
+              yield* Effect.callback<void>((resume) => {
+                interruptWait = () => resume(Effect.interrupt);
+                if (cancelled) {
+                  interruptWait();
+                } else {
+                  removeWait = waitForAgentWorkspace(workspace, owner, () => resume(Effect.void));
+                }
+                return Effect.sync(() => removeWait());
+              });
+              yield* publishWait("completed");
+              if (cancelled) return yield* Effect.interrupt;
+            }).pipe(
+              Effect.onError(() => publishWait("cancelled").pipe(Effect.ignore)),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  if (workspaceWaitingCancels.get(input.providerThread.id) === cancelWait)
+                    workspaceWaitingCancels.delete(input.providerThread.id);
+                  if (workspaceTurnWaitCancels.get(ownerKey) === cancelWait)
+                    workspaceTurnWaitCancels.delete(ownerKey);
+                }),
+              ),
+            );
+          });
         const decorated: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           ...runtime,
           ...(recovery ? { mcpServers: recovery.api } : {}),
           subscribeEvents,
+          ...(runtime.runUserShellCommand
+            ? {
+                runUserShellCommand: (input) =>
+                  runtime.runUserShellCommand!({
+                    ...input,
+                    runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
+                  }),
+              }
+            : {}),
+          ...(runtime.compactThread
+            ? {
+                compactThread: (input) =>
+                  runtime.compactThread!({
+                    ...input,
+                    runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
+                  }),
+              }
+            : {}),
           events: Stream.unwrap(
             subscribeEvents.pipe(Effect.map((subscription) => subscription.events)),
           ),
@@ -1790,10 +2116,7 @@ export const layerWithOptions = (
                 runtime
                   .ensureThread({
                     ...input,
-                    runtimePolicy:
-                      runtime.driver === "claudeAgent"
-                        ? input.runtimePolicy
-                        : supervisedRuntimePolicy(input.runtimePolicy),
+                    runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
                   })
                   .pipe(providerOperation),
               ),
@@ -1804,10 +2127,7 @@ export const layerWithOptions = (
                   providerThreadKey: providerThreadLoadKey({
                     providerThread,
                     modelSelection: input.modelSelection,
-                    runtimePolicy:
-                      runtime.driver === "claudeAgent"
-                        ? input.runtimePolicy
-                        : supervisedRuntimePolicy(input.runtimePolicy),
+                    runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
                   }),
                 }),
               ),
@@ -1821,10 +2141,7 @@ export const layerWithOptions = (
                   ...(input.runtimePolicy === undefined
                     ? {}
                     : {
-                        runtimePolicy:
-                          runtime.driver === "claudeAgent"
-                            ? input.runtimePolicy
-                            : supervisedRuntimePolicy(input.runtimePolicy),
+                        runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
                       }),
                 })
                 .pipe(providerOperation);
@@ -1837,10 +2154,7 @@ export const layerWithOptions = (
               ...(input.runtimePolicy === undefined
                 ? {}
                 : {
-                    runtimePolicy:
-                      runtime.driver === "claudeAgent"
-                        ? input.runtimePolicy
-                        : supervisedRuntimePolicy(input.runtimePolicy),
+                    runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
                   }),
             });
             return observeActivity(
@@ -1870,10 +2184,10 @@ export const layerWithOptions = (
                         ...(input.runtimePolicy === undefined
                           ? {}
                           : {
-                              runtimePolicy:
-                                runtime.driver === "claudeAgent"
-                                  ? input.runtimePolicy
-                                  : supervisedRuntimePolicy(input.runtimePolicy),
+                              runtimePolicy: sessionRuntimePolicy(
+                                runtime.driver,
+                                input.runtimePolicy,
+                              ),
                             }),
                       })
                       .pipe(providerOperation),
@@ -1890,10 +2204,7 @@ export const layerWithOptions = (
                     ...(input.runtimePolicy === undefined
                       ? {}
                       : {
-                          runtimePolicy:
-                            runtime.driver === "claudeAgent"
-                              ? input.runtimePolicy
-                              : supervisedRuntimePolicy(input.runtimePolicy),
+                          runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
                         }),
                   }),
                 }),
@@ -1916,10 +2227,7 @@ export const layerWithOptions = (
                     ...(input.runtimePolicy === undefined
                       ? {}
                       : {
-                          runtimePolicy:
-                            runtime.driver === "claudeAgent"
-                              ? input.runtimePolicy
-                              : supervisedRuntimePolicy(input.runtimePolicy),
+                          runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
                         }),
                   })
                   .pipe(providerOperation),
@@ -1936,10 +2244,7 @@ export const layerWithOptions = (
                     ...(input.runtimePolicy === undefined
                       ? {}
                       : {
-                          runtimePolicy:
-                            runtime.driver === "claudeAgent"
-                              ? input.runtimePolicy
-                              : supervisedRuntimePolicy(input.runtimePolicy),
+                          runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
                         }),
                   }),
                 }),
@@ -1971,24 +2276,7 @@ export const layerWithOptions = (
                   withActivityError(
                     providerSessionId,
                     Effect.gen(function* () {
-                      const cwd = input.runtimePolicy.cwd;
                       const turnKey = busyTurnKey(input.providerThread.id, input.runOrdinal);
-                      const ownerKey = workspaceTurnKey(providerSessionId, turnKey);
-                      if (cwd !== null) {
-                        const workspace = yield* fileSystem
-                          .realPath(cwd)
-                          .pipe(Effect.orElseSucceed(() => cwd));
-                        const token =
-                          workspaceTurnTokens.get(ownerKey) ?? Symbol("graphical workspace owner");
-                        yield* Effect.try(() =>
-                          claimAgentWorkspace(workspace, {
-                            token,
-                            threadId: input.threadId,
-                            kind: "graphical",
-                          }),
-                        );
-                        workspaceTurnTokens.set(ownerKey, token);
-                      }
                       yield* observeActivity(
                         providerSessionId,
                         recovery
@@ -1997,14 +2285,6 @@ export const layerWithOptions = (
                               recovery.withActivity(markBusy(providerSessionId, turnKey)),
                             )
                           : markBusy(providerSessionId, turnKey),
-                      ).pipe(
-                        Effect.onError(() =>
-                          Effect.sync(() => {
-                            const token = workspaceTurnTokens.get(ownerKey);
-                            if (token !== undefined) releaseAgentWorkspace(token);
-                            workspaceTurnTokens.delete(ownerKey);
-                          }),
-                        ),
                       );
                     }),
                   ).pipe(
@@ -2020,20 +2300,28 @@ export const layerWithOptions = (
                     ),
                   ),
                   () =>
-                    runtime
-                      .startTurn({
-                        ...input,
-                        runtimePolicy:
-                          runtime.driver === "claudeAgent"
-                            ? input.runtimePolicy
-                            : supervisedRuntimePolicy(input.runtimePolicy),
-                      })
-                      .pipe(
-                        turnMetrics("send", input.modelSelection.model),
-                        // Claude opens its query lazily on the first turn. Read
-                        // health now, but the busy reservation forbids repair.
-                        Effect.tap(() => recovery?.trigger ?? Effect.void),
+                    claimTurnWorkspace(input).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ProviderAdapter.ProviderAdapterTurnStartError({
+                            driver: runtime.driver,
+                            threadId: input.threadId,
+                            providerThreadId: input.providerThread.id,
+                            runId: input.runId,
+                            cause,
+                          }),
                       ),
+                      Effect.andThen(
+                        runtime.startTurn({
+                          ...input,
+                          runtimePolicy: sessionRuntimePolicy(runtime.driver, input.runtimePolicy),
+                        }),
+                      ),
+                      turnMetrics("send", input.modelSelection.model),
+                      // Claude opens its query lazily on the first turn. Read
+                      // health now, but the busy reservation forbids repair.
+                      Effect.tap(() => recovery?.trigger ?? Effect.void),
+                    ),
                   (_, exit) =>
                     Exit.isFailure(exit)
                       ? observeActivity(
@@ -2050,7 +2338,14 @@ export const layerWithOptions = (
             ),
           interruptTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(runtime.interruptTurn(input).pipe(turnMetrics("interrupt"))),
+              Effect.andThen(
+                Effect.suspend(() => {
+                  const cancelWait = workspaceWaitingCancels.get(input.providerThread.id);
+                  return cancelWait === undefined
+                    ? runtime.interruptTurn(input).pipe(turnMetrics("interrupt"))
+                    : Effect.sync(cancelWait);
+                }),
+              ),
             ),
           respondToRuntimeRequest: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
@@ -2104,12 +2399,13 @@ export const layerWithOptions = (
           ...(runtime.runUserShellCommand
             ? {
                 runUserShellCommand: (input) =>
-                  trackAuxiliaryTurn(input, runtime.runUserShellCommand!(input)),
+                  trackAuxiliaryTurn(input, decorated.runUserShellCommand!(input)),
               }
             : {}),
           ...(runtime.compactThread
             ? {
-                compactThread: (input) => trackAuxiliaryTurn(input, runtime.compactThread!(input)),
+                compactThread: (input) =>
+                  trackAuxiliaryTurn(input, decorated.compactThread!(input)),
               }
             : {}),
           ...(runtime.mcpApps
@@ -2235,6 +2531,7 @@ export const layerWithOptions = (
                   providerSessionId: entry.runtime.providerSessionId,
                   reason: "manual_shutdown",
                   gracefulSubscribers: true,
+                  exitedByProvider: true,
                 }).pipe(logReleaseFailure(entry.runtime.providerSessionId));
                 return;
               }
@@ -2374,10 +2671,7 @@ export const layerWithOptions = (
                   threadId: input.threadId,
                   providerSessionId: input.providerSessionId,
                   modelSelection: input.modelSelection,
-                  runtimePolicy:
-                    adapter.driver === "claudeAgent"
-                      ? input.runtimePolicy
-                      : supervisedRuntimePolicy(input.runtimePolicy),
+                  runtimePolicy: sessionRuntimePolicy(adapter.driver, input.runtimePolicy),
                   ...(input.resumeFromSession === undefined
                     ? {}
                     : { resumeFromSession: input.resumeFromSession }),

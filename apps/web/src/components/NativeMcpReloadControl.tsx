@@ -41,8 +41,8 @@ export function NativeMcpReloadControl({
           {!codex ? (
             <>
               <p className="text-xs text-muted-foreground">
-                Apply installed plugin changes, including skills, commands, hooks, and plugin
-                MCPs, in this terminal session. This does not download plugin updates.
+                Apply installed plugin changes, including skills, commands, hooks, and plugin MCPs,
+                in this terminal session. This does not download plugin updates.
               </p>
               <Button size="sm" variant="secondary" onClick={() => void copy("/reload-plugins")}>
                 Copy /reload-plugins
@@ -59,8 +59,8 @@ export function NativeMcpReloadControl({
           </p>
           {codex ? (
             <p className="text-xs text-muted-foreground">
-              Codex has no live MCP reload command in this terminal. Inspect connections with
-              /mcp; restart and resume the CLI session when a configuration change needs it.
+              Codex has no live MCP reload command in this terminal. Inspect connections with /mcp;
+              restart and resume the CLI session when a configuration change needs it.
             </p>
           ) : null}
           <Button size="xs" variant="outline" onClick={() => void copy("/mcp")}>

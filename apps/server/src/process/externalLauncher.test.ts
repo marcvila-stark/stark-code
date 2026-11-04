@@ -484,7 +484,7 @@ it.effect.skipIf(windowsHost)(
       const decodedCommand = Buffer.from(encodedCommand, "base64").toString("utf16le");
       assert.equal(
         decodedCommand,
-        "$ProgressPreference = 'SilentlyContinue'; Start-Process 'explorer.exe' -ArgumentList ('/select,\"' + '\\\\wsl.localhost\\Ubuntu-24.04\\home\\stark\\workspace\\media\\clip.mp4' + '\"')",
+        "$ProgressPreference = 'SilentlyContinue'; Start-Process 'explorer.exe' -ArgumentList ('/select,\"' + '\\\\wsl.localhost\\Ubuntu-24.04\\home\\stark-code\\workspace\\media\\clip.mp4' + '\"')",
       );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
@@ -677,7 +677,7 @@ it.effect.skipIf(windowsHost)(
       assert.ok(spawned);
       assert.equal(spawned.command, "explorer.exe");
       assert.deepEqual(spawned.args, [
-        '\\\\wsl.localhost\\Ubuntu-24.04\\home\\stark\\work "quoted"',
+        '\\\\wsl.localhost\\Ubuntu-24.04\\home\\stark-code\\work "quoted"',
       ]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

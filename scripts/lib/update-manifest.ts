@@ -1,3 +1,5 @@
+import { UPDATE_MANIFEST_FEED_KIND_KEY, checkUpdateFileUrl } from "./update-feed-ownership.ts";
+
 export interface UpdateManifestFile {
   readonly url: string;
   readonly sha512: string;
@@ -26,6 +28,19 @@ function stripSingleQuotes(value: string): string {
   return value;
 }
 
+/**
+ * A manifest may only name files inside its own feed directory: the same rule
+ * the app applies before it downloads anything (see updateFeedPolicy.ts).
+ */
+function assertFeedRelativeFileUrl(url: string, location: string, platformLabel: string): void {
+  const problem = checkUpdateFileUrl(url);
+  if (problem !== null) {
+    throw new Error(
+      `Invalid ${platformLabel} update manifest at ${location}: file url '${url}' is not a plain name inside the feed (${problem}).`,
+    );
+  }
+}
+
 function parseFileRecord(
   currentFile: MutableUpdateManifestFile | null,
   sourcePath: string,
@@ -44,6 +59,7 @@ function parseFileRecord(
       `Invalid ${platformLabel} update manifest at ${sourcePath}:${lineNumber}: incomplete file entry.`,
     );
   }
+  assertFeedRelativeFileUrl(currentFile.url, `${sourcePath}:${lineNumber}`, platformLabel);
   return {
     url: currentFile.url,
     sha512: currentFile.sha512,
@@ -74,6 +90,8 @@ export function parseUpdateManifest(
   const extras: Record<string, UpdateManifestScalar> = {};
   let version: string | null = null;
   let releaseDate: string | null = null;
+  let legacyPath: { readonly value: UpdateManifestScalar; readonly lineNumber: number } | null =
+    null;
   let inFiles = false;
   let currentFile: MutableUpdateManifestFile | null = null;
 
@@ -155,7 +173,13 @@ export function parseUpdateManifest(
       continue;
     }
 
-    if (key === "path" || key === "sha512") {
+    // electron-builder still writes the legacy top-level `path` and `sha512`;
+    // they are dropped on output, but `path` must name a listed file.
+    if (key === "path") {
+      legacyPath = { value, lineNumber };
+      continue;
+    }
+    if (key === "sha512") {
       continue;
     }
 
@@ -175,6 +199,16 @@ export function parseUpdateManifest(
   }
   if (files.length === 0) {
     throw new Error(`Invalid ${platformLabel} update manifest at ${sourcePath}: missing files.`);
+  }
+  if (legacyPath !== null) {
+    const location = `${sourcePath}:${legacyPath.lineNumber}`;
+    const pathValue = String(legacyPath.value);
+    assertFeedRelativeFileUrl(pathValue, location, platformLabel);
+    if (!files.some((file) => file.url === pathValue)) {
+      throw new Error(
+        `Invalid ${platformLabel} update manifest at ${location}: path '${pathValue}' is not one of its files.`,
+      );
+    }
   }
 
   return {
@@ -218,6 +252,7 @@ export function mergeUpdateManifests(
 
   const filesByUrl = new Map<string, UpdateManifestFile>();
   for (const file of [...primary.files, ...secondary.files]) {
+    assertFeedRelativeFileUrl(file.url, "merge input", platformLabel);
     const existing = filesByUrl.get(file.url);
     if (existing && (existing.sha512 !== file.sha512 || existing.size !== file.size)) {
       throw new Error(
@@ -274,4 +309,54 @@ export function serializeUpdateManifest(
   lines.push(`releaseDate: ${quoteYamlString(manifest.releaseDate)}`);
   lines.push("");
   return lines.join("\n");
+}
+
+/**
+ * Rewrites one file's digest in an electron-builder update manifest after the
+ * file changed on disk, leaving every other line as electron-builder wrote it.
+ * The legacy top-level `sha512` follows when the top-level `path` names the
+ * same file. A manifest that does not list the file is returned unchanged.
+ */
+export function replaceUpdateManifestFileDigest(raw: string, file: UpdateManifestFile): string {
+  const lines = raw.split("\n");
+  const topLevelPath = lines
+    .map((line) => line.match(/^path:\s*(.+?)\s*$/)?.[1])
+    .find((value) => value !== undefined);
+  const updatesTopLevelDigest =
+    topLevelPath !== undefined && stripSingleQuotes(topLevelPath) === file.url;
+
+  let inFileEntry = false;
+  let replacedFields = 0;
+  const next = lines.map((line) => {
+    const urlMatch = line.match(/^  - url:\s*(.+?)\s*$/);
+    if (urlMatch?.[1] !== undefined) {
+      inFileEntry = stripSingleQuotes(urlMatch[1]) === file.url;
+      return line;
+    }
+    if (!line.startsWith("    ")) inFileEntry = false;
+    if (inFileEntry && line.startsWith("    sha512:")) {
+      replacedFields += 1;
+      return `    sha512: ${file.sha512}`;
+    }
+    if (inFileEntry && line.startsWith("    size:")) {
+      replacedFields += 1;
+      return `    size: ${file.size}`;
+    }
+    if (updatesTopLevelDigest && line.startsWith("sha512:")) return `sha512: ${file.sha512}`;
+    return line;
+  });
+  return replacedFields === 0 ? raw : next.join("\n");
+}
+
+/**
+ * Marks an electron-builder channel manifest as made for the mock feed
+ * (`starkFeedKind: mock`), replacing any earlier mark and leaving every other
+ * line as written. Only the mock server serves such a manifest, and only a
+ * mock build follows one.
+ */
+export function withMockFeedKind(raw: string): string {
+  const marker = new RegExp(`^${UPDATE_MANIFEST_FEED_KIND_KEY}:`, "u");
+  const lines = raw.split("\n").filter((line) => !marker.test(line));
+  while (lines.length > 0 && lines.at(-1) === "") lines.pop();
+  return `${[...lines, `${UPDATE_MANIFEST_FEED_KIND_KEY}: mock`].join("\n")}\n`;
 }

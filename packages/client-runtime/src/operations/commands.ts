@@ -22,19 +22,29 @@ import {
   type ProviderInteractionMode,
   type ProviderUserInputAnswers,
   type RunId,
+  type PermissionSource,
+  type ProviderApprovalOptionId,
   type RuntimeMode,
   type RuntimeRequestId,
-  type ThreadId,
+  ThreadId,
   type ThreadEnvMode,
   type UploadChatAttachment,
 } from "@starkfuture/contracts";
 import { modelSelectionCommandType } from "@starkfuture/shared/model";
 import { derivePendingBackgroundWork } from "@starkfuture/shared/orchestrationV2PendingBackgroundWork";
 import { visibleThreadPullRequests } from "@starkfuture/shared/threadPullRequests";
+import { resolveWorkerRetry } from "@starkfuture/shared/workerRetry";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
-import { getInitialServerConfig, request, requestGuarded } from "../rpc/client.ts";
+import {
+  getInitialServerConfig,
+  type ReconnectRequestOptions,
+  request,
+  requestGuarded,
+  requestGuardedAcrossReconnect,
+} from "../rpc/client.ts";
 
 interface CommandMetadata {
   readonly commandId?: CommandId;
@@ -76,6 +86,8 @@ export interface CreateThreadInput extends CommandMetadata {
   readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
+  /** Omitted means a Stark preset; the server stores `inherit` only where the provider supports it. */
+  readonly permissionSource?: PermissionSource;
   readonly branch: string | null;
   readonly worktreePath: string | null;
 }
@@ -145,6 +157,13 @@ export interface SetThreadRuntimeModeInput extends ThreadCommandInput {
   readonly runtimeMode: RuntimeMode;
 }
 
+export interface SetThreadPermissionInput extends ThreadCommandInput {
+  readonly permissionSource: PermissionSource;
+  readonly runtimeMode: RuntimeMode;
+  /** Needed to narrow a running chat: stop it now, or apply when the run stops. */
+  readonly whileRunning?: "stop-and-apply" | "apply-after-run";
+}
+
 export interface SetThreadInteractionModeInput extends ThreadCommandInput {
   readonly interactionMode: ProviderInteractionMode;
 }
@@ -157,6 +176,7 @@ interface StartThreadBootstrap {
     readonly modelSelection: ModelSelection;
     readonly runtimeMode: RuntimeMode;
     readonly interactionMode: ProviderInteractionMode;
+    readonly permissionSource?: PermissionSource;
     readonly branch: string | null;
     readonly worktreePath: string | null;
     readonly localSession?: OrchestrationV2LocalSession;
@@ -201,6 +221,10 @@ export interface InterruptThreadTurnInput extends ThreadCommandInput {
 export interface RespondToThreadApprovalInput extends ThreadCommandInput {
   readonly requestId: RuntimeRequestId;
   readonly decision: ProviderApprovalDecision;
+  /** The offered option's id, when the request carries ids; the server refuses anything else. */
+  readonly optionId?: ProviderApprovalOptionId;
+  /** A reason for the agent, for an option that accepts one. */
+  readonly feedback?: string;
 }
 
 export interface RespondToThreadUserInputInput extends ThreadCommandInput {
@@ -211,6 +235,11 @@ export interface RespondToThreadUserInputInput extends ThreadCommandInput {
 
 export interface DismissThreadUserInputInput extends ThreadCommandInput {
   readonly requestId: RuntimeRequestId;
+}
+
+/** Names the lost requests one Ask again or Dismiss acts on; a single button names one. */
+export interface LostThreadRequestsInput extends ThreadCommandInput {
+  readonly requestIds: readonly [RuntimeRequestId, ...RuntimeRequestId[]];
 }
 
 export interface RevertThreadCheckpointInput extends ThreadCommandInput {
@@ -279,6 +308,25 @@ const allocateCommandId = Effect.fn("EnvironmentCommands.allocateCommandId")(fun
 
 const dispatch = (command: OrchestrationV2Command) =>
   requestGuarded(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, command);
+
+/** Lets a caller follow an answer that waits for the connection to come back. */
+export type RuntimeResponseDispatchOptions = Pick<
+  ReconnectRequestOptions,
+  "onAwaitingReconnect" | "abandonWhen"
+>;
+
+/**
+ * Answers to a pending request outlive a dropped connection: the same command, with the same
+ * `commandId`, is sent again on the next session, and the server replays its receipt if the
+ * first one landed. Only these replies use it; other commands fail fast when disconnected.
+ */
+const dispatchAcrossReconnect = (
+  command: Extract<
+    OrchestrationV2Command,
+    { readonly type: "runtime-request.respond" | "thread.user-input.dismiss" }
+  >,
+  options?: RuntimeResponseDispatchOptions,
+) => requestGuardedAcrossReconnect(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, command, options);
 
 const getProjection = (threadId: ThreadId) =>
   request(ORCHESTRATION_V2_WS_METHODS.getThreadProjection, { threadId });
@@ -415,6 +463,7 @@ export const createThread = Effect.fn("EnvironmentCommands.createThread")(functi
     modelSelection: input.modelSelection,
     runtimeMode: input.runtimeMode,
     interactionMode: input.interactionMode,
+    ...(input.permissionSource === undefined ? {} : { permissionSource: input.permissionSource }),
     branch: input.branch,
     worktreePath: input.worktreePath,
     ...(input.sideChatParentThreadId === undefined
@@ -631,6 +680,19 @@ export const setThreadRuntimeMode = Effect.fn("EnvironmentCommands.setThreadRunt
   },
 );
 
+export const setThreadPermission = Effect.fn("EnvironmentCommands.setThreadPermission")(function* (
+  input: SetThreadPermissionInput,
+) {
+  return yield* dispatch({
+    type: "thread.permission.set",
+    commandId: yield* allocateCommandId(input),
+    threadId: input.threadId,
+    permissionSource: input.permissionSource,
+    runtimeMode: input.runtimeMode,
+    ...(input.whileRunning === undefined ? {} : { whileRunning: input.whileRunning }),
+  });
+});
+
 export const setThreadInteractionMode = Effect.fn("EnvironmentCommands.setThreadInteractionMode")(
   function* (input: SetThreadInteractionModeInput) {
     return yield* dispatch({
@@ -698,6 +760,9 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
       modelSelection: input.modelSelection ?? thread.modelSelection,
       runtimeMode: input.runtimeMode,
       interactionMode: input.interactionMode,
+      ...(bootstrap?.permissionSource === undefined
+        ? {}
+        : { permissionSource: bootstrap.permissionSource }),
       workspaceStrategy,
       ...(thread.localSession === undefined ? {} : { localSession: thread.localSession }),
       initialMessage: {
@@ -867,39 +932,74 @@ export const interruptThreadTurn = Effect.fn("EnvironmentCommands.interruptThrea
 });
 
 export const respondToThreadApproval = Effect.fn("EnvironmentCommands.respondToThreadApproval")(
-  function* (input: RespondToThreadApprovalInput) {
-    return yield* dispatch({
-      type: "runtime-request.respond",
-      commandId: yield* allocateCommandId(input),
-      threadId: input.threadId,
-      requestId: input.requestId,
-      decision: input.decision,
-    });
+  function* (input: RespondToThreadApprovalInput, options?: RuntimeResponseDispatchOptions) {
+    return yield* dispatchAcrossReconnect(
+      {
+        type: "runtime-request.respond",
+        commandId: yield* allocateCommandId(input),
+        threadId: input.threadId,
+        requestId: input.requestId,
+        decision: input.decision,
+        ...(input.optionId === undefined ? {} : { optionId: input.optionId }),
+        ...(input.feedback === undefined ? {} : { feedback: input.feedback }),
+      },
+      options,
+    );
   },
 );
 
 export const respondToThreadUserInput = Effect.fn("EnvironmentCommands.respondToThreadUserInput")(
-  function* (input: RespondToThreadUserInputInput) {
-    return yield* dispatch({
-      type: "runtime-request.respond",
-      commandId: yield* allocateCommandId(input),
-      threadId: input.threadId,
-      requestId: input.requestId,
-      answers: input.answers,
-      ...(input.attachmentsByQuestionId === undefined
-        ? {}
-        : { attachmentsByQuestionId: input.attachmentsByQuestionId }),
-    });
+  function* (input: RespondToThreadUserInputInput, options?: RuntimeResponseDispatchOptions) {
+    return yield* dispatchAcrossReconnect(
+      {
+        type: "runtime-request.respond",
+        commandId: yield* allocateCommandId(input),
+        threadId: input.threadId,
+        requestId: input.requestId,
+        answers: input.answers,
+        ...(input.attachmentsByQuestionId === undefined
+          ? {}
+          : { attachmentsByQuestionId: input.attachmentsByQuestionId }),
+      },
+      options,
+    );
   },
 );
 
 export const dismissThreadUserInput = Effect.fn("EnvironmentCommands.dismissThreadUserInput")(
-  function* (input: DismissThreadUserInputInput) {
+  function* (input: DismissThreadUserInputInput, options?: RuntimeResponseDispatchOptions) {
+    return yield* dispatchAcrossReconnect(
+      {
+        type: "thread.user-input.dismiss",
+        commandId: yield* allocateCommandId(input),
+        threadId: input.threadId,
+        requestId: input.requestId,
+      },
+      options,
+    );
+  },
+);
+
+/** Starts one user turn that asks the agent to retry the steps whose decisions were lost. */
+export const askAgainThreadRequests = Effect.fn("EnvironmentCommands.askAgainThreadRequests")(
+  function* (input: LostThreadRequestsInput) {
     return yield* dispatch({
-      type: "thread.user-input.dismiss",
+      type: "runtime-request.ask-again",
       commandId: yield* allocateCommandId(input),
       threadId: input.threadId,
-      requestId: input.requestId,
+      requestIds: input.requestIds,
+    });
+  },
+);
+
+/** Clears lost requests without starting a turn. */
+export const dismissLostThreadRequests = Effect.fn("EnvironmentCommands.dismissLostThreadRequests")(
+  function* (input: LostThreadRequestsInput) {
+    return yield* dispatch({
+      type: "runtime-request.lost.dismiss",
+      commandId: yield* allocateCommandId(input),
+      threadId: input.threadId,
+      requestIds: input.requestIds,
     });
   },
 );
@@ -1122,3 +1222,59 @@ export const unlinkThreadPullRequest = Effect.fn("EnvironmentCommands.unlinkThre
     });
   },
 );
+
+export interface RetryThreadWorkerInput extends ThreadCommandInput {
+  /** The retry the user chose from the worker's state as it was last shown. */
+  readonly expected: "prepare" | "run_again";
+  /** The run-again follow-up (workerRunAgainText); unused when preparation runs again. */
+  readonly text: string;
+  readonly messageId: MessageId;
+}
+
+/** The worker no longer calls for the retry the user chose, so nothing was sent. */
+export class ThreadWorkerRetryChangedError extends Schema.TaggedError<ThreadWorkerRetryChangedError>()(
+  "ThreadWorkerRetryChangedError",
+  { threadId: ThreadId, current: Schema.String },
+) {
+  override get message(): string {
+    return "This worker changed since it was shown. Check its state and try again.";
+  }
+}
+
+/**
+ * Runs a delegated worker again from a fresh read of its thread. A failed
+ * workspace preparation runs again on the same run; otherwise the brief goes
+ * to the worker as the user's follow-up. The follow-up carries no modes, so
+ * the worker's own runtime and interaction modes at that moment apply.
+ */
+export const retryThreadWorker = Effect.fn("EnvironmentCommands.retryThreadWorker")(function* (
+  input: RetryThreadWorkerInput,
+) {
+  const retry = resolveWorkerRetry(yield* getProjection(input.threadId));
+  if (retry.type === "unavailable" || retry.type !== input.expected) {
+    return yield* new ThreadWorkerRetryChangedError({
+      threadId: input.threadId,
+      current: retry.type === "unavailable" ? retry.reason : retry.type,
+    });
+  }
+  const commandId = yield* allocateCommandId(input);
+  if (retry.type === "prepare") {
+    return yield* dispatch({
+      type: "prepared-run.retry",
+      commandId,
+      threadId: input.threadId,
+      runId: retry.runId,
+    });
+  }
+  return yield* dispatch({
+    type: "message.dispatch",
+    commandId,
+    createdBy: "user",
+    creationSource: input.creationSource ?? "web",
+    threadId: input.threadId,
+    messageId: input.messageId,
+    text: input.text,
+    attachments: [],
+    dispatchMode: { type: "start_immediately" },
+  });
+});

@@ -24,6 +24,31 @@ const commaSeparatedStrings = (name: string) =>
     ),
   );
 
+/**
+ * Activation switch for in-app updates (owner switch). While false, no build
+ * with a Stark feed checks for, downloads or installs an update, and every
+ * entry point says updates aren't switched on yet. Mock feed builds (local
+ * rehearsals only) are not held by it. The owner flips it once the packaged
+ * rehearsals pass. See "Update feeds" in docs/operations/release.md.
+ */
+export const DESKTOP_AUTO_UPDATE_ACTIVATED = false;
+
+const AUTO_UPDATE_ENABLED_VALUES = new Set(["0", "false", "no", "off"]);
+
+/**
+ * `STARK_CODE_DISABLE_AUTO_UPDATE` can only switch updates off. Unset, empty
+ * or an explicit "keep on" value (0, false, no, off) leaves them as built; any
+ * other value, including a malformed one, turns them off.
+ */
+const autoUpdateDisabledByEnv = trimmedString("STARK_CODE_DISABLE_AUTO_UPDATE").pipe(
+  Config.map(
+    Option.match({
+      onNone: () => false,
+      onSome: (value) => !AUTO_UPDATE_ENABLED_VALUES.has(value.toLowerCase()),
+    }),
+  ),
+);
+
 const compactEnv = (env: Readonly<Record<string, string | undefined>>): Record<string, string> =>
   Object.fromEntries(
     Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined),
@@ -49,11 +74,11 @@ export const DesktopConfig = Config.all({
   otlpHeaders: Config.succeed(Option.none<Record<string, string>>()),
   otlpProtocol: Config.succeed("http/json" as const),
   appImagePath: trimmedString("APPIMAGE"),
-  disableAutoUpdate: Config.succeed(true),
-  mockUpdates: Config.succeed(false),
-  mockUpdateServerPort: Config.Port("STARK_CODE_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(
-    Config.withDefault(3000),
-  ),
+  // No environment variable can turn updates on or point them at a feed: the
+  // feed comes only from the packaged app (updates/updateFeedGate.ts), and a
+  // mock feed is baked into a mock build with its own loopback URL.
+  autoUpdateDisabledByEnv,
+  autoUpdateActivated: Config.succeed(DESKTOP_AUTO_UPDATE_ACTIVATED),
 });
 
 export const layerTest = (env: Readonly<Record<string, string | undefined>>) =>

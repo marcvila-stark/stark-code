@@ -76,6 +76,15 @@ export function assertSubagentV2ApprovalOutput(
   if (approval.type !== "approval_request") throw new Error("expected an approval item");
   assert.equal(approval.requestId, request.id);
   assert.include(approval.prompt ?? "", "subagent-approval.txt");
+  // Codex listed accept, a rule for the `/bin/bash -lc` wrapper, and cancel.
+  // Stark offers exactly those minus the unsafe rule, and nothing Codex did not list.
+  assert.deepEqual(
+    approval.options?.map((option) => [option.decision, option.label]),
+    [
+      ["accept", "Allow once"],
+      ["cancel", "Deny and stop"],
+    ],
+  );
 
   // While Codex waited, the parent reported the approval and the child did not.
   const pendingShell = result.capturedShellSnapshots.get(SUBAGENT_APPROVAL_PENDING_SHELL_KEY);

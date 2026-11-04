@@ -675,21 +675,22 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
         const changes = yield* serverSettings.subscribeChanges;
 
+        // Auto-settlement is off by default, so turning it on is what must persist.
         const next = yield* serverSettings.updateSettings({
-          sidebarAutoSettleAfterDays: null,
-          sidebarAutoSettleOnMerge: false,
+          sidebarAutoSettleAfterDays: 5,
+          sidebarAutoSettleOnMerge: true,
         });
         const change = Option.getOrUndefined(yield* Stream.runHead(changes));
         const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
         // Inspect raw persisted JSON before schema decoding can apply defaults.
         const persisted = JSON.parse(raw) as Record<string, unknown>;
 
-        assert.strictEqual(next.sidebarAutoSettleAfterDays, null);
-        assert.isFalse(next.sidebarAutoSettleOnMerge);
-        assert.strictEqual(change?.sidebarAutoSettleAfterDays, null);
-        assert.isFalse(change?.sidebarAutoSettleOnMerge);
-        assert.strictEqual(persisted.sidebarAutoSettleAfterDays, null);
-        assert.isFalse(persisted.sidebarAutoSettleOnMerge);
+        assert.strictEqual(next.sidebarAutoSettleAfterDays, 5);
+        assert.isTrue(next.sidebarAutoSettleOnMerge);
+        assert.strictEqual(change?.sidebarAutoSettleAfterDays, 5);
+        assert.isTrue(change?.sidebarAutoSettleOnMerge);
+        assert.strictEqual(persisted.sidebarAutoSettleAfterDays, 5);
+        assert.isTrue(persisted.sidebarAutoSettleOnMerge);
       }),
     ).pipe(Effect.provide(layerServerSettings())),
   );

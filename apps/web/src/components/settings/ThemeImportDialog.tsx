@@ -143,7 +143,7 @@ function ThemeJsonEditor({
 /** What the import pipeline needs from a file; DOM File satisfies it. */
 type ImportableThemeFile = { name: string; size: number; text: () => Promise<string> };
 
-export function ThemeImportDialog({
+function ThemeImportDialog({
   open,
   onOpenChange,
   onImported,

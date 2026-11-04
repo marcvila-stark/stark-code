@@ -2,12 +2,15 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Tracer from "effect/Tracer";
 import { FetchHttpClient } from "effect/http";
 import { vi } from "vite-plus/test";
 
 import { RelayClientTracer, withLocalTracing, withRelayClientTracing } from "./relayTracing.ts";
 import * as RelayTracing from "./relayTracing.ts";
+
+class RelayTestFailure extends Schema.TaggedError<RelayTestFailure>()("RelayTestFailure", {}) {}
 
 function collectingTracer(spans: Array<string>): Tracer.Tracer {
   return Tracer.make({
@@ -74,7 +77,7 @@ describe("withRelayClientTracing", () => {
     ).pipe(Layer.provide(layerHttpClient));
     return Effect.gen(function* () {
       expect(Option.isNone(yield* RelayClientTracer)).toBe(true);
-      yield* Effect.fail(new Error("relay failure")).pipe(
+      yield* Effect.fail(new RelayTestFailure()).pipe(
         Effect.withSpan("relay.failed-operation"),
         withRelayClientTracing,
         Effect.exit,

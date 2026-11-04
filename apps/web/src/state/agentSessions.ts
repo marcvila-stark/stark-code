@@ -7,7 +7,7 @@ import {
 import { connectionAtomRuntime } from "../connection/runtime";
 
 /** Read-only discovery; importing never creates a separate project for every source folder. */
-export const agentSessionScan = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+const agentSessionScan = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
   label: "environment-data:agent-sessions:scan",
   tag: WS_METHODS.agentSessionsScan,
   staleTimeMs: 30_000,

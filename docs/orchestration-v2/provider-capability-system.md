@@ -37,7 +37,7 @@ type SessionCapabilities = {
 Policy examples:
 
 - If model switching is unsupported, start a new provider session.
-- If pending requests do not survive restart, mark old requests `not_resumable`.
+- If pending requests do not survive restart, mark old requests `not_resumable`. Approvals and live questions are also marked `lost`, so the user can ask again (a new turn on the resumed provider thread) or dismiss them; no adapter re-raises a request itself.
 
 Provider-thread resumption is not a capability. It is a required adapter primitive. Adapters must be able to start from a stored provider cursor/session/thread handle or return a runtime resume failure.
 

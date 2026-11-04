@@ -68,6 +68,12 @@ import {
 } from "@starkfuture/shared/htmlRender";
 import { mcpAppReferencesEqual, type McpAppReference } from "@starkfuture/shared/mcpApp";
 import { dynamicToolTitle } from "@starkfuture/shared/toolActivity";
+import {
+  humanWaitFromTurnItem,
+  humanWaitMs,
+  workedForLabel,
+  type HumanWait,
+} from "@starkfuture/shared/orchestrationTiming";
 import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 import {
   collectToolFilePaths,
@@ -85,6 +91,27 @@ function timelineEntryRunId(entry: TimelineEntry): RunId | null {
   }
   if (entry.kind === "html-render" || entry.kind === "mcp-app") return entry.runId;
   return entry.kind === "work" ? (entry.entry.runId ?? null) : null;
+}
+
+function isCompletedPreviewActivity(entry: TimelineEntry, runId: RunId): boolean {
+  if (
+    entry.kind !== "work" ||
+    entry.entry.runId !== runId ||
+    entry.entry.toolLifecycleStatus !== "completed"
+  )
+    return false;
+  const item = entry.entry.structuredPayload;
+  if (entry.entry.itemType === "approval_request") {
+    const prompt = item?.type === "approval_request" ? item.prompt : entry.entry.detail;
+    // This is the app-owned elicitation prompt, not a guess based on arbitrary approval text.
+    return /^Allow the stark-code MCP server to run tool "html_(?:render|preview)"\?$/.test(
+      prompt ?? "",
+    );
+  }
+  return (
+    item?.type === "dynamic_tool" &&
+    resolveStarkMcpToolDefinition(item.toolName)?.summaryAction === "html-preview"
+  );
 }
 
 /** Whether the entry still represents live activity, not a settled result. */
@@ -185,47 +212,130 @@ export function workEntryDisplayLabel(entry: WorkLogEntry, workspaceRoot: string
   return `${heading.charAt(0).toUpperCase()}${heading.slice(1)}`;
 }
 
-/** Successful hook activity stays off the normal transcript. Verbose folds per turn. */
+type HookRunItem = Extract<OrchestrationV2TurnItem, { type: "hook_run" }>;
+
+/**
+ * Marks the single quiet hook row a turn keeps outside verbose mode. Rows with
+ * it travel with the turn's work: they join the "Worked for" fold and never
+ * split a tool group or the live activity row.
+ */
+const QUIET_HOOK_SUMMARY_ACTIVITY_KIND = "hook-summary";
+
+function isQuietHookSummary(
+  entry: TimelineEntry,
+): entry is Extract<TimelineEntry, { kind: "work" }> {
+  return (
+    entry.kind === "work" && entry.entry.sourceActivityKind === QUIET_HOOK_SUMMARY_ACTIVITY_KIND
+  );
+}
+
+function hookRunDetailBlock(hook: HookRunItem) {
+  return `${hook.eventName} · ${hook.hookName}${hook.source ? ` · ${hook.source}` : ""}${hook.durationMs === undefined ? "" : ` · ${Math.round(hook.durationMs)}ms`}\n${hook.summary}${hook.detail ? `\n${hook.detail}` : ""}`;
+}
+
+/** One clause per outcome: a lone hook keeps its own words, several are counted by event. */
+function hookOutcomeClause(hooks: readonly HookRunItem[], plural: string) {
+  if (hooks.length === 0) return null;
+  if (hooks.length === 1) return hooks[0]!.summary;
+  const events = [...new Set(hooks.map((hook) => hook.eventName))].join(", ");
+  return `${hooks.length} ${plural} · ${events}`;
+}
+
+const HOOK_NOTICE_LEVEL_RANK = { info: 0, notice: 1, suggestion: 2, warning: 3 } as const;
+
+/**
+ * Summarizes the hooks of one turn that the normal transcript still shows. A
+ * failure is the user's own hook breaking, which Stark cannot fix, so failures
+ * stay quiet; a block keeps its notice level and wording because it changed
+ * what the agent did.
+ */
+function summarizeVisibleHookRuns(
+  hooks: readonly HookRunItem[],
+): Pick<HookRunItem, "summary" | "detail" | "level" | "outcome"> {
+  const blocked = hooks.filter((hook) => hook.outcome === "blocked");
+  const failed = hooks.filter((hook) => hook.outcome === "failed");
+  const notices = hooks.filter((hook) => hook.outcome !== "blocked" && hook.outcome !== "failed");
+  const noticeLevel = notices.reduce<HookRunItem["level"]>(
+    (level, hook) =>
+      HOOK_NOTICE_LEVEL_RANK[hook.level] > HOOK_NOTICE_LEVEL_RANK[level] ? hook.level : level,
+    "info",
+  );
+  return {
+    summary: [
+      hookOutcomeClause(blocked, "hooks blocked"),
+      hookOutcomeClause(failed, "hooks failed"),
+      hookOutcomeClause(notices, "hook messages"),
+    ]
+      .filter((clause) => clause !== null)
+      .join("; "),
+    detail: hooks.length === 1 ? hooks[0]!.detail : hooks.map(hookRunDetailBlock).join("\n\n"),
+    level: blocked.length > 0 ? "notice" : noticeLevel,
+    outcome: blocked.length > 0 ? "blocked" : failed.length > 0 ? "failed" : "notice",
+  };
+}
+
+/**
+ * Successful hook activity stays off the normal transcript, and the rest of a
+ * turn's hooks fold into one quiet row at the first one's place. Verbose keeps
+ * every hook, folded into one standalone row per provider turn.
+ */
 export function filterHookActivity(
   entries: readonly TimelineEntry[],
   verbose: boolean,
 ): readonly TimelineEntry[] {
-  const hooks = new Map<string, Extract<OrchestrationV2TurnItem, { type: "hook_run" }>[]>();
-  if (verbose)
-    for (const entry of entries) {
-      const item = entry.kind === "work" ? entry.entry.projectedItem?.item : undefined;
-      if (item?.type !== "hook_run") continue;
-      const key = item.providerTurnId ?? item.runId ?? item.id;
-      const group = hooks.get(key) ?? [];
-      group.push(item);
-      hooks.set(key, group);
-    }
+  const hookItem = (entry: TimelineEntry) => {
+    const item = entry.kind === "work" ? entry.entry.projectedItem?.item : undefined;
+    if (item?.type !== "hook_run") return undefined;
+    return verbose || (item.level !== "info" && item.outcome !== "ran") ? item : null;
+  };
+  // Verbose keeps its per-provider-turn grouping; the quiet row is per turn and attempt.
+  const groupKey = (entry: TimelineEntry, item: HookRunItem) =>
+    verbose
+      ? (item.providerTurnId ?? item.runId ?? item.id)
+      : `${item.runId ?? item.providerTurnId ?? item.id}:${entry.attempt?.id ?? ""}`;
+  const hooks = new Map<string, HookRunItem[]>();
+  for (const entry of entries) {
+    const item = hookItem(entry);
+    if (!item) continue;
+    const key = groupKey(entry, item);
+    const group = hooks.get(key) ?? [];
+    group.push(item);
+    hooks.set(key, group);
+  }
   const seen = new Set<string>();
   return entries.flatMap((entry): TimelineEntry[] => {
-    const item = entry.kind === "work" ? entry.entry.projectedItem?.item : undefined;
-    if (entry.kind !== "work" || item?.type !== "hook_run") return [entry];
-    if (!verbose) return item.level === "info" || item.outcome === "ran" ? [] : [entry];
-    const key = item.providerTurnId ?? item.runId ?? item.id;
+    const item = hookItem(entry);
+    if (item === undefined || entry.kind !== "work") return [entry];
+    if (item === null) return [];
+    const key = groupKey(entry, item);
     if (seen.has(key)) return [];
     seen.add(key);
     const group = hooks.get(key) ?? [item];
     const blocked = group.filter((hook) => hook.outcome === "blocked").length;
-    const summary = `Hooks: ${group.length} ran${blocked ? `, ${blocked} blocked` : ""}`;
-    const detail = group
-      .map(
-        (hook) =>
-          `${hook.eventName} · ${hook.hookName}${hook.source ? ` · ${hook.source}` : ""}${hook.durationMs === undefined ? "" : ` · ${Math.round(hook.durationMs)}ms`}\n${hook.summary}${hook.detail ? `\n${hook.detail}` : ""}`,
-      )
-      .join("\n\n");
+    const { source, ...rest } = item;
+    // The row names a hook file only when every hook in it came from that file.
+    const sharedSource =
+      verbose || group.every((hook) => hook.source === source) ? source : undefined;
+    const folded = {
+      ...rest,
+      ...(sharedSource === undefined ? {} : { source: sharedSource }),
+      ...(verbose
+        ? {
+            summary: `Hooks: ${group.length} ran${blocked ? `, ${blocked} blocked` : ""}`,
+            detail: group.map(hookRunDetailBlock).join("\n\n"),
+          }
+        : summarizeVisibleHookRuns(group)),
+    };
     const projectedItem = entry.entry.projectedItem!;
     return [
       {
         ...entry,
         entry: {
           ...entry.entry,
-          label: summary,
-          structuredPayload: { ...item, summary, detail },
-          projectedItem: { ...projectedItem, item: { ...item, summary, detail } },
+          label: folded.summary,
+          ...(verbose ? {} : { sourceActivityKind: QUIET_HOOK_SUMMARY_ACTIVITY_KIND }),
+          structuredPayload: folded,
+          projectedItem: { ...projectedItem, item: folded },
         },
       },
     ];
@@ -601,6 +711,8 @@ type MessagesTimelineRowContent =
       kind: "working";
       id: string;
       createdAt: string | null;
+      /** The live turn's approval and question waits, kept out of its work time. */
+      waits: ReadonlyArray<HumanWait>;
     }
   | {
       kind: "thinking";
@@ -690,6 +802,7 @@ type MessagesTimelineRowContent =
       id: string;
       createdAt: string;
       htmlRender: HtmlRenderReference;
+      htmlRenders?: readonly HtmlRenderReference[];
     }
   | {
       kind: "mcp-app";
@@ -882,7 +995,8 @@ function deriveSupersededAttemptFolds(
       // A steer supersedes the attempt but leaves its children running.
       liveSubagentEntryIds.has(entry.id) ||
       (entry.kind === "work" &&
-        (entry.entry.itemType === "system_notice" || entry.entry.itemType === "hook_run"))
+        (entry.entry.itemType === "system_notice" ||
+          (entry.entry.itemType === "hook_run" && !isQuietHookSummary(entry))))
     ) {
       continue;
     }
@@ -971,7 +1085,8 @@ function liveSubagentCardEntryIds(entries: ReadonlyArray<TimelineEntry>): Readon
 function timelineEntryFoldRunId(entry: TimelineEntry, runlessKey: RunId | null): RunId | null {
   if (
     entry.kind === "work" &&
-    (entry.entry.itemType === "system_notice" || entry.entry.itemType === "hook_run")
+    (entry.entry.itemType === "system_notice" ||
+      (entry.entry.itemType === "hook_run" && !isQuietHookSummary(entry)))
   )
     return null;
   if (entry.kind === "message" && entry.message.role === "assistant") {
@@ -1062,6 +1177,19 @@ function failedTimelineRunIds(
     if (runId) failed.add(runId);
   }
   return failed;
+}
+
+/** Approval and question waits of one run, from its timeline rows. */
+function timelineHumanWaits(
+  entries: ReadonlyArray<TimelineEntry>,
+  runId: RunId,
+): ReadonlyArray<HumanWait> {
+  return entries.flatMap((entry) => {
+    const item = entry.kind === "work" ? entry.entry.projectedItem?.item : undefined;
+    if (item === undefined || item.runId !== runId) return [];
+    const wait = humanWaitFromTurnItem(item);
+    return wait === null ? [] : [wait];
+  });
 }
 
 /**
@@ -1211,12 +1339,13 @@ function deriveTurnFolds(input: {
     if (hiddenEntryIds.size === 0) {
       continue;
     }
-    // A lone compaction row stays visible on its own; it only folds away as
-    // part of a turn that already folds other work.
+    // A lone compaction or hook row stays visible on its own; it only folds
+    // away as part of a turn that already folds other work.
     const hidesNonCompactionWork = group.entries.some(
       (entry) =>
         hiddenEntryIds.has(entry.id) &&
-        !(entry.kind === "work" && entry.entry.sourceActivityKind === "context-compaction"),
+        !(entry.kind === "work" && entry.entry.sourceActivityKind === "context-compaction") &&
+        !isQuietHookSummary(entry),
     );
     if (!hidesNonCompactionWork) {
       continue;
@@ -1237,15 +1366,15 @@ function deriveTurnFolds(input: {
     // Imported message timestamps can span disconnected CLI sessions. They
     // are not run boundaries, so never present their difference as work time.
     const importedReplies = input.hasImportedHistory === true && group.runless;
-    const elapsedMs = importedReplies
-      ? null
-      : input.latestRun?.runId === runId && input.latestRun.startedAt && input.latestRun.completedAt
-        ? computeElapsedMs(input.latestRun.startedAt, input.latestRun.completedAt)
-        : computeElapsedMs(
+    const [windowStart, windowEnd] =
+      input.latestRun?.runId === runId && input.latestRun.startedAt && input.latestRun.completedAt
+        ? [input.latestRun.startedAt, input.latestRun.completedAt]
+        : [
             group.startBoundary ?? firstEntry.createdAt,
             maxIsoTimestamp(group.terminalEntry?.message.updatedAt ?? null, lastEntryEnd) ??
               lastEntryEnd,
-          );
+          ];
+    const elapsedMs = importedReplies ? null : computeElapsedMs(windowStart, windowEnd);
     const duration = elapsedMs !== null ? formatDuration(elapsedMs) : null;
     const label = importedReplies
       ? "Imported replies"
@@ -1253,9 +1382,14 @@ function deriveTurnFolds(input: {
         ? duration
           ? `You stopped after ${duration}`
           : "You stopped this response"
-        : duration
-          ? `Worked for ${duration}`
-          : "Worked";
+        : workedForLabel(
+            elapsedMs,
+            humanWaitMs(
+              timelineHumanWaits(group.entries, runId),
+              Date.parse(windowStart),
+              Date.parse(windowEnd),
+            ),
+          );
 
     foldsByAnchorEntryId.set(group.anchorEntryId, {
       runId,
@@ -1486,6 +1620,7 @@ export function deriveMessagesTimelineRows(input: {
       })
     : new Map<MessageId, number>();
   const nextRows: MessagesTimelineRow[] = [];
+  const groupedPreviewIds = new Set<string>();
   const durationStartByMessageId = computeMessageDurationStart(
     timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
   );
@@ -1554,6 +1689,9 @@ export function deriveMessagesTimelineRows(input: {
     let tailAttemptId: string | null | undefined;
     for (let index = timelineEntries.length - 1; index >= activeTurnHeaderIndex; index -= 1) {
       const entry = timelineEntries[index]!;
+      // The turn's quiet hook row keeps its own place above the live row
+      // instead of splitting the tools around it.
+      if (isQuietHookSummary(entry) && runIdIsActiveResponse(entry.entry.runId)) continue;
       if (
         entry.kind !== "work" ||
         entry.entry.tone === "error" ||
@@ -1623,11 +1761,13 @@ export function deriveMessagesTimelineRows(input: {
   const activeWorkEntryIds = new Set(
     activeWorkRow !== null || latestToolFailed ? activeToolEntries.map((entry) => entry.id) : [],
   );
+  const liveRunId = input.runningRunId ?? input.latestRun?.runId ?? null;
   const appendWorkingRow = () => {
     nextRows.push({
       kind: "working",
       id: "working-indicator-row",
       createdAt: input.activeTurnStartedAt ?? null,
+      waits: liveRunId === null ? [] : timelineHumanWaits(input.timelineEntries, liveRunId),
     });
   };
   let hasActivityRow = false;
@@ -1743,9 +1883,26 @@ export function deriveMessagesTimelineRows(input: {
         continue;
       }
       const groupedEntries = [timelineEntry.entry];
+      // The turn's quiet hook row rides along and follows the group, so a
+      // hook that failed between two tools does not split them.
+      const followingHookEntries: Array<Extract<TimelineEntry, { kind: "work" }>> = [];
       let cursor = index + 1;
       while (cursor < timelineEntries.length) {
         const nextEntry = timelineEntries[cursor];
+        if (
+          nextEntry !== undefined &&
+          isQuietHookSummary(nextEntry) &&
+          !collapsedEntryIds.has(nextEntry.id) &&
+          !collapsedSupersededEntryIds.has(nextEntry.id) &&
+          !foldsByAnchorEntryId.has(nextEntry.id) &&
+          !supersededFoldsByAnchorEntryId.has(nextEntry.id) &&
+          (nextEntry.entry.runId ?? null) === (timelineEntry.entry.runId ?? null) &&
+          nextEntry.attempt?.id === timelineEntry.attempt?.id
+        ) {
+          followingHookEntries.push(nextEntry);
+          cursor += 1;
+          continue;
+        }
         if (
           !nextEntry ||
           nextEntry.kind !== "work" ||
@@ -1867,6 +2024,15 @@ export function deriveMessagesTimelineRows(input: {
           }
         }
       }
+      for (const hookEntry of followingHookEntries) {
+        nextRows.push({
+          kind: "work",
+          id: hookEntry.id,
+          createdAt: hookEntry.createdAt,
+          groupedEntries: [hookEntry.entry],
+          isExpandedToolGroup: false,
+        });
+      }
       index = cursor - 1;
       continue;
     }
@@ -1882,11 +2048,32 @@ export function deriveMessagesTimelineRows(input: {
     }
 
     if (timelineEntry.kind === "html-render") {
+      if (groupedPreviewIds.has(timelineEntry.id)) continue;
+      const renders = [timelineEntry.htmlRender];
+      // Completed approval/preview activity stays in the timeline after the gallery.
+      // Only the later visual rows are absorbed; prose and other work are hard boundaries.
+      for (let cursor = index + 1; timelineEntry.runId !== null; cursor += 1) {
+        const next = timelineEntries[cursor];
+        if (!next || next.attempt?.id !== timelineEntry.attempt?.id) break;
+        // Its normal fold/Activity row is still processed below; only the visual moves.
+        if (isCompletedPreviewActivity(next, timelineEntry.runId)) continue;
+        if (
+          collapsedEntryIds.has(next.id) ||
+          collapsedSupersededEntryIds.has(next.id) ||
+          foldsByAnchorEntryId.has(next.id) ||
+          supersededFoldsByAnchorEntryId.has(next.id)
+        )
+          break;
+        if (next.kind !== "html-render" || next.runId !== timelineEntry.runId) break;
+        renders.push(next.htmlRender);
+        groupedPreviewIds.add(next.id);
+      }
       nextRows.push({
         kind: "html-render",
         id: timelineEntry.id,
         createdAt: timelineEntry.createdAt,
         htmlRender: timelineEntry.htmlRender,
+        ...(renders.length > 1 ? { htmlRenders: renders } : {}),
       });
       continue;
     }
@@ -2018,6 +2205,7 @@ export function deriveMessagesTimelineRows(input: {
                 kind: "working",
                 id: "working-indicator-row",
                 createdAt: input.worktreeSetup.startedAt,
+                waits: [],
               } as const,
               setupRow,
             ]
@@ -2305,8 +2493,19 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
   if (a.kind !== b.kind || a.id !== b.id) return false;
 
   switch (a.kind) {
-    case "working":
-      return a.createdAt === (b as typeof a).createdAt;
+    case "working": {
+      const bw = b as typeof a;
+      return (
+        a.createdAt === bw.createdAt &&
+        a.waits.length === bw.waits.length &&
+        a.waits.every(
+          (wait, index) =>
+            wait.kind === bw.waits[index]?.kind &&
+            wait.startedAtMs === bw.waits[index]?.startedAtMs &&
+            wait.endedAtMs === bw.waits[index]?.endedAtMs,
+        )
+      );
+    }
     case "thinking": {
       const bt = b as typeof a;
       return a.createdAt === bt.createdAt && a.groupId === bt.groupId && a.expanded === bt.expanded;
@@ -2346,7 +2545,13 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     case "html-render": {
       // Entries rebuild on any tool update; an equal page must keep its mounted frame.
       const bh = b as typeof a;
-      return a.createdAt === bh.createdAt && htmlRenderReferencesEqual(a.htmlRender, bh.htmlRender);
+      const left = a.htmlRenders ?? [a.htmlRender];
+      const right = bh.htmlRenders ?? [bh.htmlRender];
+      return (
+        a.createdAt === bh.createdAt &&
+        left.length === right.length &&
+        left.every((render, index) => htmlRenderReferencesEqual(render, right[index]!))
+      );
     }
 
     case "mcp-app": {

@@ -2,6 +2,10 @@ import { useTurnNavigation, type TurnNavigationRequest } from "./useTurnNavigati
 import { useTurnBookmarks } from "./useTurnBookmarks";
 import { ThreadFindTimelineContext } from "./ThreadFindProvider";
 import { shouldPreserveAssistantLineBreaks } from "@starkfuture/shared/markdownPipeline";
+import {
+  groupCheckpointFilesByOrigin,
+  replyChangedSomething,
+} from "@starkfuture/client-runtime/state/thread-checkpoints";
 import { MarkdownFindContext, useFindRevealRef } from "./markdownFindContext";
 import { useChatCanvas } from "./ChatCanvasContext";
 import { WorkLogBlock, WorkLogButton, WorkLogDetails, WorkLogList, WorkLogRow } from "./WorkLog";
@@ -66,7 +70,7 @@ const NOOP_OPEN_ATTACHMENT = (_attachment: ChatFileAttachment) => {};
 
 import { resolveChatListAnchoredEndSpace } from "@starkfuture/shared/chatList";
 import { toolActivityFaviconUrl } from "@starkfuture/shared/favicon";
-import { formatDuration } from "@starkfuture/shared/orchestrationTiming";
+import { liveTurnLabel, type HumanWait } from "@starkfuture/shared/orchestrationTiming";
 import { getProjectFaviconCacheKey } from "@starkfuture/shared/projectFavicon";
 import { claudeSkillInvocation, isJavaScriptReplTool } from "@starkfuture/shared/toolActivity";
 import { observeVisibleAnimation } from "../../lib/visibleAnimation";
@@ -177,7 +181,7 @@ import {
   SnapShotAttachmentDetails,
 } from "./SnapShotAttachmentDetails";
 import { ProposedPlanCard } from "./ProposedPlanCard";
-import { HtmlRenderFrame } from "./HtmlRenderFrame";
+import { HtmlRenderGallery } from "./HtmlRenderFrame";
 import { McpAppFrame } from "./McpAppFrame";
 import { ChangedFilesCard } from "./ChangedFilesTree";
 import { useFileContextMenuHandler } from "../../fileContextMenu";
@@ -301,9 +305,9 @@ import {
 } from "./V2LifecycleRow";
 import { SecretRequestCard } from "./SecretRequestCard";
 import { UserShellCommandRow, type UserShellCommandItem } from "./UserShellCommandRow";
+import { checkRanAfterLabel, shellOutputAttachment } from "./turnChecks";
 import { orchestrationEnvironment } from "../../state/orchestration";
 import { useEnvironmentQuery } from "../../state/query";
-import { ChatAttachmentId } from "@starkfuture/contracts";
 import { TimelineSystemDivider } from "./TimelineSystemDivider";
 
 import { SkillChipIcon, SkillInlineText } from "./SkillInlineText";
@@ -1827,7 +1831,8 @@ const ConversationTimeline = memo(function ConversationTimeline({
               onItemSizeChanged={handleItemSizeChanged}
               className={cn(
                 "messages-timeline-scroll scrollbar-gutter-both min-h-0 flex-1 overflow-x-hidden overscroll-y-contain [overflow-anchor:none]",
-                topFadeEnabled && "topbar-scroll-fade",
+                // Both fades also stop the transcript where the floating composer begins.
+                topFadeEnabled ? "topbar-scroll-fade" : "scroll-end-cover",
               )}
               ListHeaderComponent={listHeader}
               ListFooterComponent={timelineListFooter}
@@ -2528,22 +2533,25 @@ function UserShellTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
     (thread) => thread?.projection.runs.find((run) => run.id === row.message.runId)?.status,
   );
   const shell = row.message.userShell!;
+  const subjectOrdinal = useAtomValue(
+    environmentThreadDetails.threadAtom(target),
+    (thread) =>
+      thread?.projection.runs.find((run) => run.id === shell.check?.subjectRunId)?.ordinal ?? null,
+  );
   return (
     <UserShellCommandRow
+      {...(shell.check
+        ? {
+            title: `${shell.check.scriptName ?? "Check"} · ${checkRanAfterLabel(subjectOrdinal === null ? "an earlier turn" : `Turn ${subjectOrdinal}`)}`,
+          }
+        : {})}
       command={shell.command}
       respond={shell.respond}
       item={displayedItem ?? null}
       {...(runStatus ? { runStatus } : {})}
       onOpenFullOutput={(path) => {
-        const basename = path.split(/[\\/]/).at(-1)!;
-        if (!basename.endsWith(".log")) return;
-        ctx.onFileOpen({
-          type: "file",
-          id: ChatAttachmentId.make(basename.slice(0, -4)),
-          name: "shell-output.log",
-          mimeType: "text/plain",
-          sizeBytes: 0,
-        });
+        const attachment = shellOutputAttachment(path);
+        if (attachment) ctx.onFileOpen(attachment);
       }}
     />
   );
@@ -3369,11 +3377,11 @@ function HtmlRenderTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "htm
 
   return (
     <div className="min-w-0 px-1">
-      <HtmlRenderFrame
+      <HtmlRenderGallery
         // A recycled row must not keep another page's frozen frame.
         key={row.htmlRender.attachmentId}
         environmentId={ctx.activeThreadEnvironmentId}
-        htmlRender={row.htmlRender}
+        renders={row.htmlRenders ?? [row.htmlRender]}
         threadRef={ctx.threadRef ?? undefined}
         onFullscreenChange={onFullscreenChange}
       />
@@ -3885,39 +3893,38 @@ const WorkGroupSection = memo(function WorkGroupSection({
   );
 });
 
-function formatWorkingTimer(startIso: string, endIso: string): string | null {
-  const startedAtMs = Date.parse(startIso);
-  const endedAtMs = Date.parse(endIso);
-  if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs)) {
-    return null;
-  }
-
-  const elapsedSeconds = Math.max(0, Math.floor((endedAtMs - startedAtMs) / 1000));
-  if (elapsedSeconds < 60) {
-    return `${elapsedSeconds}s`;
-  }
-
-  return formatDuration(elapsedSeconds * 1_000);
-}
-
-function formatWorkingTimerNow(startIso: string): string {
-  return formatWorkingTimer(startIso, new Date().toISOString()) ?? "0s";
-}
-
-function WorkingTimer({ createdAt }: { createdAt: string }) {
+/**
+ * The live turn header text. It repaints itself once a second, so the label
+ * switches between work time and the current approval wait without a render.
+ */
+function WorkingTimer({
+  createdAt,
+  waits,
+}: {
+  createdAt: string;
+  waits: ReadonlyArray<HumanWait>;
+}) {
   const textRef = useRef<HTMLSpanElement>(null);
-  const initialText = formatWorkingTimerNow(createdAt);
+  const initialText = liveTurnLabel({
+    startedAtMs: Date.parse(createdAt),
+    waits,
+    nowMs: Date.now(),
+  });
 
   useEffect(() => {
     const updateText = () => {
       if (textRef.current) {
-        textRef.current.textContent = formatWorkingTimerNow(createdAt);
+        textRef.current.textContent = liveTurnLabel({
+          startedAtMs: Date.parse(createdAt),
+          waits,
+          nowMs: Date.now(),
+        });
       }
     };
     updateText();
     const id = setInterval(updateText, 1000);
     return () => clearInterval(id);
-  }, [createdAt]);
+  }, [createdAt, waits]);
 
   return (
     <span ref={textRef} className="tabular-nums">
@@ -4118,9 +4125,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
   ) : isCompacting ? (
     <CompactingLabel />
   ) : row.createdAt ? (
-    <>
-      Working for <WorkingTimer createdAt={row.createdAt} />
-    </>
+    <WorkingTimer createdAt={row.createdAt} waits={row.waits} />
   ) : (
     "Working..."
   );
@@ -4569,7 +4574,8 @@ const AssistantChangedFilesSection = memo(function AssistantChangedFilesSection(
 }) {
   if (!turnSummary) return null;
   const checkpointFiles = turnSummary.files;
-  if (checkpointFiles.length === 0) return null;
+  // Edits made in the folder by someone else are not this reply's changes.
+  if (!replyChangedSomething(groupCheckpointFilesByOrigin(checkpointFiles))) return null;
 
   return (
     <AssistantChangedFilesSectionInner
@@ -5866,6 +5872,12 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
       failureItem.failure.code === ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE
         ? failureItem.runId
         : null;
+    // The chat that held this folder; a link back to the same chat goes nowhere.
+    const blockingThreadId =
+      failureItem.failure.blockedBy !== undefined &&
+      failureItem.failure.blockedBy.threadId !== failureItem.threadId
+        ? failureItem.failure.blockedBy.threadId
+        : null;
     return (
       <WorkLogRow
         data-v2-item-type="error"
@@ -5895,6 +5907,13 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
           <p className="ms-7 whitespace-pre-wrap break-words py-1 text-sm leading-relaxed text-foreground/80">
             {failureItem.failure.message}
           </p>
+        ) : null}
+        {blockingThreadId !== null ? (
+          <div className="ms-7 pb-1">
+            <InlineButton onClick={() => ctx.onOpenThread(blockingThreadId)}>
+              Open that chat
+            </InlineButton>
+          </div>
         ) : null}
         {retryRunId !== null && onRetryWorkspacePreparation ? (
           <div className="ms-7 pb-1">
@@ -5943,6 +5962,8 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
     workEntry.questionAnswer && hasQuestionAnswer(workEntry.questionAnswer)
       ? getQuestionAnswerPreview(workEntry.questionAnswer)
       : null;
+  // An approval's outcome trails its request: the choice, then whether it reached the agent.
+  const approvalOutcome = workEntry.approvalRecord;
   const viewedImagePath = workEntryViewedImagePath(workEntry);
   const payload = workEntry.structuredPayload;
   const skill =
@@ -6070,7 +6091,11 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
         <div className="min-w-0 flex-1 overflow-hidden">
           <p className="flex min-w-0 w-full items-baseline gap-1.5 text-sm leading-relaxed">
             <span
-              className={cn(answerPreview ? "min-w-0" : "min-w-0 flex-1", "truncate", headingClass)}
+              className={cn(
+                answerPreview || approvalOutcome ? "min-w-0" : "min-w-0 flex-1",
+                "truncate",
+                headingClass,
+              )}
             >
               {isReasoning && !expanded ? (
                 <ReactMarkdown
@@ -6107,6 +6132,32 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
               >
                 {answerPreview}
               </span>
+            ) : null}
+            {approvalOutcome ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <span
+                      data-approval-outcome={approvalOutcome.tone}
+                      className={cn(
+                        "min-w-0 truncate",
+                        approvalOutcome.tone === "error"
+                          ? "text-destructive"
+                          : approvalOutcome.tone === "warning"
+                            ? "text-warning"
+                            : approvalOutcome.tone === "success"
+                              ? "text-success"
+                              : "text-muted-foreground",
+                      )}
+                    />
+                  }
+                >
+                  {approvalOutcome.label}
+                </TooltipTrigger>
+                {approvalOutcome.detail ? (
+                  <TooltipPopup side="top">{approvalOutcome.detail}</TooltipPopup>
+                ) : null}
+              </Tooltip>
             ) : null}
           </p>
         </div>

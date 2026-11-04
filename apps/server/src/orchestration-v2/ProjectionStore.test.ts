@@ -9,6 +9,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ThreadShellSnapshot,
   NodeId,
   ProjectId,
@@ -31,6 +32,10 @@ import * as Schema from "effect/Schema";
 import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import { projectThreadAwarenessV2 } from "@starkfuture/shared/agentAwareness";
+import {
+  lostRuntimeRequestDetail,
+  openLostRuntimeRequests,
+} from "@starkfuture/shared/orchestrationV2LostRequests";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
@@ -40,6 +45,7 @@ import {
   decodeThreadHistoryCursor,
   selectHistoryPageFromCursor,
   THREAD_HISTORY_PAGE_POLICY,
+  THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
 } from "./threadHistoryPaging.ts";
 
 const layerTest = Layer.mergeAll(
@@ -3659,7 +3665,9 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         assert.deepEqual(yield* projectionStore.getCheckpointContext(threadId), {
           runs: [{ id: runId, ordinal: 1, status: "completed" }],
           checkpointScopes: [{ id: scopeId, runId, kind: "root_run", cwd: "/repo/worktree" }],
-          checkpoints: [{ scopeId, runId, appRunOrdinal: 1, status: "ready", ref }],
+          checkpoints: [
+            { scopeId, runId, ordinalWithinScope: 1, appRunOrdinal: 1, status: "ready", ref },
+          ],
         });
         const missing = yield* projectionStore
           .getCheckpointContext(ThreadId.make("thread:checkpoint-context:missing"))
@@ -5581,3 +5589,315 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 });
+
+it.effect("SQL and memory shells agree on a thread's open lost decision", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = yield* addRolledBackRecoveryCandidate("lost-shell");
+    const original = (yield* store.getThreadProjection(threadId)).runs[0]!;
+    const now = yield* DateTime.now;
+    yield* store.apply({
+      id: EventId.make("event:lost-shell:run-cancelled"),
+      type: "run.updated",
+      threadId,
+      occurredAt: now,
+      payload: { ...original, status: "cancelled", completedAt: now },
+    });
+    const lostAt = DateTime.add(now, { seconds: 1 });
+    const request = (
+      name: string,
+      lost: { readonly lostAt: DateTime.Utc } | null,
+    ): OrchestrationV2RuntimeRequest => ({
+      id: RuntimeRequestId.make(`request:lost-shell:${name}`),
+      nodeId: NodeId.make(`node:lost-shell:${name}`),
+      providerTurnId: null,
+      nativeRequestRef: null,
+      kind: "command",
+      status: "expired",
+      responseCapability: { type: "not_resumable", reason: "The server restarted." },
+      createdAt: now,
+      resolvedAt: lostAt,
+      ...(lost === null ? {} : { lost: { cause: "server_restart", lostAt: lost.lostAt } }),
+    });
+    const older = request("older", { lostAt });
+    const newer = request("newer", { lostAt: DateTime.add(lostAt, { seconds: 1 }) });
+    const applyRequest = (
+      payload: OrchestrationV2RuntimeRequest,
+      type:
+        | "runtime-request.updated"
+        | "runtime-request.asked-again"
+        | "runtime-request.lost-dismissed",
+    ) =>
+      store.apply({
+        id: EventId.make(`event:lost-shell:${payload.id}:${type}`),
+        type,
+        threadId,
+        nodeId: payload.nodeId,
+        occurredAt: now,
+        payload,
+      });
+    const shells = Effect.fnUntraced(function* () {
+      const memory = ProjectionStore.threadShellFromProjection(
+        yield* store.getThreadProjection(threadId),
+      ).lostRuntimeRequest;
+      const sql = (yield* store.getShellSnapshot()).threads.find(
+        (row) => row.id === threadId,
+      )?.lostRuntimeRequest;
+      assert.deepEqual(sql, memory);
+      const settleable = (yield* store.getSettlementCandidates(threadId)).length > 0;
+      return { lost: memory?.id ?? null, settleable };
+    });
+
+    yield* applyRequest(request("expired-before-tracking", null), "runtime-request.updated");
+    assert.deepEqual(yield* shells(), { lost: null, settleable: true });
+    yield* applyRequest(older, "runtime-request.updated");
+    yield* applyRequest(newer, "runtime-request.updated");
+    assert.deepEqual(yield* shells(), { lost: newer.id, settleable: false });
+    yield* applyRequest(
+      { ...newer, lost: { ...newer.lost!, askedAgainAt: now } },
+      "runtime-request.asked-again",
+    );
+    assert.deepEqual(yield* shells(), { lost: older.id, settleable: false });
+    yield* applyRequest(
+      { ...older, lost: { ...older.lost!, dismissedAt: now } },
+      "runtime-request.lost-dismissed",
+    );
+    assert.deepEqual(yield* shells(), { lost: null, settleable: true });
+  }).pipe(Effect.provide(layerTest)),
+);
+
+// Six turns; the first one's command approval was lost and is still open.
+// Reopening the chat loads only the latest turns, yet the notice and its
+// detail must still come with them, from SQL and memory alike.
+const openLossOutsideHistoryWindow = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const now = yield* DateTime.now;
+  const threadId = ThreadId.make("thread:lost-window");
+  const at = (seconds: number) => DateTime.add(now, { seconds });
+  const itemBase = (id: string, runId: RunId, nodeId: NodeId | null, ordinal: number) => ({
+    id: TurnItemId.make(id),
+    threadId,
+    runId,
+    nodeId,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal,
+    status: "completed" as const,
+    title: null,
+    startedAt: at(ordinal),
+    completedAt: at(ordinal),
+    updatedAt: at(ordinal),
+  });
+  yield* store.apply({
+    id: EventId.make("event:lost-window:thread"),
+    type: "thread.created",
+    threadId,
+    occurredAt: now,
+    payload: {
+      createdBy: "user",
+      creationSource: "web",
+      id: threadId,
+      projectId: ProjectId.make("project:lost-window"),
+      title: "Lost decision outside the window",
+      providerInstanceId,
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    },
+  });
+  const requestId = RuntimeRequestId.make("request:lost-window");
+  // The first turn's command approval, lost to a restart and still open.
+  const seedLostApproval = (runId: RunId) =>
+    Effect.gen(function* () {
+      const commandNodeId = NodeId.make("node:lost-window:command");
+      const approvalNodeId = NodeId.make("node:lost-window:approval");
+      for (const node of [
+        {
+          id: commandNodeId,
+          parentNodeId: null,
+          kind: "tool_call" as const,
+          runtimeRequestId: null,
+        },
+        {
+          id: approvalNodeId,
+          parentNodeId: commandNodeId,
+          kind: "approval_request" as const,
+          runtimeRequestId: requestId,
+        },
+      ]) {
+        yield* store.apply({
+          id: EventId.make(`event:${node.id}`),
+          type: "node.updated",
+          threadId,
+          runId,
+          nodeId: node.id,
+          occurredAt: at(11),
+          payload: {
+            ...node,
+            threadId,
+            runId,
+            rootNodeId: commandNodeId,
+            status: "cancelled",
+            countsForRun: false,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            checkpointScopeId: null,
+            startedAt: at(11),
+            completedAt: at(13),
+          },
+        });
+      }
+      yield* store.apply({
+        id: EventId.make("event:lost-window:command-item"),
+        type: "turn-item.updated",
+        threadId,
+        runId,
+        nodeId: commandNodeId,
+        occurredAt: at(11),
+        payload: {
+          ...itemBase("item:lost-window:command", runId, commandNodeId, 11),
+          status: "cancelled",
+          type: "command_execution",
+          input: "rm -rf build",
+        },
+      });
+      yield* store.apply({
+        id: EventId.make("event:lost-window:approval-item"),
+        type: "turn-item.updated",
+        threadId,
+        runId,
+        nodeId: approvalNodeId,
+        occurredAt: at(12),
+        payload: {
+          ...itemBase("item:lost-window:approval", runId, approvalNodeId, 12),
+          status: "cancelled",
+          title: "Approval lost: Stark Code restarted",
+          type: "approval_request",
+          requestId,
+          requestKind: "command",
+        },
+      });
+      yield* store.apply({
+        id: EventId.make("event:lost-window:request"),
+        type: "runtime-request.updated",
+        threadId,
+        nodeId: approvalNodeId,
+        occurredAt: at(13),
+        payload: {
+          id: requestId,
+          nodeId: approvalNodeId,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "command",
+          status: "expired",
+          responseCapability: { type: "not_resumable", reason: "The server restarted." },
+          createdAt: at(12),
+          resolvedAt: at(13),
+          lost: { cause: "server_restart", lostAt: at(13) },
+        },
+      });
+    });
+  for (let turn = 1; turn <= 6; turn += 1) {
+    const runId = RunId.make(`run:lost-window:${turn}`);
+    yield* store.apply({
+      id: EventId.make(`event:lost-window:run:${turn}`),
+      type: "run.created",
+      threadId,
+      runId,
+      providerInstanceId,
+      occurredAt: at(turn * 10),
+      payload: {
+        id: runId,
+        threadId,
+        ordinal: turn,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make(`message:lost-window:${turn}`),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "completed",
+        requestedAt: at(turn * 10),
+        startedAt: at(turn * 10),
+        completedAt: at(turn * 10 + 5),
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    });
+    yield* store.apply({
+      id: EventId.make(`event:lost-window:message:${turn}`),
+      type: "turn-item.updated",
+      threadId,
+      runId,
+      occurredAt: at(turn * 10),
+      payload: {
+        ...itemBase(`item:lost-window:message:${turn}`, runId, null, turn * 10),
+        type: "user_message",
+        createdBy: "user",
+        creationSource: "web",
+        messageId: MessageId.make(`message:lost-window:${turn}`),
+        inputIntent: "turn_start",
+        text: `Turn ${turn}`,
+        attachments: [],
+      },
+    });
+    if (turn === 1) yield* seedLostApproval(runId);
+  }
+  const snapshot = yield* store.getThreadSnapshotWindow(threadId, {
+    rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+    userTurnLimit: 2,
+  });
+  const { projection } = buildBoundedThreadProjection({
+    policy: { ...THREAD_HISTORY_PAGE_POLICY, maxUserTurns: 2 },
+    projection: snapshot.projection,
+    snapshotSequence: snapshot.snapshotSequence,
+  });
+  const visibleIds = projection.visibleTurnItems.map((row) => String(row.sourceItemId));
+  assert.deepEqual(visibleIds, ["item:lost-window:message:5", "item:lost-window:message:6"]);
+  const lost = openLostRuntimeRequests(projection.runtimeRequests);
+  return {
+    lost: lost.map((request) => ({
+      id: request.id,
+      cause: request.lost?.cause,
+      detail: lostRuntimeRequestDetail(request, projection),
+      title: projection.turnItems.find(
+        (item) => item.type === "approval_request" && item.requestId === request.id,
+      )?.title,
+    })),
+    // The timeline window is unchanged: the notice's records are not rows.
+    visibleIds,
+  };
+});
+
+it.effect("SQL and memory history windows keep an open loss from before the window", () =>
+  Effect.gen(function* () {
+    const sql = yield* openLossOutsideHistoryWindow.pipe(Effect.provide(layerTest));
+    const memory = yield* openLossOutsideHistoryWindow.pipe(
+      Effect.provide(ProjectionStore.layerMemory),
+    );
+    assert.deepEqual(sql.lost, [
+      {
+        id: RuntimeRequestId.make("request:lost-window"),
+        cause: "server_restart",
+        detail: { command: "rm -rf build" },
+        title: "Approval lost: Stark Code restarted",
+      },
+    ]);
+    assert.deepEqual(memory, sql);
+  }),
+);

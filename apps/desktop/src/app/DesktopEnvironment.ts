@@ -17,6 +17,8 @@ import * as DesktopConfig from "./DesktopConfig.ts";
 import { resolveLinuxDesktopEntryName } from "./DesktopEarlyElectronStartup.ts";
 import { resolveDesktopBaseDir, resolveDesktopStateDir } from "./DesktopStatePaths.ts";
 import { isNightlyDesktopVersion } from "../updates/updateChannels.ts";
+import type { BakedRehearsalPolicy } from "../updates/updateFeedPolicy.ts";
+import type { DesktopStartupLocations } from "./DesktopLocationAnchor.ts";
 import type { OtlpProtocol } from "@starkfuture/shared/observability";
 
 export interface MakeDesktopEnvironmentInput {
@@ -29,6 +31,8 @@ export interface MakeDesktopEnvironmentInput {
   readonly isPackaged: boolean;
   readonly resourcesPath: string;
   readonly runningUnderArm64Translation: boolean;
+  /** From `applyDesktopStartupLocations`, which ran before this environment was built. */
+  readonly startupLocations?: DesktopStartupLocations;
 }
 
 export class DesktopEnvironment extends Context.Service<
@@ -91,6 +95,10 @@ export class DesktopEnvironment extends Context.Service<
     readonly runtimeInfo: DesktopRuntimeInfo;
     readonly resolvePickFolderDefaultPath: (rawOptions: unknown) => Option.Option<string>;
     readonly resolveResourcePathCandidates: (fileName: string) => readonly string[];
+    /** A mock rehearsal build's baked profile and fault; absent or null otherwise. */
+    readonly rehearsal?: BakedRehearsalPolicy | null;
+    /** The location anchor this launch keeps current; null when it uses none. */
+    readonly locationAnchorPath?: string | null;
   }
 >()("@starkfuture/desktop/app/DesktopEnvironment") {}
 
@@ -281,6 +289,8 @@ const make = Effect.fn("desktop.environment.make")(function* (
       path.join(resourcesPath, "resources", fileName),
       path.join(resourcesPath, fileName),
     ],
+    rehearsal: input.startupLocations?.rehearsal ?? null,
+    locationAnchorPath: input.startupLocations?.anchorPath ?? null,
   });
 });
 

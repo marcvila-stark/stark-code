@@ -1,3 +1,7 @@
+import type {
+  BrowserCaptureDesktopCommand,
+  BrowserCaptureDesktopResult,
+} from "./browserCapture.ts";
 import * as Schema from "effect/Schema";
 
 import { SnapShotSource } from "./chatAttachment.ts";
@@ -71,6 +75,12 @@ export const ContextMenuItemSchema: Schema.Codec<ContextMenuItemSchemaType> = Sc
   ),
 });
 
+/**
+ * The desktop updater's lifecycle. `verifying` checks a finished download
+ * before it is offered; `downloaded` means ready to restart; `preparing`
+ * checks the restart preconditions and saves every window's drafts;
+ * `restarting` has stopped the backends and is handing over to the installer.
+ */
 export type DesktopUpdateStatus =
   | "disabled"
   | "idle"
@@ -78,7 +88,10 @@ export type DesktopUpdateStatus =
   | "up-to-date"
   | "available"
   | "downloading"
+  | "verifying"
   | "downloaded"
+  | "preparing"
+  | "restarting"
   | "error";
 
 export type DesktopRuntimeArch = "arm64" | "x64" | "other";
@@ -93,7 +106,10 @@ export const DesktopUpdateStatusSchema = Schema.Literals([
   "up-to-date",
   "available",
   "downloading",
+  "verifying",
   "downloaded",
+  "preparing",
+  "restarting",
   "error",
 ]);
 export const DesktopRuntimeArchSchema = Schema.Literals(["arm64", "x64", "other"]);
@@ -293,6 +309,154 @@ export interface DesktopUpdateState {
    * not install it again; the user can retry it from the update button.
    */
   notAppliedVersion?: string;
+  /**
+   * A newer version the last check found and did not offer, because it
+   * failed on this data before (its data update failed, or the data was
+   * restored to before it). Only a check the user starts offers it again.
+   */
+  skippedVersion?: string;
+  /** Why updates are off. Present only while `status` is `disabled`. */
+  disabledReason?: DesktopUpdateDisabledReason;
+  /** What failed, with `errorContext`. */
+  errorKind?: DesktopUpdateErrorKind;
+  /**
+   * A failed background check that left the known state alone: an available
+   * or downloaded update, or an earlier "up to date", stays visible.
+   */
+  lastCheckError?: DesktopUpdateCheckError;
+  /** Byte progress while downloading, when the feed reports sizes. */
+  downloadProgress?: DesktopUpdateDownloadProgress;
+  /** An automatic download retry is scheduled after a failed download. */
+  downloadRetry?: DesktopUpdateDownloadRetry;
+  /** "Later": the ready update stays, prompts are muted until this time. */
+  postponedUntil?: string;
+  /** Why the last restart request did not restart. Nothing was stopped. */
+  installBlockers?: ReadonlyArray<DesktopUpdateInstallBlocker>;
+  /**
+   * The installer accepted this version after Stark Code had already given
+   * up waiting and resumed. It installs the next time Stark Code quits.
+   */
+  stagedVersion?: string;
+  /** Channels this build's feed serves; a missing list means every channel. */
+  availableChannels?: ReadonlyArray<DesktopUpdateChannel>;
+}
+
+export const DesktopUpdateDisabledReasonCodeSchema = Schema.Literals([
+  "development-build",
+  "unsupported-platform",
+  "feed-not-configured",
+  "feed-invalid",
+  "foreign-signature",
+  "unsigned-build",
+  "turned-off",
+  "not-activated",
+]);
+export type DesktopUpdateDisabledReasonCode = typeof DesktopUpdateDisabledReasonCodeSchema.Type;
+
+export const DesktopUpdateDisabledReasonSchema = Schema.Struct({
+  code: DesktopUpdateDisabledReasonCodeSchema,
+  message: Schema.String,
+});
+export type DesktopUpdateDisabledReason = typeof DesktopUpdateDisabledReasonSchema.Type;
+
+/**
+ * `offline` needs evidence that this machine has no network; a failed
+ * connection alone is `unreachable`. `feed-unavailable` is an HTTP error or a
+ * missing channel file, `feed-invalid` a malformed release, `invalid-artifact`
+ * a damaged download and `signature` one not signed by Stark Future.
+ */
+export const DesktopUpdateErrorKindSchema = Schema.Literals([
+  "offline",
+  "unreachable",
+  "feed-unavailable",
+  "feed-invalid",
+  "invalid-artifact",
+  "signature",
+  "disk-full",
+  "install-stalled",
+  "unknown",
+]);
+export type DesktopUpdateErrorKind = typeof DesktopUpdateErrorKindSchema.Type;
+
+export const DesktopUpdateCheckErrorSchema = Schema.Struct({
+  kind: DesktopUpdateErrorKindSchema,
+  message: Schema.String,
+  at: Schema.String,
+});
+export type DesktopUpdateCheckError = typeof DesktopUpdateCheckErrorSchema.Type;
+
+export const DesktopUpdateDownloadProgressSchema = Schema.Struct({
+  transferredBytes: Schema.Number,
+  totalBytes: Schema.Number,
+  bytesPerSecond: Schema.Number,
+});
+export type DesktopUpdateDownloadProgress = typeof DesktopUpdateDownloadProgressSchema.Type;
+
+export const DesktopUpdateDownloadRetrySchema = Schema.Struct({
+  attempt: Schema.Number,
+  nextAttemptAt: Schema.String,
+});
+export type DesktopUpdateDownloadRetry = typeof DesktopUpdateDownloadRetrySchema.Type;
+
+/**
+ * Something that must finish before Stark Code restarts to update. Restarting
+ * never interrupts these; the request is refused and nothing is stopped.
+ */
+export const DesktopUpdateInstallBlockerKindSchema = Schema.Literals([
+  "active-task",
+  "pending-approval",
+  "backend-busy",
+  "maintenance-unavailable",
+  "unsaved-draft",
+  "upload-in-progress",
+  "image-encoding",
+  "send-in-progress",
+  "window-unresponsive",
+  "storage-failed",
+]);
+export type DesktopUpdateInstallBlockerKind = typeof DesktopUpdateInstallBlockerKindSchema.Type;
+
+export const DesktopUpdateInstallBlockerSchema = Schema.Struct({
+  kind: DesktopUpdateInstallBlockerKindSchema,
+  message: Schema.String,
+  count: Schema.optionalKey(Schema.Number),
+});
+export type DesktopUpdateInstallBlocker = typeof DesktopUpdateInstallBlockerSchema.Type;
+
+/** Desktop main -> every app window: save drafts and confirm before the restart. */
+export const DesktopUpdateRestartPrepareRequestSchema = Schema.Struct({
+  requestId: Schema.String,
+  version: Schema.String,
+});
+export type DesktopUpdateRestartPrepareRequest =
+  typeof DesktopUpdateRestartPrepareRequestSchema.Type;
+
+/**
+ * A window's answer. `saved` means its drafts and prompt stash are written
+ * and read back, with no upload, image encoding or send still running.
+ * Anything else aborts the restart.
+ */
+export const DesktopUpdateRestartAckSchema = Schema.Struct({
+  requestId: Schema.String,
+  outcome: Schema.Literals(["saved", "failed"]),
+  blockers: Schema.Array(DesktopUpdateInstallBlockerSchema),
+  /** Uploaded attachments the saved drafts and stash still reference. */
+  referencedAttachmentIds: Schema.Array(Schema.String),
+  /** The saved composer drafts and prompt stash, as stored; backed up before the restart. */
+  draftsJson: Schema.optionalKey(Schema.String),
+  stashJson: Schema.optionalKey(Schema.String),
+});
+export type DesktopUpdateRestartAck = typeof DesktopUpdateRestartAckSchema.Type;
+
+export interface DesktopUpdateRestartBridge {
+  /**
+   * Registers this window as one that must confirm its drafts are saved
+   * before an update restart. The returned function unregisters it.
+   */
+  onPrepare: (listener: (request: DesktopUpdateRestartPrepareRequest) => void) => () => void;
+  acknowledge: (ack: DesktopUpdateRestartAck) => Promise<void>;
+  /** The restart did not happen; lift the save barrier. */
+  onRelease: (listener: (requestId: string) => void) => () => void;
 }
 
 export interface DesktopUpdateReleaseNote {
@@ -325,6 +489,16 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   errorContext: Schema.NullOr(Schema.Literals(["check", "download", "install"])),
   canRetry: Schema.Boolean,
   notAppliedVersion: Schema.optionalKey(Schema.String),
+  skippedVersion: Schema.optionalKey(Schema.String),
+  disabledReason: Schema.optionalKey(DesktopUpdateDisabledReasonSchema),
+  errorKind: Schema.optionalKey(DesktopUpdateErrorKindSchema),
+  lastCheckError: Schema.optionalKey(DesktopUpdateCheckErrorSchema),
+  downloadProgress: Schema.optionalKey(DesktopUpdateDownloadProgressSchema),
+  downloadRetry: Schema.optionalKey(DesktopUpdateDownloadRetrySchema),
+  postponedUntil: Schema.optionalKey(Schema.String),
+  installBlockers: Schema.optionalKey(Schema.Array(DesktopUpdateInstallBlockerSchema)),
+  stagedVersion: Schema.optionalKey(Schema.String),
+  availableChannels: Schema.optionalKey(Schema.Array(DesktopUpdateChannelSchema)),
 });
 
 /** The desktop app's `stark-code` command on PATH, managed from Settings. */
@@ -1220,6 +1394,7 @@ export interface DesktopBridge {
     shortcut: SnapShotShortcut,
   ) => Promise<DesktopSnapShotShortcutAvailability>;
   setSnapShotShortcutSuppressed?: (suppressed: boolean) => Promise<void>;
+  browserCapture?: (command: BrowserCaptureDesktopCommand) => Promise<BrowserCaptureDesktopResult>;
   listPendingSnapShots?: () => Promise<readonly DesktopPendingSnapShot[]>;
   readSnapShot?: (id: string) => Promise<DesktopSnapShot>;
   setSnapShotAnimationDestination?: (
@@ -1302,6 +1477,7 @@ export interface DesktopBridge {
   /** Present when the desktop shell can perform an ordered plain-text paste. */
   pasteAsText?: () => Promise<void>;
   onMenuAction: (listener: (action: string) => void) => () => void;
+  onBrowserCapturePending?: (listener: () => void) => () => void;
   onSnapShotEvent?: (listener: (event: DesktopSnapShotEvent) => void) => () => void;
   /**
    * Quit-confirmation hint pushes. Optional: older desktop builds never emit
@@ -1316,6 +1492,12 @@ export interface DesktopBridge {
   downloadUpdate: () => Promise<DesktopUpdateActionResult>;
   installUpdate: () => Promise<DesktopUpdateActionResult>;
   onUpdateState: (listener: (state: DesktopUpdateState) => void) => () => void;
+  /** Stops a running download. Optional: older desktop builds lack it. */
+  cancelUpdateDownload?: () => Promise<DesktopUpdateActionResult>;
+  /** "Later" (true) mutes prompts for a ready update; false undoes it. */
+  setUpdatePostponed?: (postponed: boolean) => Promise<DesktopUpdateState>;
+  /** Draft preservation before an update restart. Optional for older builds. */
+  updateRestart?: DesktopUpdateRestartBridge;
   /** Settings → `stark-code` command. Optional: older desktop builds lack it. */
   cliCommand?: {
     getState: () => Promise<DesktopCliCommandState>;

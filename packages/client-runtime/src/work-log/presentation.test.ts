@@ -308,6 +308,109 @@ describe("summarizeToolGroup", () => {
       ]).summary,
     ).toBe("Used Computer Use");
   });
+
+  describe("commands an approval kept from running", () => {
+    const command = (id: string, status: WorkLogToolLifecycleStatus) =>
+      entry(id, {
+        itemType: "command_execution",
+        command: "touch stamp.md",
+        toolLifecycleStatus: status,
+      });
+    const approval = (id: string) =>
+      entry(id, {
+        itemType: "approval_request",
+        requestKind: "command",
+        label: "Approval requested",
+        toolLifecycleStatus: "stopped",
+      });
+
+    it("says a declined, lost or expired command was declined, never that it ran or failed", () => {
+      // The client marks a command whose approval never allowed it as declined; the command's
+      // own item still reads failed (Claude) or cancelled (Codex).
+      expect(summarizeToolGroup([command("a", "declined"), approval("ask")])).toEqual({
+        summary: "Declined 1 command",
+        hasFailure: false,
+      });
+      expect(
+        summarizeToolGroup([
+          command("a", "completed"),
+          command("b", "declined"),
+          command("c", "declined"),
+        ]),
+      ).toEqual({ summary: "Ran 1 command and declined 2 commands", hasFailure: false });
+      expect(summarizeToolGroup([command("a", "failed"), command("b", "declined")])).toEqual({
+        summary: "Ran 1 command and declined 1 command",
+        hasFailure: true,
+      });
+    });
+
+    it("counts an approval as work only when nothing else in the group is", () => {
+      expect(summarizeToolGroup([command("a", "completed"), approval("ask")]).summary).toBe(
+        "Ran 1 command",
+      );
+      expect(summarizeToolGroup([approval("ask")]).summary).toBe("Used 1 tool");
+    });
+  });
+
+  describe("edits", () => {
+    const edit = (id: string, file: string, status?: WorkLogToolLifecycleStatus) =>
+      entry(id, {
+        itemType: "file_change",
+        changedFiles: [file],
+        ...(status ? { toolLifecycleStatus: status } : {}),
+      });
+
+    it("keeps counting completed and status-less edits as changed files", () => {
+      expect(
+        summarizeToolGroup([
+          edit("a", "src/a.ts", "completed"),
+          edit("a-again", "src/a.ts", "completed"),
+          edit("b", "src/b.ts"),
+        ]),
+      ).toEqual({ summary: "Changed 2 files", hasFailure: false });
+    });
+
+    it("does not claim declined edits changed anything", () => {
+      const read = (id: string) => entry(id, { requestKind: "file-read", label: "Read file" });
+      expect(
+        summarizeToolGroup([
+          read("read-1"),
+          read("read-2"),
+          edit("a", "src/a.ts", "declined"),
+          edit("b", "src/b.ts", "declined"),
+          entry("other", { label: "Tool call" }),
+        ]).summary,
+      ).toBe("Read 2 files, didn't apply 2 edits, and performed 1 other action");
+      expect(
+        summarizeToolGroup([edit("a", "src/a.ts", "declined"), edit("b", "src/b.ts", "declined")]),
+      ).toEqual({ summary: "Didn't apply 2 edits", hasFailure: true });
+    });
+
+    it("reports applied edits apart from failed, stopped, and declined ones", () => {
+      expect(
+        summarizeToolGroup([
+          edit("a", "src/a.ts", "completed"),
+          edit("b", "src/b.ts", "failed"),
+          edit("c", "src/c.ts", "stopped"),
+          edit("d", "src/a.ts", "declined"),
+        ]),
+      ).toEqual({ summary: "Changed 1 file and didn't apply 3 edits", hasFailure: true });
+    });
+
+    it("reports edits that are still in progress as waiting", () => {
+      expect(summarizeToolGroup([edit("a", "src/a.ts", "inProgress")]).summary).toBe(
+        "Waiting on 1 edit",
+      );
+      expect(
+        summarizeToolGroup([
+          edit("a", "src/a.ts", "completed"),
+          edit("b", "src/b.ts", "declined"),
+          edit("c", "src/c.ts", "inProgress"),
+          edit("d", "src/d.ts", "idle"),
+        ]).summary,
+      ).toBe("Changed 1 file, didn't apply 1 edit, and waiting on 2 edits");
+    });
+  });
 });
 
 describe("resolveWorkEntryToolPresentation", () => {

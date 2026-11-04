@@ -42,7 +42,7 @@ export class CloudManagedEndpointRuntime extends Context.Service<
   }
 >()("stark-code/cloud/ManagedEndpointRuntime/CloudManagedEndpointRuntime") {}
 
-export function classifyRelayClientOutput(line: string): "connected" | "warning" | "debug" {
+function classifyRelayClientOutput(line: string): "connected" | "warning" | "debug" {
   if (/\bRegistered tunnel connection\b/iu.test(line)) {
     return "connected";
   }
@@ -60,7 +60,7 @@ export function classifyRelayClientOutput(line: string): "connected" | "warning"
  * plus the unprefixed messages seen so far. Transient rejections while a new
  * tunnel's token propagates are absorbed by requiring several in a row.
  */
-export function isRejectedRelayClientTunnelOutput(line: string): boolean {
+function isRejectedRelayClientTunnelOutput(line: string): boolean {
   return (
     /\bRegister tunnel error from server side\b/iu.test(line) &&
     /error="(?:Unauthorized:[^"]*|Failed to get tunnel|Tunnel not found|Record for tunnel not found|Invalid tunnel secret)"/iu.test(
@@ -70,7 +70,7 @@ export function isRejectedRelayClientTunnelOutput(line: string): boolean {
 }
 
 /** Connector startup failures can clear after installation or a later spawn attempt. */
-export function isRetryableManagedEndpointRuntimeStatus(status: unknown): boolean {
+function isRetryableManagedEndpointRuntimeStatus(status: unknown): boolean {
   if (typeof status !== "object" || status === null || !("status" in status)) {
     return false;
   }

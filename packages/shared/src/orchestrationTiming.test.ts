@@ -4,6 +4,10 @@ import {
   formatDuration,
   deriveActiveWorkStartedAt,
   deriveSubagentElapsedMs,
+  humanWaitMs,
+  liveTurnLabel,
+  workedForLabel,
+  type HumanWait,
 } from "./orchestrationTiming.ts";
 
 describe("formatDuration", () => {
@@ -159,5 +163,46 @@ describe("deriveSubagentElapsedMs", () => {
     expect(
       deriveSubagentElapsedMs({ status: "running", startedAt: null, completedAt: null }, now),
     ).toBeNull();
+  });
+});
+
+describe("approval wait time", () => {
+  const approval = (startedAtMs: number, endedAtMs: number | null): HumanWait => ({
+    kind: "approval",
+    startedAtMs,
+    endedAtMs,
+  });
+
+  it("counts overlapping waits once and runs an open wait to the window end", () => {
+    expect(humanWaitMs([approval(10_000, 30_000), approval(20_000, 40_000)], 0, 60_000)).toBe(
+      30_000,
+    );
+    expect(humanWaitMs([approval(50_000, null)], 0, 60_000)).toBe(10_000);
+    expect(humanWaitMs([approval(-5_000, 5_000)], 0, 60_000)).toBe(5_000);
+  });
+
+  it("says the live turn is waiting for approval and counts only that wait", () => {
+    expect(liveTurnLabel({ startedAtMs: 0, waits: [approval(75_000, null)], nowMs: 123_000 })).toBe(
+      "Waiting for your approval · 48s",
+    );
+    expect(
+      liveTurnLabel({
+        startedAtMs: 0,
+        waits: [{ kind: "answer", startedAtMs: 5_000, endedAtMs: null }],
+        nowMs: 9_000,
+      }),
+    ).toBe("Waiting for your answer · 4s");
+  });
+
+  it("counts only work time once the approval is answered", () => {
+    expect(
+      liveTurnLabel({ startedAtMs: 0, waits: [approval(10_000, 58_000)], nowMs: 60_000 }),
+    ).toBe("Working for 12s");
+  });
+
+  it("names the wait after the work time in the settled label", () => {
+    expect(workedForLabel(125_000, 113_000)).toBe("Worked for 12s · waited 1m 53s for you");
+    expect(workedForLabel(22_000, 0)).toBe("Worked for 22s");
+    expect(workedForLabel(null, 0)).toBe("Worked");
   });
 });

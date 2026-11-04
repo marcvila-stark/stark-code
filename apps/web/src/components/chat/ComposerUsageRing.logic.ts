@@ -35,8 +35,11 @@ export function selectComposerUsage(
   if (!provider.enabled || !provider.installed || provider.availability === "unavailable") {
     return unknown("This profile is not available.");
   }
-  if (provider.auth.status !== "authenticated") {
+  if (provider.auth.status === "unauthenticated") {
     return unknown("Sign in to see subscription usage.");
+  }
+  if (provider.auth.status !== "authenticated") {
+    return unknown("Could not check your account. Refresh usage to try again.");
   }
   const limits = provider.usageLimits;
   if (!limits) return unknown("Usage has not been reported yet.");

@@ -30,8 +30,9 @@ folder. The **Shell** button opens a separate CLI session.
 ## Find chats waiting for you
 
 On web and desktop, **Needs you** collects pending approvals, questions and sign-in
-requests across your connected folders. Choose an item to open its chat and review
-the request there. The list disappears when nothing is waiting.
+requests across your connected folders, plus approvals and questions lost to a
+restart. Choose an item to open its chat and review the request there. The list
+disappears when nothing is waiting.
 
 Claude native shells also appear when Claude reports a permission prompt or
 question. Selecting one opens its existing terminal; answer inside Claude. This
@@ -85,6 +86,10 @@ conversation visible. A new side chat receives a short excerpt of recent chat
 text and starts in Plan with Manual permissions. It shares the current folder;
 it does not create a separate worktree. Terminal history is never copied, so
 paste any terminal context you want it to use.
+
+If the main chat or one of its side chats is using the folder, your question waits
+and starts automatically when it is free; **Stop** cancels only that waiting question. A
+native terminal session keeps the folder until you exit it.
 
 Side chats save automatically under their main chat. Expand **Side chats** in the
 sidebar to return to one; closing the panel does not delete it. Your selected
@@ -251,6 +256,37 @@ and copying a thread reference. A copied reference uses the thread's pull reques
 link when available, otherwise its thread ID. See [keybindings](./keybindings.md)
 for custom configuration.
 
+### Search all history
+
+Open **History** from the sidebar's **⋯** menu or the command palette, or press
+`mod+shift+y` on web and desktop when the terminal is not focused. Customize
+`history.open` in **Settings → Keybindings**. History lists the threads on your
+connected machines, newest first, including archived threads and imported sessions.
+Search matches thread titles and finished messages, and each result shows its first
+prompt. Filter by status, origin, last update, provider, or folder; Back returns to
+the same filters. **Unarchive** returns an archived thread to the sidebar. A search
+that matches rarely pauses after a batch of older threads, and one that reaches a
+very long conversation can pause partway through it; choose **Search older threads**
+to continue. A machine running an older Stark Code version is not searched until it
+is updated.
+
+### Import Claude Code and Codex sessions
+
+Choose **Import sessions…** on the History page, or **Import Claude Code and Codex
+sessions…** in the command palette, and pick a project. Stark Code imports sessions
+from the last 30 days that ran in that project's folder on the project's machine, up
+to 100 at a time. Long sessions keep their first prompt and latest messages. Sessions
+run in a worktree or subfolder are not included, nor are sessions Stark Code ran for
+one of its own threads, since those are already in History. Importing again adds only
+new sessions, and imported threads start settled.
+
+Choose **Continue** on an imported thread and send a message to resume the same Claude
+Code or Codex session; the agent already has the conversation. If that session no
+longer exists on the machine, Stark Code starts a new one and gives it the imported
+conversation once. Switching the thread to another provider also passes the
+conversation along. A deleted imported thread is not imported again, so archive one
+you only want out of the way.
+
 ## Decisions and recorded results
 
 On web and desktop, **Needs you** appears in the sidebar when a chat is waiting
@@ -262,6 +298,17 @@ Codex versions distinguish approvals, questions and sign-in; older versions show
 “Input needed.” Open the entry to respond in the existing terminal. The entry
 clears when Codex reports that it has continued or the terminal exits. A version
 that does not report terminal status cannot appear here.
+
+If Stark Code restarts or shuts down, or the agent process stops, while an approval
+or question is open, the agent can no longer receive your answer. The chat marks the
+request lost and keeps it in **Needs you**; on mobile, the thread list shows
+**Decision lost**. Choose **Ask again** to send the agent a message about what was
+lost, so it retries the step and asks you again; nothing is approved for you.
+**Dismiss** clears it without starting a turn. If you had answered but Stark Code
+or the agent process stopped before the answer was confirmed, the request says the
+answer may not have reached the agent, and Ask again asks the agent to check whether
+the step already ran. Until you choose, the thread is not settled automatically and
+does not stay snoozed.
 
 After a structured chat turn ends, **Details** opens recorded commands, exit
 codes and reported edits. A successful check is marked stale when files changed
@@ -302,8 +349,20 @@ the snooze. Enable **Snooze limited threads** in thread behavior settings to
 snooze limit stops by default. Providers without a reset time offer manual
 retry and the normal snooze choices.
 
-On web and desktop, use **Agents** to follow work delegated to subagents.
-Stop on a thread also stops the subagents it delegated to.
+On web and desktop, open **Tools → Side chat → Workers** (shown once this chat has
+delegated work), or **Workers** in the thread details' Lineage section, to follow the agents this chat delegated
+work to. Each worker shows what it is doing now, its provider and model, whether
+it has its own worktree or shares this chat's folder, and how many attempts it
+has made. Open a worker to answer its questions and approvals. **Stop** ends its
+current run and holds its queued messages. In a worker's details, **Retry setup**
+repeats a worktree setup that failed, and **Run again** sends the original brief
+again in the same chat; the agent that delegated it is told the new result. Run
+again stays unavailable while messages wait in that worker's paused queue; open
+the worker to resume or remove them. If a worker lost an approval or question to
+a restart or a stopped agent process, it shows the lost decision next to its
+state and counts as needing you; open it to choose **Ask again** or **Dismiss**,
+because Retry setup and Run again wait until you do. Stop on a thread also stops
+the subagents it delegated to.
 
 Subagent threads started by the agent can't take messages; message the parent
 thread instead. When such a subagent needs an approval or an answer, the parent

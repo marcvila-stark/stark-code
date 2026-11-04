@@ -267,6 +267,8 @@ export function layerWithRegistry<Error>(
       SqlClient.SqlClient,
       MigrationError | PlatformError.PlatformError | SqlError
     >;
+    // Use a deterministic external checkpoint store when filesystem behavior is not the oracle.
+    readonly checkpointStoreLayer?: Layer.Layer<CheckpointStore.CheckpointStore>;
     readonly runEffectWorker?: boolean;
     // Start continuation runs for provider wake turns, as the live runtime does.
     // Off by default: most fixtures record no wake turn.
@@ -336,10 +338,12 @@ export function layerWithRegistry<Error>(
     Layer.provide(layerServerConfig),
     Layer.provide(NodeServices.layer),
   );
-  const layerCheckpointStore = CheckpointStore.layer.pipe(
-    Layer.provide(layerVcsDriverRegistry),
-    Layer.provide(NodeServices.layer),
-  );
+  const layerCheckpointStore =
+    options.checkpointStoreLayer ??
+    CheckpointStore.layer.pipe(
+      Layer.provide(layerVcsDriverRegistry),
+      Layer.provide(NodeServices.layer),
+    );
   const layerCheckpointServiceProvided = CheckpointService.layer.pipe(
     Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer)),
   );
@@ -505,6 +509,7 @@ export function layerWithRegistry<Error>(
         layerThreadTitleRegenerationTest,
         layerServerSettings,
         layerThreadManagementProvided,
+        layerRuntime,
       ),
     ),
   );

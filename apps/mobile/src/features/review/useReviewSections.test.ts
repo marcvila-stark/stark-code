@@ -18,7 +18,10 @@ const state = vi.hoisted(() => ({
   checkpoints: [] as ReadonlyArray<ThreadCheckpointSummary>,
 }));
 
-vi.mock("@starkfuture/client-runtime/state/thread-checkpoints", () => ({
+vi.mock("@starkfuture/client-runtime/state/thread-checkpoints", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("@starkfuture/client-runtime/state/thread-checkpoints")
+  >()),
   deriveThreadCheckpointSummaries: () => state.checkpoints,
 }));
 vi.mock("react", () => ({

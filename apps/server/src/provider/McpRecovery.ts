@@ -115,12 +115,8 @@ export const make = Effect.fn("McpRecovery.make")(function* (input: {
       if (server.status !== "failed" || server.locked) continue;
       const episode = episodes.get(server.name);
       if (!episode) continue;
-      if (input.api.reconnectScope !== "server") {
-        episode.state = "manual";
-        continue;
-      }
       if (busy) {
-        episode.state = "waiting";
+        episode.state = input.api.reconnectScope === "server" ? "waiting" : "manual";
         continue;
       }
       if (episode.nextAt > now) continue;
@@ -131,6 +127,13 @@ export const make = Effect.fn("McpRecovery.make")(function* (input: {
       if (network === "vpn-off") {
         episode.state = network;
         episode.nextAt = now + 30_000;
+        continue;
+      }
+      if (input.api.reconnectScope !== "server") {
+        // Global-only providers still need useful network/VPN diagnostics.
+        // Checking a failed endpoint does not authorize restarting healthy MCPs.
+        episode.state = network === "network-unavailable" ? network : "manual";
+        episode.nextAt = now + 60_000;
         continue;
       }
       // Recheck immediately before mutating; another provider action may have

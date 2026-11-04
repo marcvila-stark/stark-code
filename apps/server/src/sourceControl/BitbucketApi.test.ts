@@ -593,7 +593,7 @@ it.effect("creates pull requests using the official REST payload shape", () => {
       description: "PR body",
       source: {
         branch: { name: "feature/provider" },
-        repository: { full_name: "owner/starkcode" },
+        repository: { full_name: "owner/stark-code" },
       },
       destination: {
         branch: { name: "main" },

@@ -395,6 +395,9 @@ it("readThread and sendToThread reach threads in other projects", async () => {
           model: "gpt-5.4",
         }),
         projectId: foreignProjectId,
+        // The Codex caller runs Supervised under the brand, so it reaches
+        // threads that ask for no more.
+        runtimeMode: "approval-required",
       },
       runs: [],
       visibleTurnItems: [

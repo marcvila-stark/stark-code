@@ -290,6 +290,84 @@ describe("preview IPC methods", () => {
     );
   });
 
+  effectIt.effect("authorizes browser import only from the renderer scheme for its build", () => {
+    const sources = [{ id: "chrome" as const, name: "Chrome", profiles: [] }];
+    let listed = 0;
+    const listFrom = (
+      isDevelopment: boolean,
+      event?: { sender: { id: number }; senderFrame: { url: string } },
+    ) =>
+      PreviewIpc.listBrowserImportSources.handler(undefined, event).pipe(
+        Effect.provideService(ElectronWindow.ElectronWindow, {
+          currentMainOrFirst: Effect.succeedSome({ webContents: { id: 42, mainFrame } }),
+        } as never),
+        Effect.provideService(DesktopEnvironment.DesktopEnvironment, {
+          isDevelopment,
+          devServerUrl: isDevelopment
+            ? Option.some(new URL("http://127.0.0.1:4317/"))
+            : Option.none(),
+        } as never),
+        Effect.exit,
+      );
+    return Effect.gen(function* () {
+      // Development runs first: the live renderer is starkcode-dev://app/#/... there.
+      for (const isDevelopment of [true, false]) {
+        const scheme = isDevelopment ? "starkcode-dev" : "starkcode";
+        mainFrame.url = `${scheme}://app/#/browser`;
+        const accepted = yield* listFrom(isDevelopment, trustedEvent);
+        expect(Exit.isSuccess(accepted) && accepted.value).toEqual(sources);
+        for (const url of [
+          `${isDevelopment ? "starkcode" : "starkcode-dev"}://app/#/browser`,
+          "http://127.0.0.1:4317/",
+          "https://example.com/",
+          "starkcode-other://app/",
+          `${scheme}://other/`,
+          `${scheme}://app:4317/`,
+          `${scheme}://name@app/`,
+          `${scheme}://name:secret@app/`,
+        ]) {
+          mainFrame.url = url;
+          const exit = yield* listFrom(isDevelopment, trustedEvent);
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isFailure(exit)) {
+            expect(Option.getOrThrow(Cause.findErrorOption(exit.cause))).toMatchObject({
+              _tag: "BrowserImportFailedError",
+              sourceId: "browser",
+              reason: "unsafeTarget",
+            });
+          }
+        }
+        mainFrame.url = `${scheme}://app/#/browser`;
+        for (const event of [
+          undefined,
+          { sender: { id: 43 }, senderFrame: mainFrame },
+          { sender: { id: 42 }, senderFrame: { url: `${scheme}://app/#/browser` } },
+        ]) {
+          expect(Exit.isFailure(yield* listFrom(isDevelopment, event))).toBe(true);
+        }
+      }
+      expect(listed).toBe(2);
+    }).pipe(
+      Effect.provideService(BrowserImport.BrowserImport, {
+        listSources: Effect.sync(() => {
+          listed += 1;
+          return sources;
+        }),
+        importCookies: vi.fn(),
+      }),
+      Effect.provideService(ElectronApp.ElectronApp, {
+        ...ElectronApp.make,
+        applicationForProtocol: () =>
+          Effect.succeed({ name: "Browser Selector", path: "/Applications/Browser Selector.app" }),
+      }),
+      Effect.ensuring(
+        Effect.sync(() => {
+          mainFrame.url = "starkcode://app/";
+        }),
+      ),
+    );
+  });
+
   effectIt.effect("rejects invalid webContents ids before resolving the preview service", () =>
     Effect.map(
       PreviewIpc.registerWebview

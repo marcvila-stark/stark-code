@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import {
   CommandId,
   ForwardCompatibleArray,
+  ForwardCompatibleOptional,
   IsoDateTime,
   ProjectId,
   ScheduledTaskId,
@@ -16,7 +17,7 @@ import {
   OrchestrationV2CreationSource,
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
 } from "./orchestrationV2.ts";
-import { ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
+import { PermissionSource, ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
 
 /** 24-hour "HH:MM" wall-clock time. Mirrors `parseTimeOfDay` on the server. */
 const TimeOfDay = TrimmedNonEmptyString.check(
@@ -170,6 +171,56 @@ export const ScheduledTaskWebhookEndpoint = Schema.Struct({
 });
 export type ScheduledTaskWebhookEndpoint = typeof ScheduledTaskWebhookEndpoint.Type;
 
+export const ScheduledTaskWebhookDeliveryId = TrimmedNonEmptyString.pipe(
+  Schema.brand("ScheduledTaskWebhookDeliveryId"),
+);
+export type ScheduledTaskWebhookDeliveryId = typeof ScheduledTaskWebhookDeliveryId.Type;
+
+export const ScheduledTaskRunId = TrimmedNonEmptyString.pipe(Schema.brand("ScheduledTaskRunId"));
+export type ScheduledTaskRunId = typeof ScheduledTaskRunId.Type;
+
+/** What started a run: the schedule, Run now, or a request to the task's webhook URL. */
+export const ScheduledTaskRunTrigger = Schema.Literals(["scheduled", "manual", "webhook"]);
+export type ScheduledTaskRunTrigger = typeof ScheduledTaskRunTrigger.Type;
+
+/**
+ * Where one run stands. `waiting` is a webhook delivery behind earlier ones for
+ * the same task; `queued` is a prompt waiting behind other work in its thread.
+ * Literals grow over time, so read models wrap runs in forward-compatible
+ * schemas.
+ */
+export const ScheduledTaskRunState = Schema.Literals([
+  "waiting",
+  "starting",
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "skipped",
+]);
+export type ScheduledTaskRunState = typeof ScheduledTaskRunState.Type;
+
+/** One trigger occurrence of a scheduled task and the agent run it started. Never carries the prompt. */
+export const ScheduledTaskRun = Schema.Struct({
+  id: ScheduledTaskRunId,
+  taskId: ScheduledTaskId,
+  trigger: ScheduledTaskRunTrigger,
+  state: ScheduledTaskRunState,
+  /** A fixed reason a run failed, was skipped or was interrupted; never request data or causes. */
+  error: Schema.NullOr(Schema.String),
+  /** The thread the prompt went to; null until a new thread exists. */
+  threadId: Schema.NullOr(ThreadId),
+  webhookDeliveryId: Schema.NullOr(ScheduledTaskWebhookDeliveryId),
+  /** When the trigger fired, or when a webhook request was accepted. */
+  createdAt: IsoDateTime,
+  /** When the prompt began dispatching; null while the run is waiting. */
+  startedAt: Schema.NullOr(IsoDateTime),
+  endedAt: Schema.NullOr(IsoDateTime),
+});
+export type ScheduledTaskRun = typeof ScheduledTaskRun.Type;
+
 export const ScheduledTask = Schema.Struct({
   id: ScheduledTaskId,
   title: TrimmedNonEmptyString,
@@ -182,6 +233,11 @@ export const ScheduledTask = Schema.Struct({
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  /**
+   * Scheduled tasks always run a Stark preset; missing means `override`. A task
+   * bound to a thread refuses a run when the thread is broader than this.
+   */
+  permissionSource: Schema.optional(PermissionSource),
   createdBy: OrchestrationV2Actor,
   creationSource: OrchestrationV2CreationSource,
   createdAt: IsoDateTime,
@@ -192,6 +248,8 @@ export const ScheduledTask = Schema.Struct({
   lastRunError: Schema.NullOr(Schema.String),
   runCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   webhook: Schema.optional(ScheduledTaskWebhookEndpoint),
+  /** The newest run, from servers with run history. A run this client cannot read is left out. */
+  latestRun: ForwardCompatibleOptional(ScheduledTaskRun),
 });
 export type ScheduledTask = typeof ScheduledTask.Type;
 
@@ -219,7 +277,8 @@ export const ScheduledTaskUpsertInput = Schema.Struct({
   threadId: Schema.optional(Schema.NullOr(ThreadId)),
   workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
   modelSelection: ModelSelection,
-  runtimeMode: RuntimeMode,
+  /** Omitted: the project's default mode, resolved on the server. */
+  runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: ProviderInteractionMode,
   createdBy: Schema.optional(OrchestrationV2Actor),
   creationSource: Schema.optional(OrchestrationV2CreationSource),
@@ -240,6 +299,8 @@ export type ScheduledTaskDeleteInput = typeof ScheduledTaskDeleteInput.Type;
 
 export const ScheduledTaskRunNowInput = Schema.Struct({
   id: ScheduledTaskId,
+  /** One id per click: a repeated request with the same id returns the run it started. */
+  commandId: Schema.optional(CommandId),
 });
 export type ScheduledTaskRunNowInput = typeof ScheduledTaskRunNowInput.Type;
 
@@ -247,11 +308,6 @@ export const ScheduledTaskRotateWebhookTokenInput = Schema.Struct({
   id: ScheduledTaskId,
 });
 export type ScheduledTaskRotateWebhookTokenInput = typeof ScheduledTaskRotateWebhookTokenInput.Type;
-
-export const ScheduledTaskWebhookDeliveryId = TrimmedNonEmptyString.pipe(
-  Schema.brand("ScheduledTaskWebhookDeliveryId"),
-);
-export type ScheduledTaskWebhookDeliveryId = typeof ScheduledTaskWebhookDeliveryId.Type;
 
 export const ScheduledTaskWebhookDeliveryOutcome = Schema.Literals([
   "accepted",
@@ -326,8 +382,27 @@ export type ScheduledTaskDeleteResult = typeof ScheduledTaskDeleteResult.Type;
 
 export const ScheduledTaskRunNowResult = Schema.Struct({
   task: ScheduledTask,
+  /** The run this request started, or the one an earlier request with its command id started. */
+  run: ForwardCompatibleOptional(ScheduledTaskRun),
 });
 export type ScheduledTaskRunNowResult = typeof ScheduledTaskRunNowResult.Type;
+
+/** Most runs `scheduledTasks.listRuns` returns for one task. */
+const MAX_SCHEDULED_TASK_RUNS_LISTED = 100;
+
+export const ScheduledTaskListRunsInput = Schema.Struct({
+  id: ScheduledTaskId,
+  limit: Schema.optional(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_SCHEDULED_TASK_RUNS_LISTED })),
+  ),
+});
+export type ScheduledTaskListRunsInput = typeof ScheduledTaskListRunsInput.Type;
+
+export const ScheduledTaskListRunsResult = Schema.Struct({
+  /** Newest first. A run in a state this client does not know is left out. */
+  runs: ForwardCompatibleArray(ScheduledTaskRun),
+});
+export type ScheduledTaskListRunsResult = typeof ScheduledTaskListRunsResult.Type;
 
 export class ScheduledTaskError extends Schema.TaggedError<ScheduledTaskError>()(
   "ScheduledTaskError",

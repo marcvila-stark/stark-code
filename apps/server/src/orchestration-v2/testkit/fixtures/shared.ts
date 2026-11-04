@@ -761,7 +761,10 @@ export function materializeFixtureInput(input: {
               : { shellSnapshotKeyWhilePending: step.shellSnapshotKeyWhilePending }),
           };
           steps.push({ type: "advance_clock", duration: "1 millis" });
-          if (!answersNext(stepIndex)) {
+          if (
+            !answersNext(stepIndex) &&
+            input.fixtureInput.steps[stepIndex + 1]?.type !== "finish_held_run"
+          ) {
             steps.push({ type: "await_thread_idle", threadId: ids.threadId });
           }
           break;

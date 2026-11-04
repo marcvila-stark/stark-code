@@ -50,7 +50,7 @@ function joinWindowsPath(...parts: ReadonlyArray<string>): string {
     .join("\\");
 }
 
-export function shellCandidateFromCommand(
+function shellCandidateFromCommand(
   command: string | null,
   platform: NodeJS.Platform,
 ): ShellCandidate | null {

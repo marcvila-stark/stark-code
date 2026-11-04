@@ -5,8 +5,11 @@ import type {
 } from "@starkfuture/contracts";
 import type * as Stream from "effect/Stream";
 import type { ManagedServerProvider } from "@starkfuture/provider-core/server/snapshot";
+import type { ProviderInstance } from "@starkfuture/provider-core/server/driver";
 
 export type ProviderSnapshotSource = {
+  /** Owner identity rejects delayed publications from a replaced instance. */
+  readonly instance: ProviderInstance;
   /**
    * Routing key — uniquely identifies this instance in the aggregated
    * snapshot list. Two different snapshot sources may share the same
