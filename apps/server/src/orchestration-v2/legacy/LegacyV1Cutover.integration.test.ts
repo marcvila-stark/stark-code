@@ -19,6 +19,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as References from "effect/References";
@@ -561,18 +562,23 @@ const makeCodexAdapter = (capturedTurns: Ref.Ref<ReadonlyArray<CapturedTurn>>) =
 
 const waitForIdle = Effect.fn("LegacyV1Cutover.waitForIdle")(function* (threadId: ThreadId) {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
-  for (let attempt = 0; attempt < 1_000; attempt += 1) {
-    const projection = yield* orchestrator.getThreadProjection(threadId);
-    if (
-      projection.runs.every(
-        (run) => !["queued", "starting", "running", "waiting"].includes(run.status),
-      )
-    ) {
-      return projection;
-    }
-    yield* Effect.sleep("5 millis");
-  }
-  return yield* Effect.die(new Error("Cutover test timed out waiting for idle"));
+  const eventSink = yield* EventSink.EventSinkV2;
+  const isIdle = (projection: OrchestrationV2ThreadProjection) =>
+    projection.runs.every(
+      (run) => !["queued", "starting", "running", "waiting"].includes(run.status),
+    );
+  // Capture the replay cursor before reading state so a commit between the
+  // read and subscription cannot be missed, including after the restart.
+  const afterSequence = yield* eventSink.latestSequence({ threadId });
+  const current = yield* orchestrator.getThreadProjection(threadId);
+  if (isIdle(current)) return current;
+  const idle = yield* orchestrator.streamStoredEventsFrom({ threadId, afterSequence }).pipe(
+    Stream.mapEffect(() => orchestrator.getThreadProjection(threadId)),
+    Stream.filter(isIdle),
+    Stream.runHead,
+  );
+  if (Option.isSome(idle)) return idle.value;
+  return yield* Effect.die(new Error("Cutover event stream ended before idle"));
 });
 
 const layerBoot = (input: {

@@ -20,6 +20,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -764,16 +765,17 @@ it.live("detaches the old provider session after an active provider handoff", ()
           modelSelection: initialSelection,
           dispatchMode: { type: "start_immediately" },
         });
-        let activeRunId: RunId | null = null;
-        for (let index = 0; index < 1_000; index += 1) {
-          const current = yield* orchestrator.getThreadProjection(threadId);
-          if (current.providerTurns.some((turn) => turn.status === "running")) {
-            activeRunId = current.runs[0]?.id ?? null;
-            break;
-          }
-          yield* Effect.sleep("5 millis");
-        }
-        if (activeRunId === null) {
+        // The replaying event stream catches the durable milestone even when Git
+        // preparation outlasts a short polling window or finishes before subscription.
+        const active = yield* orchestrator.streamStoredEventsFrom({ threadId }).pipe(
+          Stream.mapEffect(() => orchestrator.getThreadProjection(threadId)),
+          Stream.filter((current) =>
+            current.providerTurns.some((turn) => turn.status === "running"),
+          ),
+          Stream.runHead,
+        );
+        const activeRunId = Option.getOrUndefined(active)?.runs[0]?.id;
+        if (activeRunId === undefined) {
           return yield* Effect.die("active provider-handoff run is missing");
         }
 
@@ -789,13 +791,17 @@ it.live("detaches the old provider session after an active provider handoff", ()
           modelSelection: handoffSelection,
           dispatchMode: { type: "restart_active", targetRunId: activeRunId },
         });
-        for (let index = 0; index < 1_000; index += 1) {
-          const current = yield* orchestrator.getThreadProjection(threadId);
-          if (current.attempts.length === 2 && current.attempts[1]?.status === "completed") {
-            const captured = yield* Ref.get(state);
-            return { projection: current, captured };
-          }
-          yield* Effect.sleep("5 millis");
+        const completed = yield* orchestrator.streamStoredEventsFrom({ threadId }).pipe(
+          Stream.mapEffect(() => orchestrator.getThreadProjection(threadId)),
+          Stream.filter(
+            (current) =>
+              current.attempts.length === 2 && current.attempts[1]?.status === "completed",
+          ),
+          Stream.runHead,
+        );
+        if (Option.isSome(completed)) {
+          const captured = yield* Ref.get(state);
+          return { projection: completed.value, captured };
         }
         const current = yield* orchestrator.getThreadProjection(threadId);
         const adapterState = yield* Ref.get(state);
