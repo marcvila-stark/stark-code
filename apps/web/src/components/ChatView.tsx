@@ -12599,6 +12599,17 @@ export default function ChatView(props: ChatViewProps) {
             else addTerminalSurface();
           },
         },
+        {
+          id: "browser",
+          label: "New browser tab",
+          disabled: !browserAvailable || !canOperatePreview,
+          description: !browserAvailable
+            ? "Browser is unavailable on this connection"
+            : !canOperatePreview
+              ? "Browser access is unavailable on this connection"
+              : undefined,
+          onSelect: () => createBrowserSurface(),
+        },
       ]}
       moreGroups={[
         {
@@ -12641,16 +12652,6 @@ export default function ChatView(props: ChatViewProps) {
         {
           label: "Advanced",
           actions: [
-            {
-              id: "browser",
-              label: "Browser",
-              description: "Preview a site inside the app",
-              disabled: !browserAvailable || !canOperatePreview,
-              active: previewPanelOpen,
-              onSelect: () => {
-                if (!previewPanelOpen) togglePreviewPanel();
-              },
-            },
             ...(pullRequestSurfaceAvailable
               ? [
                   {

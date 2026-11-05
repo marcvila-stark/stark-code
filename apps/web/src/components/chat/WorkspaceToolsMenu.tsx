@@ -2,6 +2,7 @@ import {
   CheckIcon,
   ChevronDownIcon,
   FileTextIcon,
+  GlobeIcon,
   LayoutGridIcon,
   MessageCircleIcon,
   TerminalIcon,
@@ -53,7 +54,9 @@ function ToolItem({
         ? MessageCircleIcon
         : action.id === "terminal"
           ? TerminalIcon
-          : null;
+          : action.id === "browser"
+            ? GlobeIcon
+            : null;
   return (
     <MenuItem
       aria-label={action.label}

@@ -11,6 +11,7 @@ const showPages = vi.fn();
 const showConversation = vi.fn();
 const showAdvanced = vi.fn();
 const showTerminal = vi.fn();
+const showBrowser = vi.fn();
 
 const trigger = () => container.querySelector<HTMLButtonElement>('button[aria-label="Tools"]')!;
 const item = (label: string) => {
@@ -33,6 +34,7 @@ const render = () =>
             disabled: true,
             onSelect: showTerminal,
           },
+          { id: "browser", label: "New browser tab", onSelect: showBrowser },
         ]}
         moreGroups={[
           {
@@ -69,7 +71,7 @@ it("keeps everyday tools visible and reveals advanced tools only on request", as
     Array.from(document.querySelectorAll('[role="menuitem"]')).map((element) =>
       element.getAttribute("aria-label"),
     ),
-  ).toEqual(["Pages", "Side chat", "Terminal", "More tools"]);
+  ).toEqual(["Pages", "Side chat", "Terminal", "New browser tab", "More tools"]);
   expect(document.querySelector('[aria-label="Open Codex CLI"]')).toBeNull();
   await act(() => item("More tools").click());
   await act(() => item("Open Codex CLI").click());
@@ -79,6 +81,16 @@ it("keeps everyday tools visible and reveals advanced tools only on request", as
   await open();
   await act(() => item("Side chat").click());
   expect(showConversation).toHaveBeenCalledOnce();
+  expect(trigger().getAttribute("aria-expanded")).toBe("false");
+});
+
+it("opens a browser tab directly from the main menu and closes the menu", async () => {
+  await render();
+  await open();
+  expect(document.querySelector('[aria-label="Open Codex CLI"]')).toBeNull();
+  await act(() => item("New browser tab").click());
+  expect(showBrowser).toHaveBeenCalledOnce();
+  expect(showAdvanced).not.toHaveBeenCalled();
   expect(trigger().getAttribute("aria-expanded")).toBe("false");
 });
 
