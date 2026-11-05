@@ -61,6 +61,11 @@ native/**/target/
 /work/
 /outputs/
 
+# Optional editor and review-tool preferences stay local.
+/.cursor/
+/.vscode/
+/.macroscope/
+
 # Generated test output, not fixtures or reviewed screenshot baselines.
 /coverage/
 /test-results/
