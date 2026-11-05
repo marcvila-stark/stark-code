@@ -18,7 +18,7 @@ export function BrowserSurfaceSlot(props: {
     tabId,
     visible,
     cornerRadius = 0,
-    zIndex = 30,
+    zIndex,
     layoutVersion,
     className,
     fitSourceContent = false,
@@ -34,6 +34,11 @@ export function BrowserSurfaceSlot(props: {
     const update = () => {
       const rect = element.getBoundingClientRect();
       const presentation = presentationRef.current;
+      // Guests live outside the panel DOM. Sheets occupy layer 46; keep their
+      // page above the sheet, below menus and dialogs (50). Explicit owners,
+      // such as the mini-player, keep their own layer.
+      const surfaceZIndex =
+        presentation.zIndex ?? (element.closest('[data-slot="sheet-popup"]') ? 47 : 30);
       const presented = lease.present(
         {
           x: Math.round(rect.x),
@@ -43,7 +48,7 @@ export function BrowserSurfaceSlot(props: {
         },
         presentation.visible && rect.width > 0 && rect.height > 0,
         presentation.cornerRadius,
-        presentation.zIndex,
+        surfaceZIndex,
       );
       if (presentation.visible && !presented) {
         lease.release();
@@ -57,7 +62,7 @@ export function BrowserSurfaceSlot(props: {
           },
           rect.width > 0 && rect.height > 0,
           presentation.cornerRadius,
-          presentation.zIndex,
+          surfaceZIndex,
         );
       }
     };
