@@ -11,6 +11,7 @@ const state = {
   busy: false,
   expanded: false,
   receipt: null,
+  newChat: null,
   extensionId: chrome.runtime.id,
 };
 const writes = new Set();
@@ -64,9 +65,27 @@ function review() {
     `<div class="content">${pendingPicker()}${preview()}<textarea class="note" id="note" aria-label="Optional note" placeholder="Add a note… (optional)" rows="1"${pending || state.busy ? " disabled" : ""}>${esc(state.record.capture.note)}</textarea>${destination()}${errors()}${pending ? '<div class="status"><p>Delivery is assigned to this chat. It has not been confirmed saved yet.</p></div>' : ""}<button class="primary" id="add"${state.busy || (!state.record.target && state.catalog) ? " disabled" : ""}>${state.busy ? "Saving…" : !state.catalog ? "Retry connection" : pending ? "Retry delivery" : state.record.target?.kind === "new" ? "Create chat & add to draft" : "Add to draft"} ${icon("arrow")}</button><p class="helper">You review and send from Stark.</p>${!state.catalog ? setup() : ""}</div>`
   );
 }
+function newChatDraft() {
+  const record = state.record;
+  if (state.newChat?.captureId === record.capture.id) return state.newChat;
+  const target = record.target?.kind === "new" ? record.target : null;
+  const project = state.catalog?.projects[0];
+  state.newChat = {
+    captureId: record.capture.id,
+    environmentId: target?.environmentId ?? project?.environmentId ?? "",
+    projectId: target?.projectId ?? project?.projectId ?? "",
+    title: target?.title ?? (record.capture.pageTitle.slice(0, 120) || "Browser reference"),
+  };
+  return state.newChat;
+}
 function choose() {
   const list = state.catalog?.destinations || [],
     projects = state.catalog?.projects || [];
+  const draft = newChatDraft();
+  const projectIndex = projects.findIndex(
+    (project) =>
+      project.environmentId === draft.environmentId && project.projectId === draft.projectId,
+  );
   const filtered = list.filter((item) =>
     (item.label + " " + item.projectLabel + " " + item.environmentLabel)
       .toLowerCase()
@@ -74,7 +93,7 @@ function choose() {
   );
   return (
     header("Choose chat", true) +
-    `<div class="choose-content"><div class="segmented" role="tablist" aria-label="Chat destination"><button class="segment" id="existing-tab" role="tab" data-tab="existing" aria-controls="existing-panel" aria-selected="${state.tab === "existing"}" tabindex="${state.tab === "existing" ? 0 : -1}">Existing chat</button><button class="segment" id="new-tab" role="tab" data-tab="new" aria-controls="new-panel" aria-selected="${state.tab === "new"}" tabindex="${state.tab === "new" ? 0 : -1}">New chat</button></div><div id="existing-panel" role="tabpanel" aria-labelledby="existing-tab"${state.tab !== "existing" ? " hidden" : ""}><div class="search-wrap">${icon("search")}<input class="search" id="search" aria-label="Search chats" placeholder="Search chats…" value="${esc(state.query)}"></div><div class="chat-list" style="margin-top:8px">${filtered.length ? filtered.map((item) => `<button class="chat-row" data-destination="${list.indexOf(item)}" aria-pressed="${JSON.stringify(item.target) === JSON.stringify(state.record.target)}">${icon("chat")}<span class="chat-text"><span class="chat-name">${esc(item.label)}</span><span class="chat-project">${esc(item.projectLabel)} · ${esc(item.environmentLabel)}</span></span>${item.current ? `<span class="current">Open ${icon("check")}</span>` : ""}</button>`).join("") : '<p class="empty">No matching recent chats. Open an older chat in Stark to choose it, or try New chat.</p>'}</div></div><div id="new-panel" role="tabpanel" aria-labelledby="new-tab"${state.tab !== "new" ? " hidden" : ""}><form class="new-form" id="new-form"><label class="form-field"><span class="field-label">Project</span><select class="field" id="project" required>${projects.map((project, index) => `<option value="${index}">${esc(project.label)} · ${esc(project.environmentLabel)}</option>`).join("")}</select></label><label class="form-field"><span class="field-label">Chat name</span><input class="field" id="chat-name" maxlength="120" required value="${esc(state.record.capture.pageTitle.slice(0, 120) || "Browser reference")}"></label><p class="choose-foot">Uses this project’s normal chat settings.<br>Created only when you add the capture.</p><button class="primary" type="submit"${!projects.length ? " disabled" : ""}>Use new chat ${icon("arrow")}</button></form></div>${errors()}</div>`
+    `<div class="choose-content"><div class="segmented" role="tablist" aria-label="Chat destination"><button class="segment" id="existing-tab" role="tab" data-tab="existing" aria-controls="existing-panel" aria-selected="${state.tab === "existing"}" tabindex="${state.tab === "existing" ? 0 : -1}">Existing chat</button><button class="segment" id="new-tab" role="tab" data-tab="new" aria-controls="new-panel" aria-selected="${state.tab === "new"}" tabindex="${state.tab === "new" ? 0 : -1}">New chat</button></div><div id="existing-panel" role="tabpanel" aria-labelledby="existing-tab"${state.tab !== "existing" ? " hidden" : ""}><div class="search-wrap">${icon("search")}<input class="search" id="search" aria-label="Search chats" placeholder="Search chats…" value="${esc(state.query)}"></div><div class="chat-list" style="margin-top:8px">${filtered.length ? filtered.map((item) => `<button class="chat-row" data-destination="${list.indexOf(item)}" aria-pressed="${JSON.stringify(item.target) === JSON.stringify(state.record.target)}">${icon("chat")}<span class="chat-text"><span class="chat-name">${esc(item.label)}</span><span class="chat-project">${esc(item.projectLabel)} · ${esc(item.environmentLabel)}</span></span>${item.current ? `<span class="current">Open ${icon("check")}</span>` : ""}</button>`).join("") : '<p class="empty">No matching recent chats. Open an older chat in Stark to choose it, or try New chat.</p>'}</div></div><div id="new-panel" role="tabpanel" aria-labelledby="new-tab"${state.tab !== "new" ? " hidden" : ""}><form class="new-form" id="new-form"><label class="form-field"><span class="field-label">Project</span><select class="field" id="project" required>${projectIndex < 0 ? '<option value="" disabled selected>Choose an available project…</option>' : ""}${projects.map((project, index) => `<option value="${index}"${index === projectIndex ? " selected" : ""}>${esc(project.label)} · ${esc(project.environmentLabel)}</option>`).join("")}</select></label><label class="form-field"><span class="field-label">Chat name</span><input class="field" id="chat-name" maxlength="120" required value="${esc(draft.title)}"></label><p class="choose-foot">Uses this project’s normal chat settings.<br>Created only when you add the capture.</p><button class="primary" type="submit"${!projects.length ? " disabled" : ""}>Use new chat ${icon("arrow")}</button></form></div>${errors()}</div>`
   );
 }
 function receipt() {
@@ -220,6 +239,7 @@ async function change() {
   state.busy = false;
   state.screen = "choose";
   state.query = "";
+  state.tab = state.record.target?.kind === "new" ? "new" : "existing";
   render("#view-title");
 }
 async function startRegion(replace = false) {
@@ -332,7 +352,8 @@ function bind() {
       name.reportValidity();
       return;
     }
-    const project = state.catalog.projects[Number(document.querySelector("#project").value)];
+    const projectValue = document.querySelector("#project").value;
+    const project = projectValue === "" ? undefined : state.catalog.projects[Number(projectValue)];
     if (!project) return;
     state.record.target = {
       kind: "new",
@@ -346,9 +367,18 @@ function bind() {
     void queueSave().catch(report);
     render("#choose");
   });
-  document
-    .querySelector("#chat-name")
-    ?.addEventListener("input", (event) => event.target.setCustomValidity(""));
+  document.querySelector("#chat-name")?.addEventListener("input", (event) => {
+    newChatDraft().title = event.target.value;
+    event.target.setCustomValidity("");
+  });
+  document.querySelector("#project")?.addEventListener("change", (event) => {
+    const project = state.catalog.projects[Number(event.target.value)];
+    if (!project || event.target.value === "") return;
+    Object.assign(newChatDraft(), {
+      environmentId: project.environmentId,
+      projectId: project.projectId,
+    });
+  });
   document
     .querySelector(".extension-id")
     ?.addEventListener("click", (event) => event.target.select());
