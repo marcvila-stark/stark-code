@@ -38,6 +38,8 @@ export interface SidebarThreadHeaderProps {
   /** The folder picker occupies its own labelled row. */
   projectScope: ReactNode;
   needsYou?: ReactNode;
+  /** Sits between search and the chat list. */
+  scheduledTasks?: ReactNode;
   onNewProject: () => void;
   groupByStatus: boolean;
   onGroupByStatusChange: (grouped: boolean) => void;
@@ -65,6 +67,7 @@ export function SidebarThreadHeader({
   hasProjects,
   projectScope,
   needsYou,
+  scheduledTasks,
   onNewProject,
   groupByStatus,
   onGroupByStatusChange,
@@ -168,6 +171,7 @@ export function SidebarThreadHeader({
           </Button>
         ) : null}
       </div>
+      {scheduledTasks}
       <div className="stark-sidebar-list-heading">
         <span>Chats</span>
         <Menu>
