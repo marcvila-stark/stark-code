@@ -293,6 +293,7 @@ import {
 import { SidebarContent, SidebarGroup, SidebarMenuButton, useSidebar } from "./ui/sidebar";
 import { SidebarNavigationButton } from "./sidebar/SidebarNavigationButton";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
+import { SidebarScheduledTasksSection } from "./sidebar/SidebarScheduledTasks";
 import { SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
 import { mergeSidebarChatRows } from "./sidebar/sidebarChatList";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
@@ -5073,6 +5074,11 @@ export default function Sidebar() {
                   threads={threads}
                   projects={projects}
                   onOpenThread={navigateToSidebarThread}
+                />
+              }
+              scheduledTasks={
+                <SidebarScheduledTasksSection
+                  onNavigate={isMobile ? () => setOpenMobile(false) : undefined}
                 />
               }
               searchFieldRef={headerSearchRef}
